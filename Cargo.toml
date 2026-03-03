@@ -49,6 +49,10 @@ zip = "0.6"
 # Unix system calls
 libc = "0.2"
 
+# Binary serialization for BLE protocol
+postcard = { version = "1.0", features = ["use-std"] }
+bytes = "1.5"
+
 [dev-dependencies]
 mockall = "0.12"
 tempfile = "3.8"
