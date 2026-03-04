@@ -182,7 +182,7 @@ impl DataFrame {
         }
     }
 
-    /// Serialize the DataFrame to bytes using postcard
+    /// Serialize the DataFrame to bytes using postcard lib
     pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
         postcard::to_stdvec(self)
     }
