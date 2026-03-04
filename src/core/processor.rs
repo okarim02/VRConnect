@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::domain::ProcessedData;
 use crate::error::Result;
 use crate::input::SocketIOServer;
-use crate::output::{BleOutput, ConsoleOutput, FileOutput};
+use crate::output::{ConsoleOutput, FileOutput, ReliableBleOutput};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Arc;
@@ -82,24 +82,23 @@ impl VitalProcessor {
     /// ID SRS: SRS-FN-PROCESSOR-003
     /// Title: create_ble_output
     ///
-    /// Description: VRConnect shall create BLE output if enabled.
+    /// Description: VRConnect shall create reliable BLE output if enabled.
+    /// Uses the new binary protocol with sliding window acknowledgment.
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     ///
     /// # Returns
-    /// Optional BleOutput or error
-    async fn create_ble_output(&self) -> Result<Option<Arc<BleOutput>>> {
+    /// Optional ReliableBleOutput or error
+    async fn create_ble_output(&self) -> Result<Option<Arc<ReliableBleOutput>>> {
         if self.config.output_ble_enabled {
-            log::info!("🔵 Initializing BLE output...");
+            log::info!("🔵 Initializing Reliable BLE output (binary protocol)...");
             Ok(Some(Arc::new(
-                BleOutput::new(
+                ReliableBleOutput::new(
                     self.config.output_ble_device_name.clone(),
                     self.config.output_ble_service_uuid.clone(),
-                    self.config.output_ble_values.clone(),
-                    self.config.output_ble_empty_value.clone(),
                     self.config.output_ble_update_interval_ms,
                 )
-                    .await?,
+                .await?,
             )))
         } else {
             Ok(None)
@@ -125,7 +124,7 @@ impl VitalProcessor {
                     self.config.output_file_archive_threshold_gb,
                     self.config.output_file_critical_disk_percent,
                 )
-                    .await?,
+                .await?,
             )))
         } else {
             Ok(None)
@@ -138,19 +137,19 @@ impl VitalProcessor {
     /// Description: VRConnect shall process single ProcessedData through
     /// all enabled outputs.
     ///
-    /// Version: V1.0
+    /// Version: V5.0
     ///
     /// # Arguments
     /// * `data` - Processed data
     /// * `console` - Optional console output
-    /// * `ble` - Optional BLE output
+    /// * `ble` - Optional reliable BLE output
     /// * `file` - Optional file output
     /// * `debug_enabled` - Debug flag
     /// * `debug_file` - Debug file handle
     async fn process_single_data(
         data: &ProcessedData,
         console: &Option<Arc<ConsoleOutput>>,
-        ble: &Option<Arc<BleOutput>>,
+        ble: &Option<Arc<ReliableBleOutput>>,
         file: &Option<Arc<FileOutput>>,
         debug_enabled: bool,
         debug_file: &Arc<RwLock<Option<std::fs::File>>>,
@@ -247,7 +246,7 @@ impl VitalProcessor {
                     debug_enabled,
                     &debug_file,
                 )
-                    .await;
+                .await;
             }
         });
 
@@ -514,7 +513,7 @@ mod tests {
             true,
             &processor.debug_file,
         )
-            .await;
+        .await;
     }
 
     /// ID SRS: SRS-TEST-PROC-014
@@ -626,7 +625,7 @@ mod tests {
             false,
             &processor.debug_file,
         )
-            .await;
+        .await;
     }
 
     /// ID SRS: SRS-TEST-PROC-016
@@ -853,6 +852,6 @@ mod tests {
             true,
             &processor.debug_file,
         )
-            .await;
+        .await;
     }
 }
