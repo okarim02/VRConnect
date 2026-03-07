@@ -361,10 +361,8 @@ impl Config {
                 ));
             }
 
-            // BLE_VALUES is mandatory when BLE is enabled
-            if self.output_ble_values.trim().is_empty() {
-                return Err("BLE_VALUES is mandatory when BLE output is enabled".to_string());
-            }
+            // BLE_VALUES is only used by legacy state-sync (ble.rs).
+            // The reliable protocol uses the hardcoded signal catalog instead.
 
             // Validate update interval
             if self.output_ble_update_interval_ms == 0 {
@@ -802,14 +800,14 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_ble_values_mandatory() {
+    fn test_validate_ble_empty_values_allowed() {
+        // BLE_VALUES is only used by legacy state-sync; reliable protocol uses catalog
         let mut config = create_test_config();
         config.output_ble_enabled = true;
         config.output_ble_values = "".to_string();
 
         let result = config.validate();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("BLE_VALUES is mandatory"));
+        assert!(result.is_ok());
     }
 
     #[test]
