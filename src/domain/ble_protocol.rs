@@ -75,11 +75,13 @@ pub enum StreamType {
 ///
 /// Version: V1.0
 ///
-/// Format: (id, name, type, period)
+/// Format: (id, source, name, type, period)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CatalogEntry {
     /// Signal ID (1=HR, 2=SpO2, 3=Temperature)
     pub id: u16,
+    /// Source identifier (per spec, typically 1)
+    pub source: u16,
     /// Human-readable signal name
     pub name: String,
     /// Stream type (Num or Wav)
@@ -117,28 +119,31 @@ impl Catalog {
     pub fn default_medical_catalog() -> Self {
         let mut catalog = Self::new();
 
-        // HR: Heart Rate, numerical, typical period 1000ms (1Hz)
+        // HR: Heart Rate, source 1, numerical, typical period 1000ms (1Hz)
         catalog.add_entry(CatalogEntry {
             id: SignalId::HR.as_u16(),
+            source: 1,
             name: "HR".to_string(),
             stream_type: StreamType::Num,
             period_ms: 1000,
         });
 
-        // SpO2: Blood oxygen, numerical, typical period 1000ms (1Hz)
+        // SpO2: Blood oxygen, source 1, numerical, typical period 1000ms (1Hz)
         catalog.add_entry(CatalogEntry {
             id: SignalId::SpO2.as_u16(),
+            source: 1,
             name: "SpO2".to_string(),
             stream_type: StreamType::Num,
             period_ms: 1000,
         });
 
-        // Temperature: body temperature, numerical, typical period 5000ms (0.2Hz)
+        // Temperature: body temperature, source 1, numerical, typical period 2000ms (0.5Hz) per spec
         catalog.add_entry(CatalogEntry {
             id: SignalId::Temperature.as_u16(),
+            source: 1,
             name: "Temperature".to_string(),
             stream_type: StreamType::Num,
-            period_ms: 5000,
+            period_ms: 2000,
         });
 
         catalog
@@ -192,6 +197,35 @@ impl DataFrame {
         postcard::from_bytes(bytes)
     }
 
+    /// Serialize to raw fixed-size binary per BLE spec.
+    /// Format: [SessionID(2b LE) | StreamID(2b LE) | SeqNum(4b LE) | Payload(Nb)]
+    pub fn to_ble_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(Self::header_size() + self.payload.len());
+        bytes.extend_from_slice(&self.session_id.to_le_bytes());
+        bytes.extend_from_slice(&self.stream_id.to_le_bytes());
+        bytes.extend_from_slice(&self.seq_num.to_le_bytes());
+        bytes.extend_from_slice(&self.payload);
+        bytes
+    }
+
+    /// Deserialize from raw fixed-size binary per BLE spec.
+    /// Format: [SessionID(2b LE) | StreamID(2b LE) | SeqNum(4b LE) | Payload(Nb)]
+    pub fn from_ble_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::header_size() {
+            return None;
+        }
+        let session_id = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let stream_id = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let seq_num = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let payload = bytes[Self::header_size()..].to_vec();
+        Some(Self {
+            session_id,
+            stream_id,
+            seq_num,
+            payload,
+        })
+    }
+
     /// Get the header size (fixed portion) in bytes
     pub const fn header_size() -> usize {
         8 // 2 (session_id) + 2 (stream_id) + 4 (seq_num)
@@ -241,6 +275,42 @@ impl AckFrame {
     /// Deserialize an AckFrame from bytes using postcard
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
         postcard::from_bytes(bytes)
+    }
+
+    /// Serialize to raw fixed-size binary per BLE spec.
+    /// Format: [SessionID(2b LE) | StreamID(2b LE) | AckBase(4b LE) | BitmapLen(1b) | Bitmap(Nb)]
+    pub fn to_ble_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(Self::header_size() + self.bitmap.len());
+        bytes.extend_from_slice(&self.session_id.to_le_bytes());
+        bytes.extend_from_slice(&self.stream_id.to_le_bytes());
+        bytes.extend_from_slice(&self.ack_base.to_le_bytes());
+        bytes.push(self.bitmap_len);
+        bytes.extend_from_slice(&self.bitmap);
+        bytes
+    }
+
+    /// Deserialize from raw fixed-size binary per BLE spec.
+    /// Format: [SessionID(2b LE) | StreamID(2b LE) | AckBase(4b LE) | BitmapLen(1b) | Bitmap(Nb)]
+    pub fn from_ble_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::header_size() {
+            return None;
+        }
+        let session_id = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let stream_id = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let ack_base = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let bitmap_len = bytes[8];
+        let bitmap = if (bytes.len()) > Self::header_size() {
+            bytes[Self::header_size()..Self::header_size() + bitmap_len as usize].to_vec()
+        } else {
+            Vec::new()
+        };
+        Some(Self {
+            session_id,
+            stream_id,
+            ack_base,
+            bitmap_len,
+            bitmap,
+        })
     }
 
     /// Get the header size (fixed portion) in bytes
@@ -488,5 +558,74 @@ mod tests {
             }
             _ => panic!("Expected DataFrame variant"),
         }
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-008
+    /// Title: Test DataFrame raw BLE binary serialization
+    ///
+    /// Description: VRConnect shall correctly serialize/deserialize DataFrame
+    /// to/from fixed-size binary format per BLE spec.
+    #[test]
+    fn test_data_frame_ble_bytes() {
+        let payload = 65.0f32.to_le_bytes().to_vec(); // HR = 65.0
+        let frame = DataFrame::new(1, SignalId::HR.as_u16(), 182, payload.clone());
+
+        let bytes = frame.to_ble_bytes();
+
+        // Verify fixed-size layout: [SessionID(2) | StreamID(2) | SeqNum(4) | Payload(4)]
+        assert_eq!(bytes.len(), 8 + 4); // 12 bytes total
+        assert_eq!(&bytes[0..2], &1u16.to_le_bytes());   // session_id = 1
+        assert_eq!(&bytes[2..4], &1u16.to_le_bytes());   // stream_id = 1 (HR)
+        assert_eq!(&bytes[4..8], &182u32.to_le_bytes());  // seq_num = 182
+        assert_eq!(&bytes[8..12], &payload);               // payload = f32 LE
+
+        // Roundtrip
+        let decoded = DataFrame::from_ble_bytes(&bytes).unwrap();
+        assert_eq!(decoded.session_id, 1);
+        assert_eq!(decoded.stream_id, 1);
+        assert_eq!(decoded.seq_num, 182);
+        assert_eq!(decoded.payload, payload);
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-009
+    /// Title: Test DataFrame BLE bytes too short
+    #[test]
+    fn test_data_frame_ble_bytes_too_short() {
+        assert!(DataFrame::from_ble_bytes(&[0x01, 0x02]).is_none());
+        assert!(DataFrame::from_ble_bytes(&[]).is_none());
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-010
+    /// Title: Test AckFrame raw BLE binary serialization
+    #[test]
+    fn test_ack_frame_ble_bytes() {
+        let bitmap = vec![0b10101010, 0b00001111];
+        let frame = AckFrame::new(1, SignalId::SpO2.as_u16(), 50, bitmap.clone());
+
+        let bytes = frame.to_ble_bytes();
+
+        // Verify: [SessionID(2) | StreamID(2) | AckBase(4) | BitmapLen(1) | Bitmap(2)]
+        assert_eq!(bytes.len(), 9 + 2); // 11 bytes total
+        assert_eq!(&bytes[0..2], &1u16.to_le_bytes());    // session_id
+        assert_eq!(&bytes[2..4], &2u16.to_le_bytes());    // stream_id = SpO2
+        assert_eq!(&bytes[4..8], &50u32.to_le_bytes());   // ack_base
+        assert_eq!(bytes[8], 2);                            // bitmap_len
+        assert_eq!(&bytes[9..11], &bitmap);                 // bitmap
+
+        // Roundtrip
+        let decoded = AckFrame::from_ble_bytes(&bytes).unwrap();
+        assert_eq!(decoded.session_id, 1);
+        assert_eq!(decoded.stream_id, 2);
+        assert_eq!(decoded.ack_base, 50);
+        assert_eq!(decoded.bitmap_len, 2);
+        assert_eq!(decoded.bitmap, bitmap);
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-011
+    /// Title: Test AckFrame BLE bytes too short
+    #[test]
+    fn test_ack_frame_ble_bytes_too_short() {
+        assert!(AckFrame::from_ble_bytes(&[0x01, 0x02]).is_none());
+        assert!(AckFrame::from_ble_bytes(&[]).is_none());
     }
 }

@@ -170,13 +170,15 @@ impl ReliableBleOutput {
     }
 
     /// Serialize catalog to binary format per PDF spec.
-    /// Format: [ID(2b) | NameLen(1b) | Name | Type(1b) | Period(4b)] per entry.
+    /// Format: [ID(2b) | Source(2b) | NameLen(1b) | Name | Type(1b) | Period(4b)] per entry.
     fn serialize_catalog(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
         for entry in &self.catalog.entries {
             // Signal ID (2 bytes, little-endian)
             bytes.extend_from_slice(&entry.id.to_le_bytes());
+            // Source (2 bytes, little-endian) - per spec
+            bytes.extend_from_slice(&entry.source.to_le_bytes());
             // Name length (1 byte) + name bytes
             let name_bytes = entry.name.as_bytes();
             bytes.push(name_bytes.len() as u8);
@@ -258,8 +260,9 @@ impl ReliableBleOutput {
             match event.characteristic_name.as_str() {
                 // ----- ACK frame from client -----
                 "Data_IN" => {
-                    match AckFrame::from_bytes(&event.data) {
-                        Ok(ack) => {
+                    // Parse ACK using raw fixed-size binary per spec
+                    match AckFrame::from_ble_bytes(&event.data) {
+                        Some(ack) => {
                             log::debug!(
                                 "ACK received: session={}, stream={}, ack_base={}",
                                 ack.session_id,
@@ -272,7 +275,7 @@ impl ReliableBleOutput {
                                 st.handle_ack(&ack)
                             };
 
-                            // Retransmit missing frames immediately
+                            // Retransmit missing frames using raw binary
                             if !retransmits.is_empty() {
                                 log::info!(
                                     "Retransmitting {} missing frame(s)",
@@ -280,33 +283,36 @@ impl ReliableBleOutput {
                                 );
                                 let srv = server.read().await;
                                 for frame in retransmits {
-                                    match frame.to_bytes() {
-                                        Ok(bytes) => {
-                                            if let Err(e) = srv.notify("Data_OUT", &bytes).await {
-                                                log::warn!(
-                                                    "Retransmit failed for seq {}: {}",
-                                                    frame.seq_num,
-                                                    e
-                                                );
-                                            } else {
-                                                log::debug!("Retransmitted seq {}", frame.seq_num);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            log::error!("Failed to serialize retransmit: {}", e);
-                                        }
+                                    let bytes = frame.to_ble_bytes();
+                                    if let Err(e) = srv.notify("Data_OUT", &bytes).await {
+                                        log::warn!(
+                                            "Retransmit failed for seq {}: {}",
+                                            frame.seq_num,
+                                            e
+                                        );
+                                    } else {
+                                        log::debug!("Retransmitted seq {}", frame.seq_num);
                                     }
                                 }
                             }
                         }
-                        Err(e) => {
-                            log::warn!("Invalid ACK frame ({} bytes): {}", event.data.len(), e);
+                        None => {
+                            log::warn!("Invalid ACK frame ({} bytes): too short (need >= {} bytes)",
+                                event.data.len(), AckFrame::header_size());
                         }
                     }
                 }
 
                 // ----- Subscribe request from client -----
                 "Subscribe" => {
+                    // Log raw bytes for debugging app interop
+                    let hex_str: Vec<String> = event.data.iter().map(|b| format!("{:02X}", b)).collect();
+                    log::info!(
+                        "Subscribe raw payload ({} bytes): [{}]",
+                        event.data.len(),
+                        hex_str.join(" ")
+                    );
+
                     if event.data.len() >= 2 {
                         let signal_id = u16::from_le_bytes([event.data[0], event.data[1]]);
                         let signal_name = SignalId::from_u16(signal_id)
@@ -452,23 +458,18 @@ impl ReliableBleOutput {
 
                 // Add to sliding window state (returns Some if subscribed)
                 if let Some(frame) = state.add_data(signal_id, val_f32) {
-                    // Send via Data_OUT Notify characteristic
-                    match frame.to_bytes() {
-                        Ok(bytes) => {
-                            if let Err(e) = server.notify("Data_OUT", &bytes).await {
-                                log::warn!("BLE notify failed for signal {}: {}", signal_id, e);
-                            } else {
-                                log::debug!(
-                                    "Sent Data_OUT: signal={}, seq={}, session={}",
-                                    signal_id,
-                                    frame.seq_num,
-                                    frame.session_id
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("Failed to serialize DataFrame: {}", e);
-                        }
+                    // Send via Data_OUT Notify using raw fixed-size binary per spec
+                    let bytes = frame.to_ble_bytes();
+                    if let Err(e) = server.notify("Data_OUT", &bytes).await {
+                        log::warn!("BLE notify failed for signal {}: {}", signal_id, e);
+                    } else {
+                        log::debug!(
+                            "Sent Data_OUT: signal={}, seq={}, session={}, {} bytes",
+                            signal_id,
+                            frame.seq_num,
+                            frame.session_id,
+                            bytes.len()
+                        );
                     }
                 }
             }
@@ -490,17 +491,11 @@ impl ReliableBleOutput {
 
         let server = self.server.read().await;
         for frame in retransmits {
-            match frame.to_bytes() {
-                Ok(bytes) => {
-                    if let Err(e) = server.notify("Data_OUT", &bytes).await {
-                        log::warn!("Retransmit failed for seq {}: {}", frame.seq_num, e);
-                    } else {
-                        log::debug!("Retransmitted seq {}", frame.seq_num);
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to serialize retransmit frame: {}", e);
-                }
+            let bytes = frame.to_ble_bytes();
+            if let Err(e) = server.notify("Data_OUT", &bytes).await {
+                log::warn!("Retransmit failed for seq {}: {}", frame.seq_num, e);
+            } else {
+                log::debug!("Retransmitted seq {}", frame.seq_num);
             }
         }
 
@@ -599,6 +594,7 @@ mod tests {
         let mut bytes = Vec::new();
         for entry in &catalog.entries {
             bytes.extend_from_slice(&entry.id.to_le_bytes());
+            bytes.extend_from_slice(&entry.source.to_le_bytes());
             let name_bytes = entry.name.as_bytes();
             bytes.push(name_bytes.len() as u8);
             bytes.extend_from_slice(name_bytes);
@@ -611,7 +607,7 @@ mod tests {
         }
 
         assert!(!bytes.is_empty());
-        assert!(bytes.len() >= 30); // 3 entries * ~10 bytes each
+        assert!(bytes.len() >= 36); // 3 entries * ~12 bytes each (added 2b source per entry)
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-003
