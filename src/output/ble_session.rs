@@ -1,32 +1,67 @@
 // /src/output/ble_session.rs
 // Module: output.ble_session
-// Purpose: Sliding Window Engine for reliable BLE protocol
-//          Isolated from Bluetooth radio, making it safe and testable
+// Purpose: Multi-stream Session Engine for the IDT ("ICU Data Transport") BLE protocol — V2.0
 //
-// The Sliding Window Engine (State Management)
+//          Each subscribed signal gets its own independent IDT stream:
+//            signal_id → stream_id (allocated at subscribe time, idempotent)
+//            per-stream: sequence counter + retransmit buffer (VecDeque<DataFrame>)
+//
+//          ACK handling: cumulative (ack_upto), no bitmap.
+//          NACK handling: explicit seq_list; frames returned with FLAG_RETRANSMIT.
+//          Session change: if a new session_id is detected in an ACK, all buffers reset.
+//
+//          Isolated from Bluetooth radio for safe unit testing.
 
-use crate::domain::ble_protocol::{AckFrame, DataFrame, SignalId};
-use std::collections::{HashSet, VecDeque};
+use crate::domain::ble_protocol::{DataFrame, FLAG_RETRANSMIT};
+use std::collections::{HashMap, VecDeque};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// StreamEntry
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// ID SRS: SRS-MOD-BLESESSION-001
+/// Title: StreamEntry
+///
+/// Description: One active IDT stream bound to a single signal_id.
+///              Each stream has its own sequence counter and retransmit buffer,
+///              independent from all other streams.
+///
+/// Version: V2.0
+pub struct StreamEntry {
+    /// Allocated IDT stream_id for this signal
+    pub stream_id: u16,
+    /// IDT signal_id (e.g. 0x0101=HR, 0x0102=SpO2, 0x0103=Temperature)
+    pub signal_id: u16,
+    /// Source identifier (always 1 for scope signals in V1)
+    pub source_id: u8,
+    /// Last sent sequence number for this stream (0 = no frame sent yet)
+    pub last_seq: u32,
+    /// Retransmit buffer: bounded VecDeque of sent-but-unacknowledged frames
+    pub tx_buffer: VecDeque<DataFrame>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BleSessionState
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// ID SRS: SRS-MOD-BLESESSION-002
 /// Title: BleSessionState
 ///
-/// Description: VRConnect shall maintain session state for reliable BLE communication
-/// including sequence tracking, transmission buffer management, and subscription handling.
+/// Description: VRConnect shall maintain per-signal IDT stream state for reliable
+///              BLE communication, including multi-stream sequence tracking,
+///              retransmit buffer management, and subscription handling.
 ///
-/// Version: V1.0
+/// Version: V2.0
 pub struct BleSessionState {
-    /// Current session identifier - resets on new session
+    /// Current IDT session identifier (from the BLE Central handshake)
     pub current_session_id: u16,
-    /// Current stream identifier (maps to SignalId)
-    pub current_stream_id: u16,
-    /// Last sequence number sent
-    pub last_seq: u32,
-    /// Transmission buffer for sliding window and retransmission
-    pub tx_buffer: VecDeque<DataFrame>,
-    /// Subscribed signal IDs (e.g., 1=HR, 2=SpO2, 3=Temperature)
-    pub subscriptions: HashSet<u16>,
-    /// Maximum buffer size to prevent unbounded growth (medical safety)
+    /// Active streams indexed by stream_id
+    pub streams: HashMap<u16, StreamEntry>,
+    /// Maps signal_id → stream_id for O(1) lookup during data output
+    pub signal_to_stream: HashMap<u16, u16>,
+    /// Next stream_id to allocate on subscribe (starts at 1, monotone)
+    pub next_stream_id: u16,
+    /// Maximum frames per stream buffer (medical safety: prevents unbounded growth)
     pub max_buffer_size: usize,
 }
 
@@ -34,36 +69,33 @@ impl BleSessionState {
     /// ID SRS: SRS-FN-BLESESSION-001
     /// Title: new
     ///
-    /// Description: VRConnect shall create a new BleSessionState with the given session ID
-    /// and default configuration.
+    /// Description: VRConnect shall create a new BleSessionState with the given
+    ///              session ID and no active streams.
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     ///
     /// # Arguments
-    /// * `session_id` - Initial session identifier
-    ///
-    /// # Returns
-    /// New BleSessionState instance
+    /// * `session_id` - Initial IDT session identifier
     pub fn new(session_id: u16) -> Self {
         Self {
             current_session_id: session_id,
-            current_stream_id: 1,
-            last_seq: 0,
-            tx_buffer: VecDeque::new(),
-            subscriptions: HashSet::new(),
-            max_buffer_size: 1000, // Medical requirement: prevent unbounded growth
+            streams: HashMap::new(),
+            signal_to_stream: HashMap::new(),
+            next_stream_id: 1,
+            max_buffer_size: 1000, // Medical: prevent unbounded memory growth
         }
     }
 
     /// ID SRS: SRS-FN-BLESESSION-002
     /// Title: with_buffer_size
     ///
-    /// Description: VRConnect shall allow configuring the maximum buffer size.
+    /// Description: VRConnect shall allow configuring the maximum retransmit buffer
+    ///              size per stream. Used for testing and resource-constrained deployments.
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     ///
     /// # Arguments
-    /// * `size` - Maximum number of frames to retain in transmission buffer
+    /// * `size` - Maximum number of frames per stream retransmit buffer
     ///
     /// # Returns
     /// Self for method chaining
@@ -75,528 +107,512 @@ impl BleSessionState {
     /// ID SRS: SRS-FN-BLESESSION-003
     /// Title: subscribe
     ///
-    /// Description: VRConnect shall subscribe a signal ID for transmission.
+    /// Description: VRConnect shall allocate a new IDT stream_id for a signal_id on
+    ///              first subscription. Subsequent calls with the same signal_id are
+    ///              idempotent: the same stream_id is returned without creating a new stream.
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     ///
     /// # Arguments
-    /// * `signal_id` - Signal ID to subscribe (1=HR, 2=SpO2, 3=Temperature)
-    pub fn subscribe(&mut self, signal_id: u16) {
-        self.subscriptions.insert(signal_id);
+    /// * `signal_id` - IDT signal identifier to subscribe (e.g. 0x0101 = HR)
+    ///
+    /// # Returns
+    /// Newly allocated or pre-existing stream_id for this signal
+    pub fn subscribe(&mut self, signal_id: u16) -> u16 {
+        // Idempotent: return existing stream_id unchanged
+        if let Some(&existing) = self.signal_to_stream.get(&signal_id) {
+            return existing;
+        }
+        let stream_id = self.next_stream_id;
+        self.next_stream_id += 1;
+        self.streams.insert(
+            stream_id,
+            StreamEntry {
+                stream_id,
+                signal_id,
+                source_id: 1,
+                last_seq: 0,
+                tx_buffer: VecDeque::new(),
+            },
+        );
+        self.signal_to_stream.insert(signal_id, stream_id);
+        stream_id
     }
 
     /// ID SRS: SRS-FN-BLESESSION-004
     /// Title: unsubscribe
     ///
-    /// Description: VRConnect shall unsubscribe a signal ID from transmission.
+    /// Description: VRConnect shall remove the stream for a signal_id, discarding
+    ///              its retransmit buffer.  A no-op if not subscribed.
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     ///
     /// # Arguments
-    /// * `signal_id` - Signal ID to unsubscribe
+    /// * `signal_id` - IDT signal identifier to unsubscribe
     pub fn unsubscribe(&mut self, signal_id: u16) {
-        self.subscriptions.remove(&signal_id);
+        if let Some(stream_id) = self.signal_to_stream.remove(&signal_id) {
+            self.streams.remove(&stream_id);
+        }
     }
 
     /// ID SRS: SRS-FN-BLESESSION-005
     /// Title: is_subscribed
     ///
-    /// Description: VRConnect shall check if a signal ID is subscribed.
+    /// Description: VRConnect shall return true if the given signal_id has an active stream.
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     ///
     /// # Arguments
-    /// * `signal_id` - Signal ID to check
+    /// * `signal_id` - IDT signal identifier
     ///
     /// # Returns
-    /// true if subscribed, false otherwise
+    /// true if an active stream exists for this signal, false otherwise
     pub fn is_subscribed(&self, signal_id: u16) -> bool {
-        self.subscriptions.contains(&signal_id)
+        self.signal_to_stream.contains_key(&signal_id)
     }
 
     /// ID SRS: SRS-FN-BLESESSION-006
-    /// Title: handle_ack
+    /// Title: get_stream_id
     ///
-    /// Description: VRConnect shall process acknowledgment frames according to protocol:
-    /// - If new session detected: reset state (clear buffer, reset sequence)
-    /// - Remove acknowledged frames from tx_buffer (seq_num <= ack_base)
-    /// - Check bitmap and retransmit missing frames (bit=0 means missing)
+    /// Description: VRConnect shall return the IDT stream_id allocated to a signal_id,
+    ///              or None if not subscribed.
     ///
-    /// PDF Logic: "Si nouvelle session détectée : reset ackWindow, stats, lastSeq"
-    /// PDF Logic: "stream.txBuffer.removeWhere((seq, _) => seq <= ackBase)"
-    /// PDF Logic: "Vérifie bitmap -> Retransmet trames manquantes"
-    ///
-    /// Version: V1.0
+    /// Version: V2.0
     ///
     /// # Arguments
-    /// * `ack` - Acknowledgment frame from receiver
+    /// * `signal_id` - IDT signal identifier
     ///
     /// # Returns
-    /// Vec of DataFrame to retransmit
-    pub fn handle_ack(&mut self, ack: &AckFrame) -> Vec<DataFrame> {
-        // Check for new session
-        if ack.session_id != self.current_session_id {
-            // PDF: "Si nouvelle session détectée : reset ackWindow, stats, lastSeq"
-            self.current_session_id = ack.session_id;
-            self.tx_buffer.clear();
-            self.last_seq = 0;
-            return vec![]; // Nothing to retransmit on new session
-        }
-
-        // PDF: "stream.txBuffer.removeWhere((seq, _) => seq <= ackBase)"
-        // Remove acknowledged frames (seq_num <= ack_base are confirmed received)
-        self.tx_buffer.retain(|frame| frame.seq_num > ack.ack_base);
-
-        // PDF: "Vérifie bitmap -> Retransmet trames manquantes"
-        // Bitmap: bit=1 means received OK, bit=0 means missing (need retransmission)
-        let mut to_retransmit = Vec::new();
-
-        for i in 0..(ack.bitmap_len as usize * 8) {
-            let byte_idx = i / 8;
-            let bit_idx = i % 8;
-
-            // Bounds check
-            if byte_idx >= ack.bitmap.len() {
-                break;
-            }
-
-            // Check if bit is 0 (0 means missing/retransmission requested)
-            let bit_set = (ack.bitmap[byte_idx] >> bit_idx) & 1 == 1;
-
-            if !bit_set {
-                // This sequence number is missing, needs retransmission
-                let missing_seq = ack.ack_base + 1 + i as u32;
-
-                // Find it in our buffer
-                if let Some(frame) = self.tx_buffer.iter().find(|f| f.seq_num == missing_seq) {
-                    to_retransmit.push(frame.clone());
-                }
-            }
-        }
-
-        to_retransmit
+    /// Some(stream_id) if subscribed, None otherwise
+    pub fn get_stream_id(&self, signal_id: u16) -> Option<u16> {
+        self.signal_to_stream.get(&signal_id).copied()
     }
 
     /// ID SRS: SRS-FN-BLESESSION-007
     /// Title: add_data
     ///
-    /// Description: VRConnect shall add data to the session if subscribed,
-    /// creating a new DataFrame with the next sequence number.
+    /// Description: VRConnect shall produce an IDT DataFrame for the given signal if
+    ///              subscribed.  The per-stream sequence counter is incremented and the
+    ///              frame is stored in the retransmit buffer (bounded by max_buffer_size).
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     ///
     /// # Arguments
-    /// * `signal_id` - Signal ID (1=HR, 2=SpO2, 3=Temperature)
-    /// * `value` - Float value to encode
+    /// * `signal_id` - IDT signal identifier (e.g. 0x0101 = HR)
+    /// * `value`     - Measured float32 value
+    /// * `t0_ms`     - Sample timestamp, milliseconds since Unix epoch
     ///
     /// # Returns
-    /// Some(DataFrame) if subscribed, None otherwise
-    pub fn add_data(&mut self, signal_id: u16, value: f32) -> Option<DataFrame> {
-        // Only add data if subscribed to this signal
-        if !self.subscriptions.contains(&signal_id) {
-            return None;
-        }
+    /// Some(DataFrame) ready to notify on Data_OUT, None if signal not subscribed
+    pub fn add_data(&mut self, signal_id: u16, value: f32, t0_ms: u64) -> Option<DataFrame> {
+        let stream_id = *self.signal_to_stream.get(&signal_id)?;
+        let entry = self.streams.get_mut(&stream_id)?;
 
-        // Increment sequence number
-        self.last_seq += 1;
+        entry.last_seq += 1;
+        let seq = entry.last_seq;
 
-        // Encode value as payload (4 bytes, little-endian f32)
-        let payload = value.to_le_bytes().to_vec();
+        let frame = DataFrame::new(self.current_session_id, stream_id, seq, t0_ms, value);
 
-        // Create the DataFrame
-        let frame = DataFrame {
-            session_id: self.current_session_id,
-            stream_id: self.current_stream_id,
-            seq_num: self.last_seq,
-            payload,
-        };
-
-        // Add to transmission buffer for potential retransmission
-        self.tx_buffer.push_back(frame.clone());
-
-        // Safety: Don't let buffer grow infinitely (Medical requirement)
-        while self.tx_buffer.len() > self.max_buffer_size {
-            self.tx_buffer.pop_front();
+        // Buffer for retransmission (oldest frame evicted when limit reached)
+        entry.tx_buffer.push_back(frame.clone());
+        while entry.tx_buffer.len() > self.max_buffer_size {
+            entry.tx_buffer.pop_front();
         }
 
         Some(frame)
     }
 
     /// ID SRS: SRS-FN-BLESESSION-008
-    /// Title: add_data_with_signal
+    /// Title: handle_ack
     ///
-    /// Description: VRConnect shall add data using SignalId enum for type safety.
+    /// Description: VRConnect shall process a cumulative IDT ACK_FRAME.
+    ///   - If a new session_id is detected: reset all stream buffers and sequence counters.
+    ///   - Otherwise: purge frames with seq ≤ ack_upto from the named stream's buffer.
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     ///
     /// # Arguments
-    /// * `signal` - SignalId enum (HR, SpO2, Temperature)
-    /// * `value` - Float value to encode
-    ///
-    /// # Returns
-    /// Some(DataFrame) if subscribed, None otherwise
-    pub fn add_data_with_signal(&mut self, signal: SignalId, value: f32) -> Option<DataFrame> {
-        self.add_data(signal.as_u16(), value)
+    /// * `session_id` - Session identifier from the received ACK header
+    /// * `stream_id`  - Stream identifier from the received ACK header
+    /// * `ack_upto`   - Last contiguously acknowledged sequence number (inclusive)
+    pub fn handle_ack(&mut self, session_id: u16, stream_id: u16, ack_upto: u32) {
+        if session_id != self.current_session_id {
+            // New session detected: reset all buffers (subscriptions preserved)
+            self.current_session_id = session_id;
+            for entry in self.streams.values_mut() {
+                entry.tx_buffer.clear();
+                entry.last_seq = 0;
+            }
+            return;
+        }
+
+        // Purge confirmed frames from the targeted stream
+        if let Some(entry) = self.streams.get_mut(&stream_id) {
+            entry.tx_buffer.retain(|f| f.header.seq > ack_upto);
+        }
     }
 
     /// ID SRS: SRS-FN-BLESESSION-009
-    /// Title: get_pending_count
+    /// Title: handle_nack
     ///
-    /// Description: VRConnect shall return the number of pending frames in buffer.
+    /// Description: VRConnect shall return frames from the named stream's buffer that
+    ///              match the requested sequence numbers, setting FLAG_RETRANSMIT in each
+    ///              returned frame.  The buffer itself is NOT modified.
     ///
-    /// Version: V1.0
+    /// Version: V2.0
+    ///
+    /// # Arguments
+    /// * `stream_id` - IDT stream targeted by the NACK
+    /// * `seqs`      - Sequence numbers requested for retransmission
     ///
     /// # Returns
-    /// Number of frames awaiting acknowledgment
-    pub fn get_pending_count(&self) -> usize {
-        self.tx_buffer.len()
+    /// Vec of cloned DataFrame with FLAG_RETRANSMIT set; empty if stream unknown
+    pub fn handle_nack(&self, stream_id: u16, seqs: &[u32]) -> Vec<DataFrame> {
+        let Some(entry) = self.streams.get(&stream_id) else {
+            return vec![];
+        };
+        seqs.iter()
+            .filter_map(|&seq| {
+                entry.tx_buffer.iter().find(|f| f.header.seq == seq).map(|f| {
+                    let mut retransmit = f.clone();
+                    retransmit.header.flags |= FLAG_RETRANSMIT;
+                    retransmit
+                })
+            })
+            .collect()
     }
 
     /// ID SRS: SRS-FN-BLESESSION-010
-    /// Title: clear_buffer
+    /// Title: reset_session
     ///
-    /// Description: VRConnect shall clear the transmission buffer.
+    /// Description: VRConnect shall reset all streams to a new session ID, clearing
+    ///              retransmit buffers and sequence counters.  Subscriptions are preserved.
     ///
-    /// Version: V1.0
-    pub fn clear_buffer(&mut self) {
-        self.tx_buffer.clear();
+    /// Version: V2.0
+    ///
+    /// # Arguments
+    /// * `new_session_id` - New IDT session identifier
+    pub fn reset_session(&mut self, new_session_id: u16) {
+        self.current_session_id = new_session_id;
+        for entry in self.streams.values_mut() {
+            entry.tx_buffer.clear();
+            entry.last_seq = 0;
+        }
     }
 
     /// ID SRS: SRS-FN-BLESESSION-011
-    /// Title: reset_session
+    /// Title: get_pending_count
     ///
-    /// Description: VRConnect shall reset the session with a new session ID,
-    /// clearing all state.
+    /// Description: VRConnect shall return the number of unacknowledged frames in
+    ///              the retransmit buffer for the given signal.
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     ///
     /// # Arguments
-    /// * `new_session_id` - New session identifier
-    pub fn reset_session(&mut self, new_session_id: u16) {
-        self.current_session_id = new_session_id;
-        self.last_seq = 0;
-        self.tx_buffer.clear();
+    /// * `signal_id` - IDT signal identifier
+    ///
+    /// # Returns
+    /// Number of buffered frames; 0 if not subscribed
+    pub fn get_pending_count(&self, signal_id: u16) -> usize {
+        self.signal_to_stream
+            .get(&signal_id)
+            .and_then(|sid| self.streams.get(sid))
+            .map(|e| e.tx_buffer.len())
+            .unwrap_or(0)
     }
 
     /// ID SRS: SRS-FN-BLESESSION-012
-    /// Title: get_frame_by_seq
+    /// Title: total_pending
     ///
-    /// Description: VRConnect shall retrieve a specific frame by sequence number
-    /// from the transmission buffer.
+    /// Description: VRConnect shall return the total number of unacknowledged frames
+    ///              across all active streams (used for session statistics).
     ///
-    /// Version: V1.0
-    ///
-    /// # Arguments
-    /// * `seq_num` - Sequence number to find
+    /// Version: V2.0
     ///
     /// # Returns
-    /// Some(&DataFrame) if found, None otherwise
-    pub fn get_frame_by_seq(&self, seq_num: u32) -> Option<&DataFrame> {
-        self.tx_buffer.iter().find(|f| f.seq_num == seq_num)
+    /// Sum of all stream buffer lengths
+    pub fn total_pending(&self) -> usize {
+        self.streams.values().map(|e| e.tx_buffer.len()).sum()
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ble_protocol::{FLAG_RETRANSMIT, IDT_MAGIC, MSG_DATA_FRAME, SignalId};
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-001
     /// Title: Test session creation
     ///
-    /// Description: VRConnect shall create BleSessionState with correct initial values.
-    ///
-    /// Version: V1.0
+    /// Description: BleSessionState::new shall start with no streams and next_stream_id=1.
     #[test]
     fn test_session_creation() {
         let session = BleSessionState::new(42);
-
         assert_eq!(session.current_session_id, 42);
-        assert_eq!(session.current_stream_id, 1);
-        assert_eq!(session.last_seq, 0);
-        assert!(session.tx_buffer.is_empty());
-        assert!(session.subscriptions.is_empty());
+        assert!(session.streams.is_empty());
+        assert!(session.signal_to_stream.is_empty());
+        assert_eq!(session.next_stream_id, 1);
         assert_eq!(session.max_buffer_size, 1000);
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-002
-    /// Title: Test subscription management
+    /// Title: Test subscribe allocates stream_id
     ///
-    /// Description: VRConnect shall correctly manage signal subscriptions.
-    ///
-    /// Version: V1.0
+    /// Description: subscribe(0x0101) shall allocate stream_id=1 for the first signal.
     #[test]
-    fn test_subscription_management() {
+    fn test_subscribe_allocates_stream_id() {
         let mut session = BleSessionState::new(1);
-
-        // Subscribe to HR
-        session.subscribe(SignalId::HR.as_u16());
+        let stream_id = session.subscribe(SignalId::HR.as_u16());
+        assert_eq!(stream_id, 1);
         assert!(session.is_subscribed(SignalId::HR.as_u16()));
-        assert!(!session.is_subscribed(SignalId::SpO2.as_u16()));
-
-        // Subscribe to SpO2
-        session.subscribe(SignalId::SpO2.as_u16());
-        assert!(session.is_subscribed(SignalId::SpO2.as_u16()));
-
-        // Unsubscribe HR
-        session.unsubscribe(SignalId::HR.as_u16());
-        assert!(!session.is_subscribed(SignalId::HR.as_u16()));
-
-        // Test with SignalId enum directly
-        session.subscribe(SignalId::Temperature.as_u16());
-        assert!(session.is_subscribed(3)); // Temperature = 3
+        assert_eq!(session.streams.len(), 1);
+        assert_eq!(session.next_stream_id, 2);
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-003
-    /// Title: Test add_data with subscription
+    /// Title: Test subscribe is idempotent
     ///
-    /// Description: VRConnect shall only add data for subscribed signals.
-    ///
-    /// Version: V1.0
+    /// Description: Calling subscribe twice for the same signal_id shall return
+    ///              the same stream_id without creating a duplicate stream.
     #[test]
-    fn test_add_data_with_subscription() {
+    fn test_subscribe_idempotent() {
         let mut session = BleSessionState::new(1);
-
-        // Not subscribed - should return None
-        assert!(session.add_data(SignalId::HR.as_u16(), 75.0).is_none());
-
-        // Subscribe and add
-        session.subscribe(SignalId::HR.as_u16());
-        let frame = session.add_data(SignalId::HR.as_u16(), 75.0);
-
-        assert!(frame.is_some());
-        let frame = frame.unwrap();
-        assert_eq!(frame.session_id, 1);
-        assert_eq!(frame.stream_id, 1);
-        assert_eq!(frame.seq_num, 1);
-
-        // Verify payload encoding (f32 little-endian)
-        let expected_payload = 75.0f32.to_le_bytes();
-        assert_eq!(frame.payload, expected_payload.to_vec());
-
-        // Check buffer size
-        assert_eq!(session.get_pending_count(), 1);
+        let id1 = session.subscribe(SignalId::HR.as_u16());
+        let id2 = session.subscribe(SignalId::HR.as_u16());
+        assert_eq!(id1, id2);
+        assert_eq!(session.streams.len(), 1);
+        assert_eq!(session.next_stream_id, 2); // only incremented once
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-004
-    /// Title: Test sequence number incrementing
+    /// Title: Test unsubscribe removes stream
     ///
-    /// Description: VRConnect shall increment sequence numbers correctly.
-    ///
-    /// Version: V1.0
+    /// Description: unsubscribe shall remove both the StreamEntry and the signal→stream mapping.
     #[test]
-    fn test_sequence_incrementing() {
+    fn test_unsubscribe_removes_stream() {
         let mut session = BleSessionState::new(1);
         session.subscribe(SignalId::HR.as_u16());
+        assert!(session.is_subscribed(SignalId::HR.as_u16()));
 
-        let frame1 = session.add_data(SignalId::HR.as_u16(), 75.0).unwrap();
-        let frame2 = session.add_data(SignalId::HR.as_u16(), 76.0).unwrap();
-        let frame3 = session.add_data(SignalId::HR.as_u16(), 77.0).unwrap();
-
-        assert_eq!(frame1.seq_num, 1);
-        assert_eq!(frame2.seq_num, 2);
-        assert_eq!(frame3.seq_num, 3);
-        assert_eq!(session.last_seq, 3);
+        session.unsubscribe(SignalId::HR.as_u16());
+        assert!(!session.is_subscribed(SignalId::HR.as_u16()));
+        assert!(session.streams.is_empty());
+        assert!(session.signal_to_stream.is_empty());
     }
 
+    // ── add_data ──────────────────────────────────────────────────────────────
+
     /// ID SRS: SRS-TEST-BLESESSION-005
-    /// Title: Test buffer size limit
-    ///
-    /// Description: VRConnect shall enforce maximum buffer size limit.
-    ///
-    /// Version: V1.0
+    /// Title: Test add_data returns None when not subscribed
     #[test]
-    fn test_buffer_size_limit() {
-        let mut session = BleSessionState::new(1).with_buffer_size(5);
-        session.subscribe(SignalId::HR.as_u16());
-
-        // Add 10 frames
-        for i in 0..10 {
-            session.add_data(SignalId::HR.as_u16(), i as f32);
-        }
-
-        // Buffer should only contain last 5 frames (seq 6-10)
-        assert_eq!(session.get_pending_count(), 5);
-
-        // Oldest frame should be seq 6
-        let oldest = session.tx_buffer.front().unwrap();
-        assert_eq!(oldest.seq_num, 6);
-
-        // Newest frame should be seq 10
-        let newest = session.tx_buffer.back().unwrap();
-        assert_eq!(newest.seq_num, 10);
+    fn test_add_data_no_subscription() {
+        let mut session = BleSessionState::new(1);
+        assert!(session.add_data(SignalId::HR.as_u16(), 75.0, 1_000_000).is_none());
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-006
-    /// Title: Test handle_ack with new session
+    /// Title: Test add_data produces a valid IDT DATA_FRAME
     ///
-    /// Description: VRConnect shall reset state when new session is detected.
-    ///
-    /// Version: V1.0
+    /// Description: The returned DataFrame shall carry the correct IDT magic, msg_type,
+    ///              session_id, t0_ms, and float32 value.
     #[test]
-    fn test_handle_ack_new_session() {
-        let mut session = BleSessionState::new(1);
+    fn test_add_data_produces_idt_frame() {
+        let mut session = BleSessionState::new(3);
         session.subscribe(SignalId::HR.as_u16());
 
-        // Add some data
-        session.add_data(SignalId::HR.as_u16(), 75.0);
-        session.add_data(SignalId::HR.as_u16(), 76.0);
-        assert_eq!(session.get_pending_count(), 2);
-        assert_eq!(session.last_seq, 2);
+        let t0_ms: u64 = 1_700_000_000_000;
+        let frame = session.add_data(SignalId::HR.as_u16(), 72.5, t0_ms).unwrap();
 
-        // Receive ACK for new session
-        let ack = AckFrame::new(2, 1, 0, vec![]);
-        let retransmit = session.handle_ack(&ack);
+        // Verify wire encoding via to_ble_bytes
+        let bytes = frame.to_ble_bytes();
+        assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), IDT_MAGIC);
+        assert_eq!(bytes[3], MSG_DATA_FRAME);
 
-        // State should be reset
-        assert_eq!(session.current_session_id, 2);
-        assert_eq!(session.get_pending_count(), 0);
-        assert_eq!(session.last_seq, 0);
-        assert!(retransmit.is_empty());
+        // Verify struct fields
+        assert_eq!(frame.header.session_id, 3);
+        assert_eq!(frame.header.seq, 1);
+        assert_eq!(frame.t0_ms, t0_ms);
+        assert!((frame.value - 72.5f32).abs() < f32::EPSILON);
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-007
-    /// Title: Test handle_ack removes acknowledged frames
+    /// Title: Test sequence number increments per stream
     ///
-    /// Description: VRConnect shall remove frames with seq <= ack_base from buffer.
-    ///
-    /// Version: V1.0
+    /// Description: Three successive add_data calls on the same signal shall produce
+    ///              seq = 1, 2, 3.
     #[test]
-    fn test_handle_ack_removes_acked_frames() {
+    fn test_add_data_seq_increment() {
         let mut session = BleSessionState::new(1);
         session.subscribe(SignalId::HR.as_u16());
 
-        // Add 5 frames (seq 1-5)
-        for i in 1..=5 {
-            session.add_data(SignalId::HR.as_u16(), i as f32);
+        let f1 = session.add_data(SignalId::HR.as_u16(), 70.0, 0).unwrap();
+        let f2 = session.add_data(SignalId::HR.as_u16(), 71.0, 1000).unwrap();
+        let f3 = session.add_data(SignalId::HR.as_u16(), 72.0, 2000).unwrap();
+
+        assert_eq!(f1.header.seq, 1);
+        assert_eq!(f2.header.seq, 2);
+        assert_eq!(f3.header.seq, 3);
+    }
+
+    // ── handle_ack ────────────────────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLESESSION-008
+    /// Title: Test handle_ack purges acknowledged frames
+    ///
+    /// Description: handle_ack(ack_upto=3) on a buffer of 5 frames shall leave
+    ///              exactly frames seq 4 and 5.
+    #[test]
+    fn test_handle_ack_purges_buffer() {
+        let mut session = BleSessionState::new(1);
+        let stream_id = session.subscribe(SignalId::HR.as_u16());
+
+        for i in 0u64..5 {
+            session.add_data(SignalId::HR.as_u16(), i as f32, i * 1000);
         }
-        assert_eq!(session.get_pending_count(), 5);
+        assert_eq!(session.get_pending_count(SignalId::HR.as_u16()), 5);
 
-        // ACK with ack_base=3 and empty bitmap (all up to 3 are acked)
-        let ack = AckFrame::new(1, 1, 3, vec![]);
-        let retransmit = session.handle_ack(&ack);
+        session.handle_ack(1, stream_id, 3);
+        assert_eq!(session.get_pending_count(SignalId::HR.as_u16()), 2);
 
-        // Frames 1-3 should be removed, 4-5 remain
-        assert_eq!(session.get_pending_count(), 2);
-        assert!(retransmit.is_empty());
-
-        // Verify remaining frames
-        let seqs: Vec<u32> = session.tx_buffer.iter().map(|f| f.seq_num).collect();
+        let entry = session.streams.get(&stream_id).unwrap();
+        let seqs: Vec<u32> = entry.tx_buffer.iter().map(|f| f.header.seq).collect();
         assert_eq!(seqs, vec![4, 5]);
     }
 
-    /// ID SRS: SRS-TEST-BLESESSION-008
-    /// Title: Test handle_ack retransmission
-    ///
-    /// Description: VRConnect shall retransmit frames where bitmap bit is 0.
-    ///
-    /// Version: V1.0
-    #[test]
-    fn test_handle_ack_retransmission() {
-        let mut session = BleSessionState::new(1);
-        session.subscribe(SignalId::HR.as_u16());
-
-        // Add 5 frames (seq 1-5)
-        for i in 1..=5 {
-            session.add_data(SignalId::HR.as_u16(), i as f32);
-        }
-
-        // ACK with ack_base=1 and bitmap where bits 1 and 3 are 0 (seq 2 and 4 missing)
-        // Bitmap: bit 0 = seq 2, bit 1 = seq 3, bit 2 = seq 4, bit 3 = seq 5
-        // We want bits 1 and 3 to be 0 -> bitmap byte = 0b00000101 = 5
-        let ack = AckFrame::new(1, 1, 1, vec![0b00001010]); // bits 1 and 3 are 1, wait no...
-                                                            // Let me reconsider: bit 0 set = seq 2 received, bit 1 set = seq 3 received
-                                                            // We want seq 2 (bit 0) = 0 and seq 4 (bit 2) = 0
-                                                            // bitmap = 0b00001010 = seq 3 and seq 5 received (bits 1 and 3 set)
-                                                            // Actually, let's be clearer:
-                                                            // - bit 0 (0x01) = seq 2 received OK
-                                                            // - bit 1 (0x02) = seq 3 received OK
-                                                            // - bit 2 (0x04) = seq 4 received OK
-                                                            // - bit 3 (0x08) = seq 5 received OK
-                                                            // To mark seq 2 and 4 as missing, we set bits 1 and 3: 0b00001010 = 10
-                                                            // Wait, that's wrong. If bit is 1 = received OK, 0 = missing
-                                                            // So to have seq 2 (bit 0) and seq 4 (bit 2) MISSING:
-                                                            // bits 1 and 3 should be 1: 0b00001010
-        let ack = AckFrame::new(1, 1, 1, vec![0b00001010]);
-
-        let retransmit = session.handle_ack(&ack);
-
-        // Should retransmit seq 2 and 4
-        assert_eq!(retransmit.len(), 2);
-        assert_eq!(retransmit[0].seq_num, 2);
-        assert_eq!(retransmit[1].seq_num, 4);
-
-        // Buffer should still have 4 and 5 (2 was retransmitted but not removed)
-        // Actually, frames are only removed by ack_base, not by retransmission
-        assert_eq!(session.get_pending_count(), 4); // 2, 3, 4, 5 remain (seq 1 removed)
-    }
-
     /// ID SRS: SRS-TEST-BLESESSION-009
-    /// Title: Test session reset
+    /// Title: Test handle_ack with new session_id resets all buffers
     ///
-    /// Description: VRConnect shall reset session state correctly.
-    ///
-    /// Version: V1.0
+    /// Description: If session_id in the ACK differs from current_session_id, all
+    ///              stream buffers shall be cleared (subscriptions preserved).
     #[test]
-    fn test_session_reset() {
+    fn test_handle_ack_session_reset() {
         let mut session = BleSessionState::new(1);
-        session.subscribe(SignalId::HR.as_u16());
+        let stream_id = session.subscribe(SignalId::HR.as_u16());
 
-        session.add_data(SignalId::HR.as_u16(), 75.0);
-        session.add_data(SignalId::HR.as_u16(), 76.0);
+        session.add_data(SignalId::HR.as_u16(), 70.0, 0);
+        session.add_data(SignalId::HR.as_u16(), 71.0, 1000);
+        session.add_data(SignalId::HR.as_u16(), 72.0, 2000);
+        assert_eq!(session.get_pending_count(SignalId::HR.as_u16()), 3);
 
-        assert_eq!(session.get_pending_count(), 2);
-        assert_eq!(session.last_seq, 2);
+        // New session_id in ACK
+        session.handle_ack(99, stream_id, 0);
 
-        session.reset_session(42);
-
-        assert_eq!(session.current_session_id, 42);
-        assert_eq!(session.last_seq, 0);
-        assert_eq!(session.get_pending_count(), 0);
-        // Subscriptions should be preserved
+        assert_eq!(session.current_session_id, 99);
+        assert_eq!(session.total_pending(), 0);
+        // Subscriptions must survive the reset
         assert!(session.is_subscribed(SignalId::HR.as_u16()));
     }
 
+    // ── handle_nack ───────────────────────────────────────────────────────────
+
     /// ID SRS: SRS-TEST-BLESESSION-010
-    /// Title: Test get_frame_by_seq
+    /// Title: Test handle_nack returns frames with FLAG_RETRANSMIT
     ///
-    /// Description: VRConnect shall retrieve frames by sequence number.
-    ///
-    /// Version: V1.0
+    /// Description: handle_nack for seq=2 shall return exactly that frame with
+    ///              FLAG_RETRANSMIT set, without modifying the buffer.
     #[test]
-    fn test_get_frame_by_seq() {
+    fn test_handle_nack_retransmit() {
         let mut session = BleSessionState::new(1);
-        session.subscribe(SignalId::HR.as_u16());
+        let stream_id = session.subscribe(SignalId::HR.as_u16());
 
-        session.add_data(SignalId::HR.as_u16(), 75.0);
-        session.add_data(SignalId::HR.as_u16(), 76.0);
-        session.add_data(SignalId::HR.as_u16(), 77.0);
+        session.add_data(SignalId::HR.as_u16(), 70.0, 0);
+        session.add_data(SignalId::HR.as_u16(), 71.0, 1000);
+        session.add_data(SignalId::HR.as_u16(), 72.0, 2000);
 
-        assert!(session.get_frame_by_seq(2).is_some());
-        assert_eq!(session.get_frame_by_seq(2).unwrap().seq_num, 2);
+        let retransmits = session.handle_nack(stream_id, &[2]);
+        assert_eq!(retransmits.len(), 1);
+        assert_eq!(retransmits[0].header.seq, 2);
+        assert_ne!(retransmits[0].header.flags & FLAG_RETRANSMIT, 0,
+            "FLAG_RETRANSMIT must be set");
 
-        assert!(session.get_frame_by_seq(99).is_none());
+        // Buffer unchanged — 3 frames still present
+        assert_eq!(session.get_pending_count(SignalId::HR.as_u16()), 3);
     }
 
+    // ── Buffer size limit ─────────────────────────────────────────────────────
+
     /// ID SRS: SRS-TEST-BLESESSION-011
-    /// Title: Test add_data_with_signal
+    /// Title: Test buffer size limit evicts oldest frames
     ///
-    /// Description: VRConnect shall support SignalId enum for type-safe data addition.
-    ///
-    /// Version: V1.0
+    /// Description: with_buffer_size(3) followed by 5 add_data calls shall retain
+    ///              only the 3 most recent frames (seq 3, 4, 5).
     #[test]
-    fn test_add_data_with_signal_enum() {
+    fn test_buffer_size_limit() {
+        let mut session = BleSessionState::new(1).with_buffer_size(3);
+        let stream_id = session.subscribe(SignalId::HR.as_u16());
+
+        for i in 0u64..5 {
+            session.add_data(SignalId::HR.as_u16(), i as f32, i * 1000);
+        }
+        assert_eq!(session.get_pending_count(SignalId::HR.as_u16()), 3);
+
+        let entry = session.streams.get(&stream_id).unwrap();
+        assert_eq!(entry.tx_buffer.front().unwrap().header.seq, 3);
+        assert_eq!(entry.tx_buffer.back().unwrap().header.seq, 5);
+    }
+
+    // ── Multi-signal ──────────────────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLESESSION-012
+    /// Title: Test multiple signals get independent streams and sequence counters
+    ///
+    /// Description: HR and SpO2 shall receive distinct stream_ids and independent
+    ///              per-stream sequence numbers.
+    #[test]
+    fn test_multi_signal_independent_streams() {
+        let mut session = BleSessionState::new(1);
+        let hr_stream = session.subscribe(SignalId::HR.as_u16());
+        let spo2_stream = session.subscribe(SignalId::SpO2.as_u16());
+
+        assert_ne!(hr_stream, spo2_stream);
+
+        let f_hr_1 = session.add_data(SignalId::HR.as_u16(), 70.0, 0).unwrap();
+        let f_spo2_1 = session.add_data(SignalId::SpO2.as_u16(), 98.0, 0).unwrap();
+        let f_hr_2 = session.add_data(SignalId::HR.as_u16(), 71.0, 1000).unwrap();
+
+        // Independent sequence counters: each starts at 1
+        assert_eq!(f_hr_1.header.seq, 1);
+        assert_eq!(f_spo2_1.header.seq, 1);
+        assert_eq!(f_hr_2.header.seq, 2);
+
+        // Each frame carries its correct stream_id
+        assert_eq!(f_hr_1.header.stream_id, hr_stream);
+        assert_eq!(f_spo2_1.header.stream_id, spo2_stream);
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-013
+    /// Title: Test get_stream_id returns correct stream_id
+    #[test]
+    fn test_get_stream_id() {
         let mut session = BleSessionState::new(1);
         session.subscribe(SignalId::SpO2.as_u16());
 
-        let frame = session.add_data_with_signal(SignalId::SpO2, 98.5).unwrap();
+        assert_eq!(session.get_stream_id(SignalId::SpO2.as_u16()), Some(1));
+        assert_eq!(session.get_stream_id(SignalId::HR.as_u16()), None);
+    }
 
-        // Verify the payload
-        let value = f32::from_le_bytes([
-            frame.payload[0],
-            frame.payload[1],
-            frame.payload[2],
-            frame.payload[3],
-        ]);
-        assert!((value - 98.5).abs() < f32::EPSILON);
+    /// ID SRS: SRS-TEST-BLESESSION-014
+    /// Title: Test total_pending sums all stream buffers
+    ///
+    /// Description: 2 HR frames + 1 SpO2 frame → total_pending = 3.
+    #[test]
+    fn test_total_pending() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe(SignalId::HR.as_u16());
+        session.subscribe(SignalId::SpO2.as_u16());
+
+        session.add_data(SignalId::HR.as_u16(), 70.0, 0);
+        session.add_data(SignalId::HR.as_u16(), 71.0, 1000);
+        session.add_data(SignalId::SpO2.as_u16(), 98.0, 0);
+
+        assert_eq!(session.total_pending(), 3);
+        assert_eq!(session.get_pending_count(SignalId::HR.as_u16()), 2);
+        assert_eq!(session.get_pending_count(SignalId::SpO2.as_u16()), 1);
     }
 }

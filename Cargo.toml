@@ -56,8 +56,10 @@ zip = "0.6"
 # Unix system calls
 libc = "0.2"
 
-# Binary serialization for BLE protocol
-postcard = { version = "1.0", features = ["use-std"] }
+# CRC32C (Castagnoli) for IDT BLE protocol frame integrity
+crc32c = "0.6"
+
+# Binary serialization (kept for non-BLE use)
 bytes = "1.5"
 
 [dev-dependencies]
