@@ -415,12 +415,12 @@ impl ReliableBleOutput {
     /// Normalizes legacy signal IDs (1,2,3) to IDT compound IDs (0x0101-0x0103),
     /// subscribes each signal, and sends SUBSCRIBE_RSP on Data_OUT and Control.
     ///
-    /// Stream ID assignment: use `raw_id.swap_bytes()` so that when the Flutter Dart
-    /// code reads stream_id as big-endian (Dart ByteData default), it recovers the
-    /// original legacy signal ID (1, 2, 3).
-    ///   raw_id=1  → stream_id=0x0100=256 → LE bytes [0x00,0x01] → Dart BE-read → 1
-    ///   raw_id=2  → stream_id=0x0200=512 → LE bytes [0x00,0x02] → Dart BE-read → 2
-    ///   raw_id=3  → stream_id=0x0300=768 → LE bytes [0x00,0x03] → Dart BE-read → 3
+    /// Stream ID assignment: use raw_id directly (1, 2, 3) for the session/DATA_FRAME
+    /// stream_id (stored LE → Flutter LE-reads it correctly).
+    /// The SUBSCRIBE_RSP result item encodes stream_id.swap_bytes() so that Flutter's
+    /// BE-reading of the RSP field also recovers the correct raw_id.
+    ///   raw_id=1 → session stream_id=1 → DATA_FRAME LE [0x01,0x00] → Dart LE-read → 1
+    ///   raw_id=1 → RSP item stream_id=256 → LE [0x00,0x01] → Dart BE-read → 1
     ///
     /// RSP is delayed 300 ms so the client has time to enable CCCD notifications
     /// before the notification arrives.
@@ -446,8 +446,10 @@ impl ReliableBleOutput {
                         canonical_id
                     );
                 }
-                // Byteswap the legacy raw_id so Dart's big-endian stream_id read gives raw_id back
-                let preferred_stream_id = raw_id.swap_bytes();
+                // Use raw_id directly for DATA_FRAME stream_id (Flutter LE-reads header field)
+                // RSP result item uses stream_id.swap_bytes() so Flutter's BE-read of the RSP
+                // field also recovers raw_id.
+                let preferred_stream_id = *raw_id;
                 let stream_id = st.subscribe_with_stream_id(canonical_id, preferred_stream_id);
                 let (period_ms, source_id) = if let Some(sig) = SignalId::from_u16(*raw_id) {
                     (sig.nominal_period_ms(), sig.source_id())
@@ -457,15 +459,15 @@ impl ReliableBleOutput {
                 rsp_items.push(SubscribeRspItem {
                     source_id,
                     signal_id: canonical_id,
-                    stream_id,
+                    stream_id: stream_id.swap_bytes(),
                     effective_period_ms: period_ms,
                     effective_batch_max: 1,
                 });
                 log::info!(
-                    "TLV SUBSCRIBE: signal 0x{:04X} → stream {} (Dart BE-reads as {})",
+                    "TLV SUBSCRIBE: signal 0x{:04X} → session stream_id={} → RSP encodes {}",
                     canonical_id,
                     stream_id,
-                    raw_id
+                    stream_id.swap_bytes()
                 );
             }
         }
@@ -771,7 +773,7 @@ mod tests {
     use super::*;
     use crate::domain::{ProcessedRoom, ProcessedTrack, TrackType};
     use crate::domain::ble_protocol::{
-        AckFrame, FLAG_RETRANSMIT, IDT_MAGIC, IDT_HEADER_LEN, IDT_VERSION,
+        AckFrame, FLAG_RETRANSMIT, IDT_MAGIC, IDT_VERSION,
         IdtHeader, InboundFrame, MSG_ACK_FRAME, MSG_SUBSCRIBE_REQ, MSG_SUBSCRIBE_RSP,
         SubscribeItem, SubscribeRsp, SubscribeRspItem, SUB_OP_SUBSCRIBE,
     };
@@ -795,14 +797,13 @@ mod tests {
         }
     }
 
-    /// Helper: build a valid 24-byte IDT ACK_FRAME buffer
+    /// Helper: build a valid 23-byte IDT ACK_FRAME buffer
     fn make_ack_bytes(session_id: u16, stream_id: u16, ack_upto: u32) -> Vec<u8> {
         let header = IdtHeader {
             magic: IDT_MAGIC,
             version: IDT_VERSION,
             msg_type: MSG_ACK_FRAME,
             flags: 0,
-            header_len: IDT_HEADER_LEN,
             session_id,
             stream_id,
             seq: 0,
@@ -829,7 +830,6 @@ mod tests {
             version: IDT_VERSION,
             msg_type: MSG_SUBSCRIBE_REQ,
             flags: 0,
-            header_len: IDT_HEADER_LEN,
             session_id,
             stream_id: 0,
             seq: 0,
@@ -1064,7 +1064,7 @@ mod tests {
             "SUBSCRIBE_RSP must start with IDT_MAGIC"
         );
         assert_eq!(bytes[3], MSG_SUBSCRIBE_RSP, "msg_type must be 0x02 (SUBSCRIBE_RSP)");
-        // Size: header(16) + req_id(2)+status(1)+n(1) + result(10) + crc(4) = 34
-        assert_eq!(bytes.len(), 34);
+        // Size: header(15) + req_id(2)+status(1)+n(1) + result(10) + crc(4) = 33
+        assert_eq!(bytes.len(), 33);
     }
 }

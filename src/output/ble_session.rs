@@ -299,11 +299,15 @@ impl BleSessionState {
         };
         seqs.iter()
             .filter_map(|&seq| {
-                entry.tx_buffer.iter().find(|f| f.header.seq == seq).map(|f| {
-                    let mut retransmit = f.clone();
-                    retransmit.header.flags |= FLAG_RETRANSMIT;
-                    retransmit
-                })
+                entry
+                    .tx_buffer
+                    .iter()
+                    .find(|f| f.header.seq == seq)
+                    .map(|f| {
+                        let mut retransmit = f.clone();
+                        retransmit.header.flags |= FLAG_RETRANSMIT;
+                        retransmit
+                    })
             })
             .collect()
     }
@@ -369,7 +373,7 @@ impl BleSessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::ble_protocol::{FLAG_RETRANSMIT, IDT_MAGIC, MSG_DATA_FRAME, SignalId};
+    use crate::domain::ble_protocol::{SignalId, FLAG_RETRANSMIT, IDT_MAGIC, MSG_DATA_FRAME};
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -439,7 +443,9 @@ mod tests {
     #[test]
     fn test_add_data_no_subscription() {
         let mut session = BleSessionState::new(1);
-        assert!(session.add_data(SignalId::HR.as_u16(), 75.0, 1_000_000).is_none());
+        assert!(session
+            .add_data(SignalId::HR.as_u16(), 75.0, 1_000_000)
+            .is_none());
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-006
@@ -453,7 +459,9 @@ mod tests {
         session.subscribe(SignalId::HR.as_u16());
 
         let t0_ms: u64 = 1_700_000_000_000;
-        let frame = session.add_data(SignalId::HR.as_u16(), 72.5, t0_ms).unwrap();
+        let frame = session
+            .add_data(SignalId::HR.as_u16(), 72.5, t0_ms)
+            .unwrap();
 
         // Verify wire encoding via to_ble_bytes
         let bytes = frame.to_ble_bytes();
@@ -554,8 +562,11 @@ mod tests {
         let retransmits = session.handle_nack(stream_id, &[2]);
         assert_eq!(retransmits.len(), 1);
         assert_eq!(retransmits[0].header.seq, 2);
-        assert_ne!(retransmits[0].header.flags & FLAG_RETRANSMIT, 0,
-            "FLAG_RETRANSMIT must be set");
+        assert_ne!(
+            retransmits[0].header.flags & FLAG_RETRANSMIT,
+            0,
+            "FLAG_RETRANSMIT must be set"
+        );
 
         // Buffer unchanged — 3 frames still present
         assert_eq!(session.get_pending_count(SignalId::HR.as_u16()), 3);
