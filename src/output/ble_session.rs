@@ -86,6 +86,82 @@ impl BleSessionState {
         }
     }
 
+    /// ID SRS: SRS-FN-BLESESSION-008
+    /// Title: handle_ack
+    ///
+    /// Description: VRConnect shall process a cumulative IDT ACK_FRAME with selective bitmap.
+    ///   - If a new session_id is detected: reset all stream buffers and sequence counters.
+    ///   - Purge frames with seq ≤ ack_upto from the named stream's buffer.
+    ///   - Check bitmap for selective ACKs (bit i in bitmap = seq [ack_upto+1+i] received).
+    ///   - Return list of frames NOT in bitmap (lost frames) with FLAG_RETRANSMIT set.
+    ///
+    /// Version: V2.0
+    ///
+    /// # Arguments
+    /// * `session_id` - Session identifier from the received ACK header
+    /// * `stream_id`  - Stream identifier from the received ACK header
+    /// * `ack_upto`   - Last contiguously acknowledged sequence number (inclusive)
+    /// * `bitmap`     - 64-bit selective ACK bitmap (bit i = 1 means seq [ack_upto+1+i] received)
+    ///
+    /// # Returns
+    /// Vec of cloned DataFrame (lost frames) with FLAG_RETRANSMIT set for retransmission
+    pub fn handle_ack_with_bitmap(
+        &mut self,
+        session_id: u16,
+        stream_id: u16,
+        ack_upto: u32,
+        bitmap: &[u8; 8],
+    ) -> Vec<DataFrame> {
+        if session_id != self.current_session_id {
+            // New session detected: reset all buffers (subscriptions preserved)
+            self.current_session_id = session_id;
+            for entry in self.streams.values_mut() {
+                entry.tx_buffer.clear();
+                entry.last_seq = 0;
+            }
+            return vec![];
+        }
+
+        let Some(entry) = self.streams.get_mut(&stream_id) else {
+            return vec![];
+        };
+
+        let mut retransmits = Vec::new();
+
+        // Build a set of all frames in buffer keyed by seq
+        let buffer_seqs: std::collections::HashSet<u32> =
+            entry.tx_buffer.iter().map(|f| f.header.seq).collect();
+
+        // Check for lost frames in bitmap range
+        for offset in 0..64u32 {
+            let seq = ack_upto.wrapping_add(1).wrapping_add(offset);
+            let bit_index = offset as usize;
+            let byte_index = bit_index / 8;
+            let bit_in_byte = bit_index % 8;
+
+            // Check if bit is set (frame received)
+            let is_acked = if byte_index < 8 {
+                (bitmap[byte_index] >> bit_in_byte) & 1 == 1
+            } else {
+                false
+            };
+
+            // If frame exists in buffer but bitmap bit is NOT set, it's lost
+            if buffer_seqs.contains(&seq) && !is_acked {
+                if let Some(frame) = entry.tx_buffer.iter().find(|f| f.header.seq == seq) {
+                    let mut retransmit = frame.clone();
+                    retransmit.header.flags |= FLAG_RETRANSMIT;
+                    retransmits.push(retransmit);
+                }
+            }
+        }
+
+        // Purge all frames with seq ≤ ack_upto (cumulatively acknowledged)
+        entry.tx_buffer.retain(|f| f.header.seq > ack_upto);
+
+        retransmits
+    }
+
     /// ID SRS: SRS-FN-BLESESSION-002
     /// Title: with_buffer_size
     ///

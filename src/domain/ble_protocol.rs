@@ -1,16 +1,18 @@
 // /src/domain/ble_protocol.rs
 // Module: domain.ble_protocol
-// Purpose: IDT ("ICU Data Transport") BLE binary protocol — V2.0
-//          Full IDT frame format per "Proposition de protocole BLE.pdf"
+// Purpose: IDT ("ICU Data Transport") BLE binary protocol — V3.0
+//          Flutter-compatible wire format (main-central.dart reference implementation)
 //
-// All frames: [Header(15b) | Payload(Nb) | CRC32C(4b)]
+// IDT frames: [Header(13b) | Payload(Nb) | CRC32C(4b)]
+// DATA_FRAME:  [Header(13b) | t0ms(8b) | count(1b) | payloadLen(2b) | dt_ms(2b) | value(4b)]  = 30 bytes, NO CRC
+// ACK_FRAME:   Flutter custom [session_id(2b) | stream_id(2b) | ack_base(4b) | bitmap_len(1b) | bitmap(8b)] = 17 bytes, NO IDT magic
 // All values: little-endian
 //
 // msg_type values:
 //   0x01 = SUBSCRIBE_REQ  (Write → Subscribe char)
 //   0x02 = SUBSCRIBE_RSP  (Notify → Data_OUT char)
 //   0x10 = DATA_FRAME     (Notify → Data_OUT char)
-//   0x20 = ACK_FRAME      (Write → Data_IN char)
+//   0x20 = ACK_FRAME      (Write → Data_IN char, no IDT magic for the app's ACKs)
 //   0x21 = NACK_FRAME     (Write → Data_IN char)
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -31,9 +33,9 @@ pub const MSG_DATA_FRAME: u8 = 0x10;
 pub const MSG_ACK_FRAME: u8 = 0x20;
 pub const MSG_NACK_FRAME: u8 = 0x21;
 
-// flags bits
-pub const FLAG_BACKLOG: u8 = 0b0000_0001;
-pub const FLAG_RETRANSMIT: u8 = 0b0000_0010;
+// flags bits — values match Flutter's main-central.dart constants exactly
+pub const FLAG_RETRANSMIT: u8 = 0x02; // bit0: frame is a retransmission
+pub const FLAG_BACKLOG: u8 = 0x01; // bit1: sender has backlogged unacked frames
 
 // value_type codes (used in Catalog)
 pub const VALUE_TYPE_FLOAT32: u8 = 3;
@@ -118,21 +120,22 @@ impl SignalId {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// IdtHeader — 15-byte common header for all IDT frames
+// IdtHeader — 13-byte common header for all IDT frames
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// ID SRS: SRS-MOD-BLEPROTOCOL-003
-/// IDT frame header — exactly 15 bytes, little-endian
+/// IDT frame header — exactly 13 bytes, little-endian.
+/// Matches app's decodeHeader() which reads magic→version→msg_type→flags→
+/// session_id→stream_id→seq and then immediately reads t0ms (no payload_len field).
 ///
 /// Byte layout:
-/// [0..2]   magic       u16 LE  = 0xD17A
-/// [2]      version     u8      = 0x01
-/// [3]      msg_type    u8
-/// [4]      flags       u8
-/// [5..7]   session_id  u16 LE
-/// [7..9]   stream_id   u16 LE
-/// [9..13]  seq         u32 LE
-/// [13..15] payload_len u16 LE
+/// [0..2]  magic       u16 LE  = 0xD17A
+/// [2]     version     u8      = 0x01
+/// [3]     msg_type    u8
+/// [4]     flags       u8
+/// [5..7]  session_id  u16 LE
+/// [7..9]  stream_id   u16 LE
+/// [9..13] seq         u32 LE
 #[derive(Debug, Clone, PartialEq)]
 pub struct IdtHeader {
     pub magic: u16,
@@ -142,13 +145,12 @@ pub struct IdtHeader {
     pub session_id: u16,
     pub stream_id: u16,
     pub seq: u32,
-    pub payload_len: u16,
 }
 
 impl IdtHeader {
-    pub const SIZE: usize = 15;
+    pub const SIZE: usize = 13;
 
-    pub fn new_data(session_id: u16, stream_id: u16, seq: u32, payload_len: u16) -> Self {
+    pub fn new_data(session_id: u16, stream_id: u16, seq: u32) -> Self {
         Self {
             magic: IDT_MAGIC,
             version: IDT_VERSION,
@@ -157,13 +159,12 @@ impl IdtHeader {
             session_id,
             stream_id,
             seq,
-            payload_len,
         }
     }
 
-    /// Serialize to exactly 15 bytes
-    pub fn to_bytes(&self) -> [u8; 15] {
-        let mut b = [0u8; 15];
+    /// Serialize to exactly 13 bytes
+    pub fn to_bytes(&self) -> [u8; 13] {
+        let mut b = [0u8; 13];
         b[0..2].copy_from_slice(&self.magic.to_le_bytes());
         b[2] = self.version;
         b[3] = self.msg_type;
@@ -171,7 +172,6 @@ impl IdtHeader {
         b[5..7].copy_from_slice(&self.session_id.to_le_bytes());
         b[7..9].copy_from_slice(&self.stream_id.to_le_bytes());
         b[9..13].copy_from_slice(&self.seq.to_le_bytes());
-        b[13..15].copy_from_slice(&self.payload_len.to_le_bytes());
         b
     }
 
@@ -192,7 +192,6 @@ impl IdtHeader {
             session_id: u16::from_le_bytes([b[5], b[6]]),
             stream_id: u16::from_le_bytes([b[7], b[8]]),
             seq: u32::from_le_bytes([b[9], b[10], b[11], b[12]]),
-            payload_len: u16::from_le_bytes([b[13], b[14]]),
         })
     }
 }
@@ -204,11 +203,17 @@ impl IdtHeader {
 /// ID SRS: SRS-MOD-BLEPROTOCOL-004
 /// IDT DATA_FRAME for a single float32 sample (count=1).
 ///
-/// Wire format (34 bytes total):
-/// [Header(15b)] [t0_ms(8b)] [count=1(1b)] [dt_ms=0(2b)] [value(4b)] [CRC32C(4b)]
+/// Wire format (30 bytes total, NO CRC — matches Flutter's decodeHeader):
+/// [Header(13b)] [t0_ms(8b)] [count=1(1b)] [payloadLen=6(2b)] [dt_ms=0(2b)] [value(4b)]
 ///
-/// Payload = 15 bytes: t0_ms(8) + count(1) + dt_ms[0](2) + value(4)
-/// CRC32C computed over bytes [0..30] (header + payload, excluding the 4 CRC bytes)
+/// Byte offsets:
+/// [0..12]  Header (13 bytes: IDT header without payload_len)
+/// [13..20] t0_ms    u64 LE (milliseconds since Unix epoch)
+/// [21]     count    u8  = 1
+/// [22,23]  payloadLen u16 LE = 6 (size of dt_ms+value per sample)
+/// [24,25]  dt_ms    u16 LE = 0 (delta from t0_ms for this sample)
+/// [26..29] value    f32 LE
+/// Total: 30 bytes, NO CRC32C (Flutter does not read a trailing CRC on DATA_FRAME)
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataFrame {
     pub header: IdtHeader,
@@ -217,60 +222,50 @@ pub struct DataFrame {
 }
 
 impl DataFrame {
-    /// Payload size in bytes for count=1, float32
-    pub const PAYLOAD_LEN: usize = 15; // t0_ms(8) + count(1) + dt_ms(2) + value(4)
-    /// Total frame size: header(15) + payload(15) + CRC32C(4)
-    pub const TOTAL_LEN: usize = 34;
+    /// Total frame size: header(13) + t0ms(8) + count(1) + payloadLen(2) + dt_ms(2) + value(4) = 30
+    pub const TOTAL_LEN: usize = 30;
+    /// Per-sample payload size written into the payloadLen field: dt_ms(2) + value(4) = 6
+    const SAMPLE_PAYLOAD_LEN: u16 = 6;
 
     pub fn new(session_id: u16, stream_id: u16, seq: u32, t0_ms: u64, value: f32) -> Self {
         Self {
-            header: IdtHeader::new_data(
-                session_id,
-                stream_id,
-                seq,
-                Self::PAYLOAD_LEN as u16,
-            ),
+            header: IdtHeader::new_data(session_id, stream_id, seq),
             t0_ms,
             value,
         }
     }
 
-    /// Serialize to 34 bytes. CRC32C covers bytes [0..30].
+    /// Serialize to 30 bytes. No CRC — Flutter's decodeHeader does not expect one.
     pub fn to_ble_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::TOTAL_LEN);
-        buf.extend_from_slice(&self.header.to_bytes()); // 15 bytes
-        buf.extend_from_slice(&self.t0_ms.to_le_bytes()); // 8 bytes
-        buf.push(1u8); // count = 1
-        buf.extend_from_slice(&0u16.to_le_bytes()); // dt_ms[0] = 0
-        buf.extend_from_slice(&self.value.to_le_bytes()); // 4 bytes
-        // Append CRC32C over all bytes so far
-        let crc = crc32c::crc32c(&buf);
-        buf.extend_from_slice(&crc.to_le_bytes());
+        buf.extend_from_slice(&self.header.to_bytes()); // [0..12]  13 bytes
+        buf.extend_from_slice(&self.t0_ms.to_le_bytes()); // [13..20]  8 bytes
+        buf.push(1u8); // [21]      count = 1
+        buf.extend_from_slice(&Self::SAMPLE_PAYLOAD_LEN.to_le_bytes()); // [22,23]  payloadLen = 6
+        buf.extend_from_slice(&0u16.to_le_bytes()); // [24,25]   dt_ms = 0
+        buf.extend_from_slice(&self.value.to_le_bytes()); // [26..29]  4 bytes
         buf
     }
 
-    /// Deserialize from bytes. Returns None on length/magic/CRC mismatch.
+    /// Deserialize from bytes. Returns None on length or magic mismatch.
     pub fn from_ble_bytes(b: &[u8]) -> Option<Self> {
         if b.len() < Self::TOTAL_LEN {
-            return None;
-        }
-        // Verify CRC32C over bytes [0..30]
-        let expected_crc = crc32c::crc32c(&b[..Self::TOTAL_LEN - 4]);
-        let actual_crc = u32::from_le_bytes([b[30], b[31], b[32], b[33]]);
-        if expected_crc != actual_crc {
             return None;
         }
         let header = IdtHeader::from_bytes(&b[0..IdtHeader::SIZE])?;
         if header.msg_type != MSG_DATA_FRAME {
             return None;
         }
-        let t0_ms = u64::from_le_bytes([
-            b[15], b[16], b[17], b[18], b[19], b[20], b[21], b[22],
-        ]);
-        // b[23] = count (should be 1)
-        // b[24..26] = dt_ms[0] (should be 0)
+        let t0_ms = u64::from_le_bytes([b[13], b[14], b[15], b[16], b[17], b[18], b[19], b[20]]);
+        // b[21] = count (should be 1)
+        // b[22,23] = payloadLen (should be 6)
+        // b[24,25] = dt_ms (should be 0)
         let value = f32::from_le_bytes([b[26], b[27], b[28], b[29]]);
-        Some(Self { header, t0_ms, value })
+        Some(Self {
+            header,
+            t0_ms,
+            value,
+        })
     }
 }
 
@@ -279,37 +274,62 @@ impl DataFrame {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// ID SRS: SRS-MOD-BLEPROTOCOL-005
-/// Cumulative ACK from the BLE Central (client).
+/// Cumulative + selective ACK from the BLE Central (Flutter client).
 ///
-/// Wire format (23 bytes total):
-/// [Header(15b)] [ack_upto(4b)] [CRC32C(4b)]
+/// Flutter sends a CUSTOM format — NOT an IDT frame. No IDT magic.
+/// Wire format from Flutter's sendAck():
+/// [0,1]   session_id  u16 LE
+/// [2,3]   stream_id   u16 LE
+/// [4..7]  ack_upto    u32 LE  (ackBase: last contiguously acknowledged seq)
+/// [8]     bitmap_len  u8      (= 8 bytes = 64 bits)
+/// [9..16] bitmap      8 bytes (SACK: bit i = 1 ↔ seq (ack_upto+1+i) received)
+/// Total: 17 bytes (MIN_LEN = 9 to parse the fixed fields)
 #[derive(Debug, Clone, PartialEq)]
 pub struct AckFrame {
-    pub header: IdtHeader,
+    pub session_id: u16,
+    pub stream_id: u16,
+    /// Last contiguously acknowledged seq (cumulative ACK base)
     pub ack_upto: u32,
+    /// 64-bit selective-ACK bitmap: bit i = 1 means seq (ack_upto+1+i) was received
+    pub bitmap: [u8; 8],
 }
 
 impl AckFrame {
-    pub const PAYLOAD_LEN: usize = 4;
-    pub const TOTAL_LEN: usize = 23; // header(15) + payload(4) + CRC(4)
+    /// Minimum bytes needed to parse session_id + stream_id + ack_upto + bitmap_len
+    pub const MIN_LEN: usize = 9; // session(2)+stream(2)+ack_base(4)+bitmap_len(1)
 
-    /// Deserialize from bytes received on Data_IN characteristic.
+    /// Deserialize from bytes received on Data_IN characteristic (Flutter custom format).
+    /// Does NOT check for IDT magic — Flutter ACKs have no IDT header.
     pub fn from_ble_bytes(b: &[u8]) -> Option<Self> {
-        if b.len() < Self::TOTAL_LEN {
+        if b.len() < Self::MIN_LEN {
             return None;
         }
-        // Verify CRC32C over bytes [0..19]
-        let expected_crc = crc32c::crc32c(&b[..Self::TOTAL_LEN - 4]);
-        let actual_crc = u32::from_le_bytes([b[19], b[20], b[21], b[22]]);
-        if expected_crc != actual_crc {
-            return None;
+        let session_id = u16::from_le_bytes([b[0], b[1]]);
+        let stream_id = u16::from_le_bytes([b[2], b[3]]);
+        let ack_upto = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+        let bitmap_len = b[8] as usize;
+        let mut bitmap = [0u8; 8];
+        let copy_len = bitmap_len.min(8).min(b.len().saturating_sub(9));
+        bitmap[..copy_len].copy_from_slice(&b[9..9 + copy_len]);
+        Some(Self {
+            session_id,
+            stream_id,
+            ack_upto,
+            bitmap,
+        })
+    }
+
+    /// Returns true if `seq` is acknowledged — either cumulatively (seq ≤ ack_upto)
+    /// or selectively (bit set in bitmap for seq in [ack_upto+1 .. ack_upto+64]).
+    pub fn is_acked(&self, seq: u32) -> bool {
+        if seq <= self.ack_upto {
+            return true;
         }
-        let header = IdtHeader::from_bytes(&b[0..IdtHeader::SIZE])?;
-        if header.msg_type != MSG_ACK_FRAME {
-            return None;
+        let offset = seq.wrapping_sub(self.ack_upto).wrapping_sub(1) as usize;
+        if offset >= 64 {
+            return false;
         }
-        let ack_upto = u32::from_le_bytes([b[15], b[16], b[17], b[18]]);
-        Some(Self { header, ack_upto })
+        (self.bitmap[offset / 8] >> (offset % 8)) & 1 == 1
     }
 }
 
@@ -361,9 +381,18 @@ impl NackFrame {
         let mut seq_list = Vec::with_capacity(n);
         for i in 0..n {
             let off = IdtHeader::SIZE + 2 + i * 4;
-            seq_list.push(u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]));
+            seq_list.push(u32::from_le_bytes([
+                b[off],
+                b[off + 1],
+                b[off + 2],
+                b[off + 3],
+            ]));
         }
-        Some(Self { header, reason, seq_list })
+        Some(Self {
+            header,
+            reason,
+            seq_list,
+        })
     }
 }
 
@@ -466,7 +495,12 @@ impl SubscribeReq {
                 ]),
             });
         }
-        Some(Self { header, req_id, op, items })
+        Some(Self {
+            header,
+            req_id,
+            op,
+            items,
+        })
     }
 
     /// Find the item stride (bytes/item) that yields a valid CRC32C for the given buffer.
@@ -482,12 +516,28 @@ impl SubscribeReq {
             }
             let crc_off = FIXED - 4;
             let exp = crc32c::crc32c(&b[..crc_off]);
-            let got = u32::from_le_bytes([b[crc_off], b[crc_off+1], b[crc_off+2], b[crc_off+3]]);
+            let got =
+                u32::from_le_bytes([b[crc_off], b[crc_off + 1], b[crc_off + 2], b[crc_off + 3]]);
             return if exp == got { Some(0) } else { None };
         }
 
         // Priority order: standard first, then the known 23-byte Flutter variant
-        for &candidate in &[SubscribeItem::SIZE, 23usize, 18, 19, 20, 21, 22, 24, 25, 26, 27, 28, 29, 30] {
+        for &candidate in &[
+            SubscribeItem::SIZE,
+            23usize,
+            18,
+            19,
+            20,
+            21,
+            22,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+        ] {
             let payload_end = IdtHeader::SIZE + 4 + n * candidate;
             if b.len() < payload_end + 4 {
                 continue; // frame too short for this candidate
@@ -562,14 +612,14 @@ pub struct SubscribeRsp {
 
 impl SubscribeRsp {
     /// Serialize to bytes for sending via Data_OUT Notify.
-    /// Format: [Header(15b)] [req_id(2b)] [status(1b)] [n(1b)] [results(n×10b)] [CRC32C(4b)]
+    /// Format: [Header(13b)] [req_id(2b)] [status(1b)] [n(1b)] [results(n×10b)] [CRC32C(4b)]
     pub fn to_ble_bytes(&self) -> Vec<u8> {
         let n = self.results.len();
         let payload_len = 4 + n * SubscribeRspItem::SIZE; // req_id(2)+status(1)+n(1)+results
         let total = IdtHeader::SIZE + payload_len + 4;
         let mut buf = Vec::with_capacity(total);
 
-        // Build header
+        // Build header (13 bytes — no payload_len field in IdtHeader)
         let header = IdtHeader {
             magic: IDT_MAGIC,
             version: IDT_VERSION,
@@ -578,7 +628,6 @@ impl SubscribeRsp {
             session_id: self.session_id,
             stream_id: 0,
             seq: 0,
-            payload_len: payload_len as u16,
         };
         buf.extend_from_slice(&header.to_bytes());
 
@@ -634,6 +683,7 @@ pub struct Catalog {
 
 impl Catalog {
     /// Default medical catalog: HR, SpO2, Temperature (all float32, source=scope)
+    /// Todo — make this configurable in case we want to add more signals in the future without code changes
     pub fn default_medical_catalog() -> Self {
         Self {
             entries: vec![
@@ -695,22 +745,32 @@ pub enum InboundFrame {
 }
 
 impl InboundFrame {
-    /// Parse an inbound frame. Dispatches on byte[3] = msg_type.
+    /// Parse an inbound frame from the BLE Central.
+    ///
+    /// Routing logic:
+    /// - If bytes[0..2] == IDT_MAGIC (0xD17A): IDT frame → dispatch on msg_type (NACK/SUBSCRIBE_REQ)
+    /// - Otherwise: Flutter custom ACK format (no IDT magic) → try AckFrame::from_ble_bytes
     pub fn from_ble_bytes(b: &[u8]) -> Option<Self> {
-        if b.len() < IdtHeader::SIZE {
+        if b.len() < 2 {
             return None;
         }
-        // Verify magic first (bytes 0..2)
         let magic = u16::from_le_bytes([b[0], b[1]]);
-        if magic != IDT_MAGIC {
-            return None;
-        }
-        let msg_type = b[3];
-        match msg_type {
-            MSG_ACK_FRAME => AckFrame::from_ble_bytes(b).map(InboundFrame::Ack),
-            MSG_NACK_FRAME => NackFrame::from_ble_bytes(b).map(InboundFrame::Nack),
-            MSG_SUBSCRIBE_REQ => SubscribeReq::from_ble_bytes(b).map(InboundFrame::SubscribeReq),
-            _ => None,
+        if magic == IDT_MAGIC {
+            // IDT frame: need full header, dispatch on msg_type
+            if b.len() < IdtHeader::SIZE {
+                return None;
+            }
+            let msg_type = b[3];
+            match msg_type {
+                MSG_NACK_FRAME => NackFrame::from_ble_bytes(b).map(InboundFrame::Nack),
+                MSG_SUBSCRIBE_REQ => {
+                    SubscribeReq::from_ble_bytes(b).map(InboundFrame::SubscribeReq)
+                }
+                _ => None,
+            }
+        } else {
+            // Non-IDT frame: Flutter custom ACK format
+            AckFrame::from_ble_bytes(b).map(InboundFrame::Ack)
         }
     }
 }
@@ -720,9 +780,9 @@ impl InboundFrame {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// ID SRS: SRS-MOD-BLEPROTOCOL-011
-/// Parse the Flutter app's TLV-based SUBSCRIBE_REQ (non-IDT format).
+/// Parse theTLV-based SUBSCRIBE_REQ (non-IDT format).
 ///
-/// The app sends a completely different binary format from IDT:
+/// The app (predimed) sends a completely different binary format from IDT:
 ///   - No IDT magic (0x20 at byte[0] instead of 0xD17A)
 ///   - 12-byte proprietary header; bytes[6..8] = req_id (LE u16)
 ///   - No CRC32C footer
@@ -772,30 +832,23 @@ pub fn parse_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<u16>)> {
 mod tests {
     use super::*;
 
-    // ── Helper: build a valid ACK_FRAME byte buffer ───────────────────────────
+    // ── Helper: build a valid Flutter ACK byte buffer (no IDT magic) ─────────
+    // Flutter's sendAck():
+    //   [0,1]=session_id LE | [2,3]=stream_id LE | [4..7]=ack_upto LE
+    //   [8]=bitmap_len(8) | [9..16]=8-byte bitmap (all zeros)  → 17 bytes
     fn make_ack_frame_bytes(session_id: u16, stream_id: u16, ack_upto: u32) -> Vec<u8> {
-        let header = IdtHeader {
-            magic: IDT_MAGIC,
-            version: IDT_VERSION,
-            msg_type: MSG_ACK_FRAME,
-            flags: 0,
-            session_id,
-            stream_id,
-            seq: 0,
-            payload_len: 4,
-        };
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&header.to_bytes());
-        buf.extend_from_slice(&ack_upto.to_le_bytes());
-        let crc = crc32c::crc32c(&buf);
-        buf.extend_from_slice(&crc.to_le_bytes());
+        let mut buf = Vec::with_capacity(17);
+        buf.extend_from_slice(&session_id.to_le_bytes()); // [0,1]
+        buf.extend_from_slice(&stream_id.to_le_bytes()); // [2,3]
+        buf.extend_from_slice(&ack_upto.to_le_bytes()); // [4..7]
+        buf.push(8u8); // [8] bitmap_len = 8
+        buf.extend_from_slice(&0u64.to_le_bytes()); // [9..16] bitmap = all zeros
         buf
     }
 
     // ── Helper: build a valid NACK_FRAME byte buffer ──────────────────────────
     fn make_nack_frame_bytes(session_id: u16, stream_id: u16, reason: u8, seqs: &[u32]) -> Vec<u8> {
         let n = seqs.len();
-        let payload_len = 2 + n * 4;
         let header = IdtHeader {
             magic: IDT_MAGIC,
             version: IDT_VERSION,
@@ -804,7 +857,6 @@ mod tests {
             session_id,
             stream_id,
             seq: 0,
-            payload_len: payload_len as u16,
         };
         let mut buf = Vec::new();
         buf.extend_from_slice(&header.to_bytes());
@@ -819,9 +871,13 @@ mod tests {
     }
 
     // ── Helper: build a valid SUBSCRIBE_REQ byte buffer ──────────────────────
-    fn make_subscribe_req_bytes(session_id: u16, req_id: u16, op: u8, items: &[(u8, u16)]) -> Vec<u8> {
+    fn make_subscribe_req_bytes(
+        session_id: u16,
+        req_id: u16,
+        op: u8,
+        items: &[(u8, u16)],
+    ) -> Vec<u8> {
         let n = items.len();
-        let payload_len = 4 + n * SubscribeItem::SIZE;
         let header = IdtHeader {
             magic: IDT_MAGIC,
             version: IDT_VERSION,
@@ -830,7 +886,6 @@ mod tests {
             session_id,
             stream_id: 0,
             seq: 0,
-            payload_len: payload_len as u16,
         };
         let mut buf = Vec::new();
         buf.extend_from_slice(&header.to_bytes());
@@ -897,9 +952,9 @@ mod tests {
     /// ID SRS: SRS-TEST-BLEPROTOCOL-004
     #[test]
     fn test_idt_header_byte_layout() {
-        let h = IdtHeader::new_data(42, 7, 100, 15);
+        let h = IdtHeader::new_data(42, 7, 100);
         let b = h.to_bytes();
-        assert_eq!(b.len(), 15);
+        assert_eq!(b.len(), 13);
         // magic at [0..2] = 0xD17A → LE: 0x7A 0xD1
         assert_eq!(b[0], 0x7A);
         assert_eq!(b[1], 0xD1);
@@ -909,13 +964,13 @@ mod tests {
         assert_eq!(u16::from_le_bytes([b[5], b[6]]), 42); // session_id
         assert_eq!(u16::from_le_bytes([b[7], b[8]]), 7); // stream_id
         assert_eq!(u32::from_le_bytes([b[9], b[10], b[11], b[12]]), 100); // seq
-        assert_eq!(u16::from_le_bytes([b[13], b[14]]), 15); // payload_len
+                                                                          // No payload_len field in 13-byte header
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-005
     #[test]
     fn test_idt_header_magic_mismatch() {
-        let mut b = IdtHeader::new_data(1, 1, 1, 4).to_bytes();
+        let mut b = IdtHeader::new_data(1, 1, 1).to_bytes();
         b[0] = 0xFF; // corrupt magic
         assert!(IdtHeader::from_bytes(&b).is_none());
     }
@@ -923,7 +978,7 @@ mod tests {
     /// ID SRS: SRS-TEST-BLEPROTOCOL-006
     #[test]
     fn test_idt_header_roundtrip() {
-        let original = IdtHeader::new_data(5, 3, 999, 15);
+        let original = IdtHeader::new_data(5, 3, 999);
         let parsed = IdtHeader::from_bytes(&original.to_bytes()).unwrap();
         assert_eq!(original, parsed);
     }
@@ -935,7 +990,7 @@ mod tests {
     fn test_data_frame_total_length() {
         let frame = DataFrame::new(1, 1, 1, 0, 65.0);
         assert_eq!(frame.to_ble_bytes().len(), DataFrame::TOTAL_LEN);
-        assert_eq!(DataFrame::TOTAL_LEN, 34);
+        assert_eq!(DataFrame::TOTAL_LEN, 30);
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-008
@@ -945,38 +1000,39 @@ mod tests {
         let value: f32 = 72.5;
         let bytes = DataFrame::new(1, 2, 10, t0_ms, value).to_ble_bytes();
 
-        // Header occupies [0..15]
+        // Header occupies [0..13] — 13-byte header (no payload_len field)
         assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), IDT_MAGIC);
         assert_eq!(bytes[3], MSG_DATA_FRAME);
 
-        // t0_ms at [15..23]
+        // t0_ms at [13..21] (immediately after the 13-byte header)
         let parsed_t0 = u64::from_le_bytes([
-            bytes[15], bytes[16], bytes[17], bytes[18],
-            bytes[19], bytes[20], bytes[21], bytes[22],
+            bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19], bytes[20],
         ]);
         assert_eq!(parsed_t0, t0_ms);
 
-        // count at [23] = 1
-        assert_eq!(bytes[23], 1u8);
+        // count at [21] = 1
+        assert_eq!(bytes[21], 1u8);
 
-        // dt_ms at [24..26] = 0
+        // payloadLen at [22,23] = 6 (size of dt_ms+value per sample)
+        assert_eq!(u16::from_le_bytes([bytes[22], bytes[23]]), 6u16);
+
+        // dt_ms at [24,25] = 0
         assert_eq!(u16::from_le_bytes([bytes[24], bytes[25]]), 0u16);
 
         // value at [26..30]
         let parsed_val = f32::from_le_bytes([bytes[26], bytes[27], bytes[28], bytes[29]]);
         assert!((parsed_val - value).abs() < f32::EPSILON);
 
-        // CRC at [30..34]
-        let expected_crc = crc32c::crc32c(&bytes[..30]);
-        let actual_crc = u32::from_le_bytes([bytes[30], bytes[31], bytes[32], bytes[33]]);
-        assert_eq!(expected_crc, actual_crc);
+        // No CRC in new format (Flutter does not read trailing CRC on DATA_FRAME)
+        assert_eq!(bytes.len(), 30);
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-009
+    /// Data frame with corrupted magic returns None from from_ble_bytes
     #[test]
-    fn test_data_frame_crc_corruption() {
+    fn test_data_frame_bad_magic() {
         let mut bytes = DataFrame::new(1, 1, 1, 0, 65.0).to_ble_bytes();
-        bytes[10] ^= 0xFF; // corrupt a header byte
+        bytes[0] = 0xFF; // corrupt magic
         assert!(DataFrame::from_ble_bytes(&bytes).is_none());
     }
 
@@ -996,9 +1052,10 @@ mod tests {
     // ── AckFrame tests ────────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-011
+    /// Flutter ACK minimum length is 9 bytes (session+stream+ack_base+bitmap_len)
     #[test]
-    fn test_ack_frame_total_length() {
-        assert_eq!(AckFrame::TOTAL_LEN, 23);
+    fn test_ack_frame_min_len() {
+        assert_eq!(AckFrame::MIN_LEN, 9);
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-012
@@ -1006,16 +1063,17 @@ mod tests {
     fn test_ack_frame_parse() {
         let bytes = make_ack_frame_bytes(1, 2, 99);
         let ack = AckFrame::from_ble_bytes(&bytes).unwrap();
-        assert_eq!(ack.header.session_id, 1);
-        assert_eq!(ack.header.stream_id, 2);
+        // Flutter custom format: fields directly on AckFrame (no header)
+        assert_eq!(ack.session_id, 1);
+        assert_eq!(ack.stream_id, 2);
         assert_eq!(ack.ack_upto, 99);
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-013
+    /// Flutter ACK that is too short returns None
     #[test]
-    fn test_ack_frame_crc_fail() {
-        let mut bytes = make_ack_frame_bytes(1, 1, 10);
-        bytes[15] ^= 0xFF; // corrupt ack_upto
+    fn test_ack_frame_too_short() {
+        let bytes = vec![0u8; AckFrame::MIN_LEN - 1]; // 8 bytes, need ≥ 9
         assert!(AckFrame::from_ble_bytes(&bytes).is_none());
     }
 
@@ -1078,8 +1136,8 @@ mod tests {
         // Verify magic in header
         assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), IDT_MAGIC);
         assert_eq!(bytes[3], MSG_SUBSCRIBE_RSP);
-        // Size = header(15) + req_id(2)+status(1)+n(1) + result(10) + crc(4) = 33
-        assert_eq!(bytes.len(), 15 + 4 + 10 + 4);
+        // Size = header(13) + req_id(2)+status(1)+n(1) + result(10) + crc(4) = 31
+        assert_eq!(bytes.len(), 13 + 4 + 10 + 4);
     }
 
     // ── Catalog tests ─────────────────────────────────────────────────────────
@@ -1111,11 +1169,16 @@ mod tests {
     // ── InboundFrame dispatch tests ───────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-020
+    /// Flutter ACK (no IDT magic) is routed to InboundFrame::Ack via custom parser
     #[test]
     fn test_inbound_frame_dispatch_ack() {
-        let bytes = make_ack_frame_bytes(1, 1, 5);
+        let bytes = make_ack_frame_bytes(1, 1, 5); // Flutter format, no IDT magic
         match InboundFrame::from_ble_bytes(&bytes) {
-            Some(InboundFrame::Ack(ack)) => assert_eq!(ack.ack_upto, 5),
+            Some(InboundFrame::Ack(ack)) => {
+                assert_eq!(ack.session_id, 1);
+                assert_eq!(ack.stream_id, 1);
+                assert_eq!(ack.ack_upto, 5);
+            }
             _ => panic!("Expected InboundFrame::Ack"),
         }
     }
@@ -1155,10 +1218,11 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-024
+    /// A non-IDT buffer shorter than Flutter ACK MIN_LEN returns None
     #[test]
-    fn test_inbound_frame_bad_magic() {
-        let mut bytes = make_ack_frame_bytes(1, 1, 1);
-        bytes[0] = 0x00; // corrupt magic
+    fn test_inbound_frame_too_short_for_ack() {
+        // Non-IDT frame (no 0xD17A magic) with fewer than MIN_LEN bytes
+        let bytes = vec![0x00u8; AckFrame::MIN_LEN - 1]; // 8 bytes, need ≥ 9
         assert!(InboundFrame::from_ble_bytes(&bytes).is_none());
     }
 }
