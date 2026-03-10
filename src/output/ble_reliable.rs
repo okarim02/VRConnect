@@ -16,8 +16,8 @@
 // - Unsubscribe (0x90b1): Write  - SUBSCRIBE_REQ with op=UNSUBSCRIBE, or legacy 2b fallback
 
 use crate::domain::ble_protocol::{
-    AckFrame, Catalog, InboundFrame, SignalId, SubscribeReq, SubscribeRsp, SubscribeRspItem,
-    SUB_OP_SUBSCRIBE, SUB_OP_UNSUBSCRIBE,
+    parse_tlv_subscribe_req, AckFrame, Catalog, InboundFrame, SignalId, SubscribeReq, SubscribeRsp,
+    SubscribeRspItem, SUB_OP_SUBSCRIBE, SUB_OP_UNSUBSCRIBE,
 };
 use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};
@@ -259,15 +259,33 @@ impl ReliableBleOutput {
 
                 // ── Subscribe: SUBSCRIBE_REQ (IDT) from client ────────────────
                 "Subscribe" => {
+                    // Always dump raw bytes at INFO level — essential for protocol debugging
+                    let hex: String = event.data.iter()
+                        .map(|b| format!("{:02X}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    log::info!(
+                        "Subscribe raw ({} bytes): {}",
+                        event.data.len(),
+                        hex
+                    );
+
                     if let Some(InboundFrame::SubscribeReq(req)) =
                         InboundFrame::from_ble_bytes(&event.data)
                     {
                         Self::handle_subscribe_req(req, &state, &server).await;
-                    } else {
-                        log::warn!(
-                            "Invalid IDT SUBSCRIBE_REQ on Subscribe char ({} bytes)",
-                            event.data.len()
+                    } else if let Some((req_id, signal_ids)) =
+                        parse_tlv_subscribe_req(&event.data)
+                    {
+                        log::info!(
+                            "TLV subscribe: req_id={}, signals={:?}",
+                            req_id,
+                            signal_ids
                         );
+                        Self::handle_tlv_subscribe(req_id, signal_ids, &state, &server).await;
+                    } else {
+                        // Log why it failed for diagnosis
+                        Self::log_subscribe_parse_failure(&event.data);
                     }
                 }
 
@@ -317,8 +335,19 @@ impl ReliableBleOutput {
             for item in &req.items {
                 match req.op {
                     SUB_OP_SUBSCRIBE => {
-                        let stream_id = st.subscribe(item.signal_id);
-                        // Use catalog metadata if signal is known, else use request values
+                        // Normalize legacy simple IDs (1,2,3 per I.pdf) to IDT compound IDs
+                        // (0x0101,0x0102,0x0103 per "Proposition de protocole BLE")
+                        let canonical_id = SignalId::from_u16(item.signal_id)
+                            .map(|s| s.as_u16())
+                            .unwrap_or(item.signal_id);
+                        if canonical_id != item.signal_id {
+                            log::info!(
+                                "Signal ID: app sent 0x{:04X} → normalized to 0x{:04X} (legacy→IDT)",
+                                item.signal_id,
+                                canonical_id
+                            );
+                        }
+                        let stream_id = st.subscribe(canonical_id);
                         let (period_ms, source_id) =
                             if let Some(sig) = SignalId::from_u16(item.signal_id) {
                                 (sig.nominal_period_ms(), sig.source_id())
@@ -327,20 +356,24 @@ impl ReliableBleOutput {
                             };
                         rsp_items.push(SubscribeRspItem {
                             source_id,
-                            signal_id: item.signal_id,
+                            signal_id: canonical_id,
                             stream_id,
                             effective_period_ms: period_ms,
                             effective_batch_max: 1,
                         });
                         log::info!(
                             "SUBSCRIBE: signal 0x{:04X} → stream {}",
-                            item.signal_id,
+                            canonical_id,
                             stream_id
                         );
                     }
                     SUB_OP_UNSUBSCRIBE => {
-                        st.unsubscribe(item.signal_id);
-                        log::info!("UNSUBSCRIBE: signal 0x{:04X}", item.signal_id);
+                        // Also normalize on unsubscribe
+                        let canonical_id = SignalId::from_u16(item.signal_id)
+                            .map(|s| s.as_u16())
+                            .unwrap_or(item.signal_id);
+                        st.unsubscribe(canonical_id);
+                        log::info!("UNSUBSCRIBE: signal 0x{:04X}", canonical_id);
                     }
                     _ => {
                         log::warn!("Unknown subscribe op: 0x{:02X}", req.op);
@@ -349,7 +382,8 @@ impl ReliableBleOutput {
             }
         }
 
-        // Send SUBSCRIBE_RSP on Data_OUT (only for SUBSCRIBE op with allocated streams)
+        // Send SUBSCRIBE_RSP for SUBSCRIBE op with allocated streams.
+        // Notify on both Data_OUT (per IDT spec) and Control (per I.pdf / legacy clients).
         if req.op == SUB_OP_SUBSCRIBE && !rsp_items.is_empty() {
             let rsp = SubscribeRsp {
                 session_id,
@@ -360,13 +394,112 @@ impl ReliableBleOutput {
             let bytes = rsp.to_ble_bytes();
             let srv = server.read().await;
             if let Err(e) = srv.notify("Data_OUT", &bytes).await {
-                log::warn!("Failed to send SUBSCRIBE_RSP: {}", e);
+                log::warn!("Failed to send SUBSCRIBE_RSP on Data_OUT: {}", e);
             } else {
                 log::info!(
                     "SUBSCRIBE_RSP sent on Data_OUT ({} bytes, req_id={})",
                     bytes.len(),
                     req_id
                 );
+            }
+            // Also send on Control char — some Flutter implementations listen here (I.pdf)
+            if let Err(e) = srv.notify("Control", &bytes).await {
+                log::debug!("SUBSCRIBE_RSP on Control: {} (client may not be subscribed)", e);
+            } else {
+                log::info!("SUBSCRIBE_RSP also sent on Control ({} bytes)", bytes.len());
+            }
+        }
+    }
+
+    /// Handle a TLV-format SUBSCRIBE_REQ from the Flutter app (non-IDT wire format).
+    /// Normalizes legacy signal IDs (1,2,3) to IDT compound IDs (0x0101-0x0103),
+    /// subscribes each signal, and sends SUBSCRIBE_RSP on Data_OUT and Control.
+    ///
+    /// Stream ID assignment: use `raw_id.swap_bytes()` so that when the Flutter Dart
+    /// code reads stream_id as big-endian (Dart ByteData default), it recovers the
+    /// original legacy signal ID (1, 2, 3).
+    ///   raw_id=1  → stream_id=0x0100=256 → LE bytes [0x00,0x01] → Dart BE-read → 1
+    ///   raw_id=2  → stream_id=0x0200=512 → LE bytes [0x00,0x02] → Dart BE-read → 2
+    ///   raw_id=3  → stream_id=0x0300=768 → LE bytes [0x00,0x03] → Dart BE-read → 3
+    ///
+    /// RSP is delayed 300 ms so the client has time to enable CCCD notifications
+    /// before the notification arrives.
+    async fn handle_tlv_subscribe(
+        req_id: u16,
+        signal_ids: Vec<u16>,
+        state: &Arc<RwLock<BleSessionState>>,
+        server: &Arc<RwLock<GattServer>>,
+    ) {
+        let session_id = state.read().await.current_session_id;
+        let mut rsp_items: Vec<SubscribeRspItem> = Vec::new();
+
+        {
+            let mut st = state.write().await;
+            for raw_id in &signal_ids {
+                let canonical_id = SignalId::from_u16(*raw_id)
+                    .map(|s| s.as_u16())
+                    .unwrap_or(*raw_id);
+                if canonical_id != *raw_id {
+                    log::info!(
+                        "TLV Signal ID: app sent 0x{:04X} → normalized to 0x{:04X} (legacy→IDT)",
+                        raw_id,
+                        canonical_id
+                    );
+                }
+                // Byteswap the legacy raw_id so Dart's big-endian stream_id read gives raw_id back
+                let preferred_stream_id = raw_id.swap_bytes();
+                let stream_id = st.subscribe_with_stream_id(canonical_id, preferred_stream_id);
+                let (period_ms, source_id) = if let Some(sig) = SignalId::from_u16(*raw_id) {
+                    (sig.nominal_period_ms(), sig.source_id())
+                } else {
+                    (1000, 1)
+                };
+                rsp_items.push(SubscribeRspItem {
+                    source_id,
+                    signal_id: canonical_id,
+                    stream_id,
+                    effective_period_ms: period_ms,
+                    effective_batch_max: 1,
+                });
+                log::info!(
+                    "TLV SUBSCRIBE: signal 0x{:04X} → stream {} (Dart BE-reads as {})",
+                    canonical_id,
+                    stream_id,
+                    raw_id
+                );
+            }
+        }
+
+        if !rsp_items.is_empty() {
+            // Delay before sending RSP to ensure the client has enabled CCCD notifications.
+            // The Flutter app enables CCCD *after* writing to the Subscribe characteristic,
+            // so without a delay the notify would be silently dropped.
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+            let rsp = SubscribeRsp {
+                session_id,
+                req_id,
+                status: 0,
+                results: rsp_items,
+            };
+            let bytes = rsp.to_ble_bytes();
+            let srv = server.read().await;
+            if let Err(e) = srv.notify("Data_OUT", &bytes).await {
+                log::warn!("Failed to send TLV SUBSCRIBE_RSP on Data_OUT: {}", e);
+            } else {
+                log::info!(
+                    "TLV SUBSCRIBE_RSP sent on Data_OUT ({} bytes, req_id={})",
+                    bytes.len(),
+                    req_id
+                );
+            }
+            if let Err(e) = srv.notify("Control", &bytes).await {
+                log::debug!(
+                    "TLV SUBSCRIBE_RSP on Control: {} (client may not be subscribed)",
+                    e
+                );
+            } else {
+                log::info!("TLV SUBSCRIBE_RSP also sent on Control ({} bytes)", bytes.len());
             }
         }
     }
@@ -504,6 +637,128 @@ impl ReliableBleOutput {
     pub async fn get_session_stats(&self) -> (u16, usize) {
         let state = self.state.read().await;
         (state.current_session_id, state.total_pending())
+    }
+
+    /// Diagnostic helper: logs why a SUBSCRIBE_REQ frame failed to parse.
+    /// Tries all candidate SubscribeItem sizes (17..=30) to identify the correct one,
+    /// and dumps the first item's raw bytes + signal_id for protocol mismatch detection.
+    fn log_subscribe_parse_failure(data: &[u8]) {
+        use crate::domain::ble_protocol::{IDT_MAGIC, MSG_SUBSCRIBE_REQ};
+
+        if data.len() < 16 {
+            log::warn!(
+                "Subscribe PARSE FAIL: too short ({} bytes, need ≥ 16 for IDT header)",
+                data.len()
+            );
+            return;
+        }
+        let magic = u16::from_le_bytes([data[0], data[1]]);
+        if magic != IDT_MAGIC {
+            log::warn!(
+                "Subscribe PARSE FAIL: bad magic 0x{:04X} (expected 0x{:04X}=IDT_MAGIC)",
+                magic,
+                IDT_MAGIC
+            );
+            return;
+        }
+        let msg_type = data[3];
+        if msg_type != MSG_SUBSCRIBE_REQ {
+            log::warn!(
+                "Subscribe PARSE FAIL: msg_type=0x{:02X} (expected 0x01=SUBSCRIBE_REQ)",
+                msg_type
+            );
+            return;
+        }
+        if data.len() < 20 {
+            log::warn!(
+                "Subscribe PARSE FAIL: too short for fixed payload fields ({} bytes)",
+                data.len()
+            );
+            return;
+        }
+
+        let req_id = u16::from_le_bytes([data[16], data[17]]);
+        let op = data[18];
+        let n = data[19] as usize;
+
+        log::warn!(
+            "Subscribe PARSE FAIL: req_id={}, op=0x{:02X}, n={} items, {} bytes total",
+            req_id,
+            op,
+            n,
+            data.len()
+        );
+
+        // Brute-force candidate item sizes to find CRC match
+        if n > 0 {
+            // fixed overhead: header(16) + req_id(2)+op(1)+n(1) + CRC(4)
+            let fixed = 16 + 4 + 4;
+            let payload_bytes = data.len().saturating_sub(fixed);
+            log::warn!(
+                "  item payload bytes = {} ÷ {} items = {} bytes/item  (server expects 17)",
+                payload_bytes,
+                n,
+                payload_bytes / n
+            );
+
+            for candidate in 17usize..=30 {
+                let expected_total = 16 + 4 + n * candidate + 4;
+                if expected_total == data.len() {
+                    let crc_off = expected_total - 4;
+                    let expected_crc = crc32c::crc32c(&data[..crc_off]);
+                    let actual_crc = u32::from_le_bytes([
+                        data[crc_off],
+                        data[crc_off + 1],
+                        data[crc_off + 2],
+                        data[crc_off + 3],
+                    ]);
+                    if expected_crc == actual_crc {
+                        log::warn!(
+                            "  → item_size={}: CRC MATCH ← fix SubscribeItem::SIZE to {}",
+                            candidate,
+                            candidate
+                        );
+                    } else {
+                        log::warn!(
+                            "  → item_size={}: total matches but CRC fails (exp=0x{:08X} got=0x{:08X})",
+                            candidate,
+                            expected_crc,
+                            actual_crc
+                        );
+                    }
+                }
+            }
+        }
+
+        // Dump first item bytes for signal_id inspection
+        if n > 0 && data.len() > 20 {
+            let end = data.len().min(20 + 30);
+            let raw: String = data[20..end]
+                .iter()
+                .map(|b| format!("{:02X}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            log::warn!("  item[0] raw: {}", raw);
+            if data.len() >= 23 {
+                let src = data[20];
+                let sig = u16::from_le_bytes([data[21], data[22]]);
+                let sig_label = match sig {
+                    0x0101 => "HR (IDT compound ID)",
+                    0x0102 => "SpO2 (IDT compound ID)",
+                    0x0103 => "Temp (IDT compound ID)",
+                    1 => "HR? (legacy simple ID — mismatch!)",
+                    2 => "SpO2? (legacy simple ID — mismatch!)",
+                    3 => "Temp? (legacy simple ID — mismatch!)",
+                    _ => "unknown",
+                };
+                log::warn!(
+                    "  item[0] source_id={}, signal_id=0x{:04X} ({})",
+                    src,
+                    sig,
+                    sig_label
+                );
+            }
+        }
     }
 }
 

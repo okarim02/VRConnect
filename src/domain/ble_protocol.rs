@@ -73,9 +73,14 @@ impl SignalId {
 
     pub fn from_u16(v: u16) -> Option<Self> {
         match v {
+            // IDT compound IDs (spec "Proposition de protocole BLE")
             0x0101 => Some(SignalId::HR),
             0x0102 => Some(SignalId::SpO2),
             0x0103 => Some(SignalId::Temperature),
+            // Legacy simple IDs (spec "I.pdf" / some Flutter client implementations)
+            1 => Some(SignalId::HR),
+            2 => Some(SignalId::SpO2),
+            3 => Some(SignalId::Temperature),
             _ => None,
         }
     }
@@ -411,36 +416,46 @@ pub struct SubscribeReq {
 
 impl SubscribeReq {
     /// Deserialize from bytes received on Subscribe characteristic.
+    ///
+    /// Supports non-standard SubscribeItem sizes by brute-forcing candidate strides
+    /// (17..=30 bytes/item) and accepting the first that yields a valid CRC32C.
+    /// Only the first `SubscribeItem::SIZE` (17) bytes of each item are decoded;
+    /// any extra bytes per item are treated as padding and ignored.
+    /// This handles Flutter app implementations that use a 23-byte item layout.
     pub fn from_ble_bytes(b: &[u8]) -> Option<Self> {
         // Minimum: header(16) + req_id(2) + op(1) + n(1) + crc(4) = 24 bytes
         if b.len() < IdtHeader::SIZE + 4 + 4 {
+            log::debug!(
+                "SubscribeReq: too short ({} bytes, need ≥ {})",
+                b.len(),
+                IdtHeader::SIZE + 8
+            );
             return None;
         }
         let header = IdtHeader::from_bytes(&b[0..16])?;
         if header.msg_type != MSG_SUBSCRIBE_REQ {
+            log::debug!(
+                "SubscribeReq: wrong msg_type=0x{:02X} (expected 0x01)",
+                header.msg_type
+            );
             return None;
         }
         let req_id = u16::from_le_bytes([b[16], b[17]]);
         let op = b[18];
         let n = b[19] as usize;
-        let payload_end = IdtHeader::SIZE + 4 + n * SubscribeItem::SIZE;
-        if b.len() < payload_end + 4 {
-            return None;
-        }
-        // Verify CRC32C
-        let expected_crc = crc32c::crc32c(&b[..payload_end]);
-        let actual_crc = u32::from_le_bytes([
-            b[payload_end],
-            b[payload_end + 1],
-            b[payload_end + 2],
-            b[payload_end + 3],
-        ]);
-        if expected_crc != actual_crc {
-            return None;
-        }
+
+        // Detect the actual item stride by finding which size makes CRC validate.
+        // Standard size (17) is tried first; 23 is tried second (known Flutter variant).
+        let stride = Self::detect_item_stride(b, n)?;
+
+        // Parse items: read only the first SubscribeItem::SIZE bytes of each stride
         let mut items = Vec::with_capacity(n);
         for i in 0..n {
-            let off = IdtHeader::SIZE + 4 + i * SubscribeItem::SIZE;
+            let off = IdtHeader::SIZE + 4 + i * stride;
+            if off + SubscribeItem::SIZE > b.len() {
+                log::debug!("SubscribeReq: item[{}] out of bounds", i);
+                return None;
+            }
             items.push(SubscribeItem {
                 source_id: b[off],
                 signal_id: u16::from_le_bytes([b[off + 1], b[off + 2]]),
@@ -460,6 +475,58 @@ impl SubscribeReq {
             });
         }
         Some(Self { header, req_id, op, items })
+    }
+
+    /// Find the item stride (bytes/item) that yields a valid CRC32C for the given buffer.
+    /// Tries standard size first, then common alternatives up to 30 bytes/item.
+    fn detect_item_stride(b: &[u8], n: usize) -> Option<usize> {
+        // fixed overhead: header(16) + req_id(2)+op(1)+n(1) + CRC(4)
+        const FIXED: usize = IdtHeader::SIZE + 4 + 4;
+
+        if n == 0 {
+            // No items — verify CRC at fixed header position
+            if b.len() < FIXED {
+                return None;
+            }
+            let crc_off = FIXED - 4;
+            let exp = crc32c::crc32c(&b[..crc_off]);
+            let got = u32::from_le_bytes([b[crc_off], b[crc_off+1], b[crc_off+2], b[crc_off+3]]);
+            return if exp == got { Some(0) } else { None };
+        }
+
+        // Priority order: standard first, then the known 23-byte Flutter variant
+        for &candidate in &[SubscribeItem::SIZE, 23usize, 18, 19, 20, 21, 22, 24, 25, 26, 27, 28, 29, 30] {
+            let payload_end = IdtHeader::SIZE + 4 + n * candidate;
+            if b.len() < payload_end + 4 {
+                continue; // frame too short for this candidate
+            }
+            let exp_crc = crc32c::crc32c(&b[..payload_end]);
+            let got_crc = u32::from_le_bytes([
+                b[payload_end],
+                b[payload_end + 1],
+                b[payload_end + 2],
+                b[payload_end + 3],
+            ]);
+            if exp_crc == got_crc {
+                if candidate != SubscribeItem::SIZE {
+                    log::warn!(
+                        "SubscribeReq: non-standard item stride={} bytes (expected {}) — \
+                         parsing first {} bytes/item, ignoring {} extra bytes/item",
+                        candidate,
+                        SubscribeItem::SIZE,
+                        SubscribeItem::SIZE,
+                        candidate - SubscribeItem::SIZE
+                    );
+                }
+                return Some(candidate);
+            }
+        }
+        log::debug!(
+            "SubscribeReq: no item stride yields valid CRC (buf={} bytes, n={} items)",
+            b.len(),
+            n
+        );
+        None
     }
 }
 
@@ -658,6 +725,55 @@ impl InboundFrame {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// TLV Subscribe parser — Flutter app wire format (non-IDT)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// ID SRS: SRS-MOD-BLEPROTOCOL-011
+/// Parse the Flutter app's TLV-based SUBSCRIBE_REQ (non-IDT format).
+///
+/// The app sends a completely different binary format from IDT:
+///   - No IDT magic (0x20 at byte[0] instead of 0xD17A)
+///   - 12-byte proprietary header; bytes[6..8] = req_id (LE u16)
+///   - No CRC32C footer
+///   - Items are TLV triplets: tag(1b)=0x03 | len_u16_le(2b)=24 | nested_tlvs(24b)
+///   - Nested sub-TLVs (tag=01→source_id, tag=02→signal_id LE u16, tag=03→mode, ...)
+///   - signal_id located at item_base + 10 (LE u16, legacy simple IDs 1/2/3)
+///
+/// Returns (req_id, signal_ids) on success, None if format is not recognized.
+pub fn parse_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<u16>)> {
+    // Byte[0] must be 0x20 (TLV SUBSCRIBE_CMD marker)
+    if data.len() < 12 + 27 || data[0] != 0x20 {
+        return None;
+    }
+
+    let req_id = u16::from_le_bytes([data[6], data[7]]);
+
+    // Scan items starting at offset 12
+    let mut pos = 12;
+    let mut signal_ids = Vec::new();
+
+    while pos + 27 <= data.len() {
+        // Item header: tag=0x03, len_u16_le=24 (0x18 0x00)
+        if data[pos] == 0x03 && data[pos + 1] == 0x18 && data[pos + 2] == 0x00 {
+            // signal_id (LE u16) is at item_base + 10
+            let signal_id = u16::from_le_bytes([data[pos + 10], data[pos + 11]]);
+            if signal_id > 0 {
+                signal_ids.push(signal_id);
+            }
+            pos += 27; // 3 (item header) + 24 (item value)
+        } else {
+            break;
+        }
+    }
+
+    if signal_ids.is_empty() {
+        None
+    } else {
+        Some((req_id, signal_ids))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -759,11 +875,18 @@ mod tests {
     /// ID SRS: SRS-TEST-BLEPROTOCOL-002
     #[test]
     fn test_signal_id_from_u16_roundtrip() {
+        // IDT compound IDs (primary spec)
         assert_eq!(SignalId::from_u16(0x0101), Some(SignalId::HR));
         assert_eq!(SignalId::from_u16(0x0102), Some(SignalId::SpO2));
         assert_eq!(SignalId::from_u16(0x0103), Some(SignalId::Temperature));
-        assert_eq!(SignalId::from_u16(0x0001), None);
-        assert_eq!(SignalId::from_u16(1), None);
+        // Legacy simple IDs (I.pdf / Flutter client) — must also be accepted
+        assert_eq!(SignalId::from_u16(1), Some(SignalId::HR));
+        assert_eq!(SignalId::from_u16(2), Some(SignalId::SpO2));
+        assert_eq!(SignalId::from_u16(3), Some(SignalId::Temperature));
+        // Unknown IDs must be rejected (0x0001==1 is now valid as legacy HR, use other values)
+        assert_eq!(SignalId::from_u16(0), None);
+        assert_eq!(SignalId::from_u16(4), None);
+        assert_eq!(SignalId::from_u16(0x0200), None);
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-003

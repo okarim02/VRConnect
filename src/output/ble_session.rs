@@ -139,6 +139,32 @@ impl BleSessionState {
         stream_id
     }
 
+    /// Subscribe with a caller-chosen stream_id instead of auto-allocation.
+    /// Used by the TLV path to assign stream IDs that the Flutter app can match
+    /// regardless of its endianness assumptions.
+    /// Idempotent: if signal_id is already subscribed, the existing stream_id is returned.
+    pub fn subscribe_with_stream_id(&mut self, signal_id: u16, preferred_stream_id: u16) -> u16 {
+        if let Some(&existing) = self.signal_to_stream.get(&signal_id) {
+            return existing;
+        }
+        let stream_id = preferred_stream_id;
+        if self.next_stream_id <= stream_id {
+            self.next_stream_id = stream_id + 1;
+        }
+        self.streams.insert(
+            stream_id,
+            StreamEntry {
+                stream_id,
+                signal_id,
+                source_id: 1,
+                last_seq: 0,
+                tx_buffer: VecDeque::new(),
+            },
+        );
+        self.signal_to_stream.insert(signal_id, stream_id);
+        stream_id
+    }
+
     /// ID SRS: SRS-FN-BLESESSION-004
     /// Title: unsubscribe
     ///
