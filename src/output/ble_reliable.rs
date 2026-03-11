@@ -543,7 +543,7 @@ impl ReliableBleOutput {
     /// Extract (signal_id, f32) pairs from ProcessedData for room_index=0.
     /// Signal name mapping covers all known VitalRecorder export names:
     /// - SpO2:        "SPO2", "PLETH", "PLETH_SPO2"
-    /// - Temperature: "TEMP", "TEMPERATURE", "BT1", "BT1_TEMP"
+    /// - Temperature: "TEMP", "TEMPERATURE", "BT", "BT1", "BT1_TEMP"
     #[cfg(test)]
     fn extract_signal_values(data: &ProcessedData) -> Vec<(u16, f32)> {
         use std::collections::HashMap;
@@ -554,6 +554,7 @@ impl ReliableBleOutput {
             ("PLETH_SPO2", SignalId::SpO2.as_u16()),
             ("TEMP", SignalId::Temperature.as_u16()),
             ("TEMPERATURE", SignalId::Temperature.as_u16()),
+            ("BT", SignalId::Temperature.as_u16()),
             ("BT1", SignalId::Temperature.as_u16()),
             ("BT1_TEMP", SignalId::Temperature.as_u16()),
         ]
@@ -1141,5 +1142,203 @@ mod tests {
         );
         // Size: header(13) + req_id(2)+status(1)+n(1) + result(10) + crc(4) = 31
         assert_eq!(bytes.len(), 31);
+    }
+
+    // ── Signal name alias coverage ────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-011
+    /// Title: Test all VitalRecorder signal name aliases are matched
+    ///
+    /// Description: extract_signal_values shall recognise every alias for SpO2
+    ///              and Temperature that VitalRecorder can export.
+    #[test]
+    fn test_signal_name_aliases() {
+        let room = ProcessedRoom {
+            room_index: 0,
+            room_name: "BED_01".to_string(),
+            tracks: vec![
+                // SpO2 aliases
+                create_test_track("PLETH", 97.0, 0, "BED_01"),
+                create_test_track("PLETH_SPO2", 98.0, 0, "BED_01"),
+                // Temperature aliases
+                create_test_track("BT", 36.5, 0, "BED_01"),
+                create_test_track("BT1", 36.6, 0, "BED_01"),
+                create_test_track("BT1_TEMP", 36.7, 0, "BED_01"),
+                create_test_track("TEMP", 36.8, 0, "BED_01"),
+                create_test_track("TEMPERATURE", 36.9, 0, "BED_01"),
+            ],
+        };
+        let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+        let values = ReliableBleOutput::extract_signal_values(&data);
+
+        let spo2_count = values
+            .iter()
+            .filter(|(id, _)| *id == SignalId::SpO2.as_u16())
+            .count();
+        let temp_count = values
+            .iter()
+            .filter(|(id, _)| *id == SignalId::Temperature.as_u16())
+            .count();
+
+        assert_eq!(spo2_count, 2, "Two SpO2 aliases (PLETH, PLETH_SPO2)");
+        assert_eq!(temp_count, 5, "Five Temperature aliases (BT, BT1, BT1_TEMP, TEMP, TEMPERATURE)");
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-012
+    /// Title: Test unknown signal names produce no output
+    ///
+    /// Description: Tracks whose names are not in the signal map must be silently
+    ///              ignored by extract_signal_values.
+    #[test]
+    fn test_unknown_signal_name_ignored() {
+        let room = ProcessedRoom {
+            room_index: 0,
+            room_name: "BED_01".to_string(),
+            tracks: vec![
+                create_test_track("ART1_SBP", 120.0, 0, "BED_01"),
+                create_test_track("ECG1", 0.5, 0, "BED_01"),
+                create_test_track("PPV", 10.0, 0, "BED_01"),
+            ],
+        };
+        let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+        let values = ReliableBleOutput::extract_signal_values(&data);
+        assert!(values.is_empty(), "Unmapped signals must produce no output");
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-013
+    /// Title: Test extract_signal_values uses display_value when raw_value is None
+    ///
+    /// Description: If raw_value is None, the track's display_value string shall be
+    ///              parsed as f32 and used as the signal value.
+    #[test]
+    fn test_extract_signal_values_display_value_fallback() {
+        let mut track = create_test_track("HR", 0.0, 0, "BED_01");
+        track.raw_value = None;
+        track.display_value = "82.0".to_string();
+
+        let room = ProcessedRoom {
+            room_index: 0,
+            room_name: "BED_01".to_string(),
+            tracks: vec![track],
+        };
+        let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+        let values = ReliableBleOutput::extract_signal_values(&data);
+
+        assert_eq!(values.len(), 1);
+        assert!((values[0].1 - 82.0f32).abs() < f32::EPSILON);
+    }
+
+    // ── TLV subscribe parsing ─────────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-014
+    /// Title: Test parse_tlv_subscribe_req with the real Flutter hex payload
+    ///
+    /// Description: The exact bytes from Flutter's subscribeStreams() must yield
+    ///              req_id=42 and signal_ids=[1,2,3].
+    #[test]
+    fn test_parse_tlv_subscribe_req_real_flutter_bytes() {
+        let hex = "20 3F 00 01 02 00 2A 00 02 01 00 02 \
+                   03 18 00 01 01 00 01 02 02 00 01 00 03 01 00 00 04 04 00 00 00 00 00 05 01 00 01 \
+                   03 18 00 01 01 00 01 02 02 00 02 00 03 01 00 00 04 04 00 00 00 00 00 05 01 00 01 \
+                   03 18 00 01 01 00 01 02 02 00 03 00 03 01 00 00 04 04 00 00 00 00 00 05 01 00 01";
+        let bytes: Vec<u8> = hex
+            .split_whitespace()
+            .map(|s| u8::from_str_radix(s, 16).unwrap())
+            .collect();
+
+        let (req_id, signal_ids) = parse_tlv_subscribe_req(&bytes).unwrap();
+        assert_eq!(req_id, 42);
+        assert_eq!(signal_ids, vec![1u16, 2, 3]);
+    }
+
+    // ── FLAG_BACKLOG on outgoing frames ───────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-015
+    /// Title: Test FLAG_BACKLOG is set on frames when the retransmit buffer is non-empty
+    ///
+    /// Description: After one unacknowledged frame, the second add_data call shall
+    ///              produce a frame with FLAG_BACKLOG set.
+    #[tokio::test]
+    async fn test_flag_backlog_via_add_data() {
+        use crate::domain::ble_protocol::FLAG_BACKLOG;
+
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        {
+            let mut st = state.write().await;
+            st.subscribe(SignalId::HR.as_u16());
+
+            let f1 = st.add_data(SignalId::HR.as_u16(), 70.0, 0).unwrap();
+            assert_eq!(f1.header.flags & FLAG_BACKLOG, 0, "First frame: no backlog");
+
+            let f2 = st.add_data(SignalId::HR.as_u16(), 71.0, 1000).unwrap();
+            assert_ne!(
+                f2.header.flags & FLAG_BACKLOG,
+                0,
+                "Second frame: unacked buffer → FLAG_BACKLOG must be set"
+            );
+        }
+    }
+
+    // ── Selective ACK bitmap retransmit ───────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-016
+    /// Title: Test handle_ack_with_bitmap returns lost frames for retransmission
+    ///
+    /// Description: 4 frames buffered (seq 1-4). Flutter ACK: ack_upto=1, bitmap
+    ///              bit1=1 (seq 3 received, seq 2 missing). handle_ack_with_bitmap
+    ///              must return seq 2 with FLAG_RETRANSMIT, and purge seq 1.
+    #[tokio::test]
+    async fn test_handle_ack_with_bitmap_retransmit() {
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        let stream_id;
+
+        {
+            let mut st = state.write().await;
+            stream_id = st.subscribe(SignalId::HR.as_u16());
+            for i in 0u64..4 {
+                st.add_data(SignalId::HR.as_u16(), i as f32, i * 1000);
+            }
+        }
+
+        // ack_upto=1; bit0=seq2 (clear=missing), bit1=seq3 (set=received)
+        let mut bitmap = [0u8; 8];
+        bitmap[0] = 0b0000_0010; // bit1 set → seq 3 received
+
+        let retransmits = {
+            let mut st = state.write().await;
+            st.handle_ack_with_bitmap(1, stream_id, 1, &bitmap)
+        };
+
+        assert_eq!(retransmits.len(), 1, "Seq 2 is the only hole");
+        assert_eq!(retransmits[0].header.seq, 2);
+        assert_ne!(retransmits[0].header.flags & FLAG_RETRANSMIT, 0);
+
+        // seq 1 must have been purged (ack_upto=1)
+        let st = state.read().await;
+        let pending = st.get_pending_count(SignalId::HR.as_u16());
+        assert_eq!(pending, 3, "Seq 1 purged; seq 2,3,4 remain in buffer");
+    }
+
+    // ── subscribe_with_stream_id ──────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-017
+    /// Title: Test subscribe_with_stream_id assigns IDs 1, 2, 3 for HR/SpO2/Temp
+    ///
+    /// Description: The TLV subscribe path uses preferred_stream_id = raw_id (1,2,3).
+    ///              All three signals must get independent fixed stream IDs.
+    #[tokio::test]
+    async fn test_subscribe_with_stream_id_all_signals() {
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        {
+            let mut st = state.write().await;
+            let hr_sid = st.subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+            let spo2_sid = st.subscribe_with_stream_id(SignalId::SpO2.as_u16(), 2);
+            let temp_sid = st.subscribe_with_stream_id(SignalId::Temperature.as_u16(), 3);
+
+            assert_eq!(hr_sid, 1);
+            assert_eq!(spo2_sid, 2);
+            assert_eq!(temp_sid, 3);
+            assert_eq!(st.streams.len(), 3);
+        }
     }
 }

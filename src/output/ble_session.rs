@@ -742,4 +742,234 @@ mod tests {
         assert_eq!(session.get_pending_count(SignalId::HR.as_u16()), 2);
         assert_eq!(session.get_pending_count(SignalId::SpO2.as_u16()), 1);
     }
+
+    // ── subscribe_with_stream_id ───────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLESESSION-015
+    /// Title: Test subscribe_with_stream_id assigns the preferred stream_id
+    ///
+    /// Description: Calling subscribe_with_stream_id(HR, 5) shall allocate stream_id=5,
+    ///              and advance next_stream_id to 6.
+    #[test]
+    fn test_subscribe_with_stream_id_preferred() {
+        let mut session = BleSessionState::new(1);
+        let sid = session.subscribe_with_stream_id(SignalId::HR.as_u16(), 5);
+        assert_eq!(sid, 5);
+        assert_eq!(session.get_stream_id(SignalId::HR.as_u16()), Some(5));
+        assert_eq!(session.next_stream_id, 6);
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-016
+    /// Title: Test subscribe_with_stream_id is idempotent
+    ///
+    /// Description: A second call with the same signal_id must return the first
+    ///              stream_id unchanged, even if a different preferred_id is given.
+    #[test]
+    fn test_subscribe_with_stream_id_idempotent() {
+        let mut session = BleSessionState::new(1);
+        let first = session.subscribe_with_stream_id(SignalId::HR.as_u16(), 3);
+        let second = session.subscribe_with_stream_id(SignalId::HR.as_u16(), 99);
+        assert_eq!(first, second); // second call ignored
+        assert_eq!(session.streams.len(), 1);
+    }
+
+    // ── FLAG_BACKLOG behaviour ─────────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLESESSION-017
+    /// Title: Test FLAG_BACKLOG is set when retransmit buffer is non-empty
+    ///
+    /// Description: The first frame has an empty buffer → no BACKLOG flag.
+    ///              The second frame is sent while the first is still unacknowledged
+    ///              → BACKLOG flag must be set on the second frame.
+    #[test]
+    fn test_flag_backlog_set_when_buffer_non_empty() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe(SignalId::HR.as_u16());
+
+        // First frame: buffer was empty at send time → no BACKLOG
+        let f1 = session.add_data(SignalId::HR.as_u16(), 70.0, 0).unwrap();
+        assert_eq!(
+            f1.header.flags & FLAG_BACKLOG,
+            0,
+            "First frame: buffer empty → FLAG_BACKLOG must NOT be set"
+        );
+
+        // Second frame: first frame is still unacknowledged → BACKLOG
+        let f2 = session.add_data(SignalId::HR.as_u16(), 71.0, 1000).unwrap();
+        assert_ne!(
+            f2.header.flags & FLAG_BACKLOG,
+            0,
+            "Second frame: buffer non-empty → FLAG_BACKLOG must be set"
+        );
+    }
+
+    // ── reset_session ─────────────────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLESESSION-018
+    /// Title: Test reset_session clears all buffers and sequence counters
+    ///
+    /// Description: After reset_session(99), all stream buffers must be empty,
+    ///              last_seq must be 0, and subscriptions must be preserved.
+    #[test]
+    fn test_reset_session() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe(SignalId::HR.as_u16());
+        session.subscribe(SignalId::SpO2.as_u16());
+
+        session.add_data(SignalId::HR.as_u16(), 70.0, 0);
+        session.add_data(SignalId::SpO2.as_u16(), 98.0, 0);
+        assert_eq!(session.total_pending(), 2);
+
+        session.reset_session(99);
+
+        assert_eq!(session.current_session_id, 99);
+        assert_eq!(session.total_pending(), 0);
+        // Subscriptions survive
+        assert!(session.is_subscribed(SignalId::HR.as_u16()));
+        assert!(session.is_subscribed(SignalId::SpO2.as_u16()));
+        // Sequence counters reset
+        for entry in session.streams.values() {
+            assert_eq!(entry.last_seq, 0);
+        }
+    }
+
+    // ── handle_nack edge cases ────────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLESESSION-019
+    /// Title: Test handle_nack returns empty Vec for unknown stream_id
+    #[test]
+    fn test_handle_nack_unknown_stream() {
+        let session = BleSessionState::new(1);
+        let result = session.handle_nack(999, &[1, 2, 3]);
+        assert!(result.is_empty());
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-020
+    /// Title: Test handle_nack for seq not in buffer returns empty Vec
+    ///
+    /// Description: If the requested seq has already been evicted (buffer capped),
+    ///              handle_nack shall silently skip it and return nothing.
+    #[test]
+    fn test_handle_nack_seq_not_in_buffer() {
+        let mut session = BleSessionState::new(1).with_buffer_size(2);
+        let stream_id = session.subscribe(SignalId::HR.as_u16());
+
+        // Add 3 frames; buffer capped at 2 → seq 1 evicted
+        session.add_data(SignalId::HR.as_u16(), 70.0, 0);
+        session.add_data(SignalId::HR.as_u16(), 71.0, 1000);
+        session.add_data(SignalId::HR.as_u16(), 72.0, 2000);
+
+        let result = session.handle_nack(stream_id, &[1]); // seq 1 was evicted
+        assert!(result.is_empty(), "Evicted seq must not be retransmitted");
+    }
+
+    // ── handle_ack_with_bitmap ────────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLESESSION-021
+    /// Title: Test handle_ack_with_bitmap purges cumulatively acknowledged frames
+    ///
+    /// Description: ack_upto=3 with all-zero bitmap must purge seq 1,2,3 and leave
+    ///              seq 4,5 in the buffer. No retransmits since bitmap is all zeros.
+    #[test]
+    fn test_handle_ack_with_bitmap_cumulative_purge() {
+        let mut session = BleSessionState::new(1);
+        let stream_id = session.subscribe(SignalId::HR.as_u16());
+
+        for i in 0u64..5 {
+            session.add_data(SignalId::HR.as_u16(), i as f32, i * 1000);
+        }
+
+        let bitmap = [0u8; 8]; // no out-of-order frames
+        let retransmits =
+            session.handle_ack_with_bitmap(1, stream_id, 3, &bitmap);
+
+        assert!(retransmits.is_empty(), "All-zero bitmap → no retransmits");
+        assert_eq!(session.get_pending_count(SignalId::HR.as_u16()), 2);
+        let entry = session.streams.get(&stream_id).unwrap();
+        let seqs: Vec<u32> = entry.tx_buffer.iter().map(|f| f.header.seq).collect();
+        assert_eq!(seqs, vec![4, 5]);
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-022
+    /// Title: Test handle_ack_with_bitmap detects a hole and returns retransmit
+    ///
+    /// Description: 5 frames buffered (seq 1-5). ack_upto=1, bitmap has bit1 set
+    ///              (seq 3 received) but bit0 clear (seq 2 missing). Only seq 2
+    ///              must be returned for retransmission (seq 3 is already received,
+    ///              seq 4-5 are beyond the highest acked offset).
+    #[test]
+    fn test_handle_ack_with_bitmap_hole_retransmit() {
+        let mut session = BleSessionState::new(1);
+        let stream_id = session.subscribe(SignalId::HR.as_u16());
+
+        for i in 0u64..5 {
+            session.add_data(SignalId::HR.as_u16(), i as f32, i * 1000);
+        }
+
+        // ack_upto=1; bit0=seq2 (0=missing), bit1=seq3 (1=received)
+        let mut bitmap = [0u8; 8];
+        bitmap[0] = 0b0000_0010; // bit1 set → seq 3 received; bit0 clear → seq 2 missing
+        let retransmits =
+            session.handle_ack_with_bitmap(1, stream_id, 1, &bitmap);
+
+        assert_eq!(retransmits.len(), 1, "Exactly one hole (seq 2)");
+        assert_eq!(retransmits[0].header.seq, 2);
+        assert_ne!(
+            retransmits[0].header.flags & FLAG_RETRANSMIT,
+            0,
+            "FLAG_RETRANSMIT must be set"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-023
+    /// Title: Test handle_ack_with_bitmap with all-zero bitmap and no highest_acked_offset
+    ///
+    /// Description: When bitmap is all zeros (no out-of-order frames confirmed),
+    ///              highest_acked_offset is None → no retransmits triggered.
+    ///              Buffer frames above ack_upto are treated as in-flight.
+    #[test]
+    fn test_handle_ack_with_bitmap_in_flight_no_retransmit() {
+        let mut session = BleSessionState::new(1);
+        let stream_id = session.subscribe(SignalId::HR.as_u16());
+
+        session.add_data(SignalId::HR.as_u16(), 70.0, 0);
+        session.add_data(SignalId::HR.as_u16(), 71.0, 1000);
+        session.add_data(SignalId::HR.as_u16(), 72.0, 2000);
+
+        // ack_upto=0, empty bitmap → nothing confirmed above base, frames are in-flight
+        let bitmap = [0u8; 8];
+        let retransmits =
+            session.handle_ack_with_bitmap(1, stream_id, 0, &bitmap);
+
+        assert!(
+            retransmits.is_empty(),
+            "In-flight frames must not be retransmitted"
+        );
+        // All 3 frames still in buffer (ack_upto=0 purges nothing)
+        assert_eq!(session.get_pending_count(SignalId::HR.as_u16()), 3);
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-024
+    /// Title: Test handle_ack_with_bitmap new session_id resets all streams
+    ///
+    /// Description: If session_id in the bitmap-ACK differs from current_session_id,
+    ///              all stream buffers and sequence counters must be cleared.
+    #[test]
+    fn test_handle_ack_with_bitmap_new_session_resets() {
+        let mut session = BleSessionState::new(1);
+        let stream_id = session.subscribe(SignalId::HR.as_u16());
+
+        session.add_data(SignalId::HR.as_u16(), 70.0, 0);
+        session.add_data(SignalId::HR.as_u16(), 71.0, 1000);
+        assert_eq!(session.get_pending_count(SignalId::HR.as_u16()), 2);
+
+        let bitmap = [0u8; 8];
+        let retransmits =
+            session.handle_ack_with_bitmap(42, stream_id, 0, &bitmap); // new session_id=42
+
+        assert!(retransmits.is_empty());
+        assert_eq!(session.current_session_id, 42);
+        assert_eq!(session.total_pending(), 0);
+        assert!(session.is_subscribed(SignalId::HR.as_u16()));
+    }
 }
