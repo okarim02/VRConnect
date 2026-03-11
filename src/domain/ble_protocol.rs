@@ -34,8 +34,8 @@ pub const MSG_ACK_FRAME: u8 = 0x20;
 pub const MSG_NACK_FRAME: u8 = 0x21;
 
 // flags bits — values match Flutter's main-central.dart constants exactly
-pub const FLAG_RETRANSMIT: u8 = 0x02; // bit0: frame is a retransmission
-pub const FLAG_BACKLOG: u8 = 0x01; // bit1: sender has backlogged unacked frames
+pub const FLAG_RETRANSMIT: u8 = 0x01; // bit0: frame is a retransmission
+pub const FLAG_BACKLOG: u8 = 0x02; // bit1: sender has backlogged unacked frames
 
 // value_type codes (used in Catalog)
 pub const VALUE_TYPE_FLOAT32: u8 = 3;

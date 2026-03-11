@@ -12,7 +12,7 @@
 //
 //          Isolated from Bluetooth radio for safe unit testing.
 
-use crate::domain::ble_protocol::{DataFrame, FLAG_RETRANSMIT};
+use crate::domain::ble_protocol::{DataFrame, FLAG_BACKLOG, FLAG_RETRANSMIT};
 use std::collections::{HashMap, VecDeque};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -113,7 +113,7 @@ impl BleSessionState {
         bitmap: &[u8; 8],
     ) -> Vec<DataFrame> {
         if session_id != self.current_session_id {
-            // New session detected: reset all buffers (subscriptions preserved)
+            // New session detected: reset all buffers
             self.current_session_id = session_id;
             for entry in self.streams.values_mut() {
                 entry.tx_buffer.clear();
@@ -128,30 +128,39 @@ impl BleSessionState {
 
         let mut retransmits = Vec::new();
 
-        // Build a set of all frames in buffer keyed by seq
-        let buffer_seqs: std::collections::HashSet<u32> =
-            entry.tx_buffer.iter().map(|f| f.header.seq).collect();
-
-        // Check for lost frames in bitmap range
+        // 1. Find the "leading edge" (the highest bit set in the bitmap)
+        // This tells us the latest out-of-order frame the client has received.
+        let mut highest_acked_offset: Option<u32> = None;
         for offset in 0..64u32 {
-            let seq = ack_upto.wrapping_add(1).wrapping_add(offset);
             let bit_index = offset as usize;
             let byte_index = bit_index / 8;
             let bit_in_byte = bit_index % 8;
 
-            // Check if bit is set (frame received)
-            let is_acked = if byte_index < 8 {
-                (bitmap[byte_index] >> bit_in_byte) & 1 == 1
-            } else {
-                false
-            };
+            if (bitmap[byte_index] >> bit_in_byte) & 1 == 1 {
+                highest_acked_offset = Some(offset);
+            }
+        }
 
-            // If frame exists in buffer but bitmap bit is NOT set, it's lost
-            if buffer_seqs.contains(&seq) && !is_acked {
-                if let Some(frame) = entry.tx_buffer.iter().find(|f| f.header.seq == seq) {
-                    let mut retransmit = frame.clone();
-                    retransmit.header.flags |= FLAG_RETRANSMIT;
-                    retransmits.push(retransmit);
+        // 2. Only check for lost frames BEFORE the highest received offset.
+        // If highest_acked_offset is None, no newer frames arrived yet (frames are just in-flight).
+        if let Some(max_offset) = highest_acked_offset {
+            let buffer_seqs: std::collections::HashSet<u32> =
+                entry.tx_buffer.iter().map(|f| f.header.seq).collect();
+
+            for offset in 0..max_offset {
+                let seq = ack_upto.wrapping_add(1).wrapping_add(offset);
+                let bit_index = offset as usize;
+                let byte_index = bit_index / 8;
+                let bit_in_byte = bit_index % 8;
+                let is_acked = (bitmap[byte_index] >> bit_in_byte) & 1 == 1;
+
+                // If frame is in our buffer, but the bit is 0, it's a hole! Retransmit it.
+                if buffer_seqs.contains(&seq) && !is_acked {
+                    if let Some(frame) = entry.tx_buffer.iter().find(|f| f.header.seq == seq) {
+                        let mut retransmit = frame.clone();
+                        retransmit.header.flags |= FLAG_RETRANSMIT;
+                        retransmits.push(retransmit);
+                    }
                 }
             }
         }
@@ -313,7 +322,12 @@ impl BleSessionState {
         entry.last_seq += 1;
         let seq = entry.last_seq;
 
-        let frame = DataFrame::new(self.current_session_id, stream_id, seq, t0_ms, value);
+        let mut frame = DataFrame::new(self.current_session_id, stream_id, seq, t0_ms, value);
+
+        // Set FLAG_BACKLOG if we have unacknowledged frames buffered
+        if !entry.tx_buffer.is_empty() {
+            frame.header.flags |= FLAG_BACKLOG;
+        }
 
         // Buffer for retransmission (oldest frame evicted when limit reached)
         entry.tx_buffer.push_back(frame.clone());

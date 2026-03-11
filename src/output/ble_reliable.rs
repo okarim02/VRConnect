@@ -24,6 +24,10 @@ use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};
 use crate::output::ble_gatt::{CharProperty, GattServer, WriteEvent};
 use crate::output::ble_session::BleSessionState;
+/// IN order to test real retransmits (DELETE LATER)
+// use std::sync::atomic::{AtomicUsize, Ordering};
+// static CHAOS_COUNTER: AtomicUsize = AtomicUsize::new(0);
+// --
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -214,14 +218,44 @@ impl ReliableBleOutput {
                 // ── Data_IN: ACK_FRAME or NACK_FRAME from client ──────────────
                 "Data_IN" => match InboundFrame::from_ble_bytes(&event.data) {
                     Some(InboundFrame::Ack(ack)) => {
-                        log::debug!(
-                            "ACK: session={}, stream={}, ack_upto={}",
-                            ack.session_id,
+                        // ELEVATED TO INFO so you can see ACKs arriving
+                        log::info!(
+                            "ACK Recv: stream={}, ack_upto={}, bitmap={:02X?}",
                             ack.stream_id,
-                            ack.ack_upto
+                            ack.ack_upto,
+                            ack.bitmap
                         );
-                        let mut st = state.write().await;
-                        st.handle_ack(ack.session_id, ack.stream_id, ack.ack_upto);
+
+                        let retransmits = {
+                            let mut st = state.write().await;
+                            st.handle_ack_with_bitmap(
+                                ack.session_id,
+                                ack.stream_id,
+                                ack.ack_upto,
+                                &ack.bitmap,
+                            )
+                        };
+
+                        if !retransmits.is_empty() {
+                            let srv = server.read().await;
+                            for frame in retransmits {
+                                let bytes = frame.to_ble_bytes();
+                                if let Err(e) = srv.notify("Data_OUT", &bytes).await {
+                                    log::warn!(
+                                        "Retransmit failed for seq {}: {}",
+                                        frame.header.seq,
+                                        e
+                                    );
+                                } else {
+                                    // ELEVATED TO INFO so you can see Rust saving dropped packets
+                                    log::info!(
+                                        "--> RETRANSMITTED seq {} for stream {}",
+                                        frame.header.seq,
+                                        frame.header.stream_id
+                                    );
+                                }
+                            }
+                        }
                     }
                     Some(InboundFrame::Nack(nack)) => {
                         log::info!(
@@ -560,13 +594,24 @@ impl ReliableBleOutput {
                 continue;
             }
 
+            // log track info for diagnosis
+            // log::info!(
+            //     "Track: name='{}', raw={:?}, display='{}', timestamp={}",
+            //     track.name,
+            //     track.raw_value,
+            //     track.display_value,
+            //     track.timestamp
+            // );
+
             // Map VitalRecorder signal name → IDT signal_id.
             // VitalRecorder exports SpO2 as "PLETH_SPO2" (or "PLETH" / "SpO2" in older versions)
             // and temperature as "BT1_TEMP" (or "BT1" / "TEMPERATURE" in older versions).
-            let signal_id = match track.name.to_uppercase().as_str() {
+            let signal_id = match track.name.trim().to_uppercase().as_str() {
                 "HR" => SignalId::HR.as_u16(),
                 "SPO2" | "PLETH" | "PLETH_SPO2" => SignalId::SpO2.as_u16(),
-                "TEMP" | "TEMPERATURE" | "BT1" | "BT1_TEMP" => SignalId::Temperature.as_u16(),
+                "TEMP" | "TEMPERATURE" | "BT" | "BT1" | "BT1_TEMP" => {
+                    SignalId::Temperature.as_u16()
+                }
                 _ => continue,
             };
 
@@ -583,6 +628,19 @@ impl ReliableBleOutput {
 
             // add_data returns Some(frame) only if signal is subscribed
             if let Some(frame) = state.add_data(signal_id, val_f32, t0_ms) {
+                // // --- CHAOS MONKEY START --- TO DELETE LATER ONLY FOR TEST PURPOSE
+                // // Intentionally drop 1 out of every 15 frames to simulate bad BLE connection
+                // let c = CHAOS_COUNTER.fetch_add(1, Ordering::SeqCst);
+                // if c % 15 == 0 {
+                //     log::warn!(
+                //         "[CHAOS] 💥 Dropped DATA seq={} stream={} into the void!",
+                //         frame.header.seq,
+                //         frame.header.stream_id
+                //     );
+                //     continue; // Skip the BLE notify!
+                // }
+                // // --- CHAOS MONKEY END ---
+
                 let bytes = frame.to_ble_bytes();
                 if let Err(e) = server.notify("Data_OUT", &bytes).await {
                     log::warn!("BLE notify failed for signal 0x{:04X}: {}", signal_id, e);
