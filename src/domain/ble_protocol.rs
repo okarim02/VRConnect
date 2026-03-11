@@ -12,7 +12,7 @@
 //   0x01 = SUBSCRIBE_REQ  (Write → Subscribe char)
 //   0x02 = SUBSCRIBE_RSP  (Notify → Data_OUT char)
 //   0x10 = DATA_FRAME     (Notify → Data_OUT char)
-//   0x20 = ACK_FRAME      (Write → Data_IN char, no IDT magic for the app's ACKs)
+//   0x20 = ACK_FRAME      (Write → Data_IN char, no IDT magic for the fluter app's ACKs)
 //   0x21 = NACK_FRAME     (Write → Data_IN char)
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -76,7 +76,7 @@ impl SignalId {
             0x0101 => Some(SignalId::HR),
             0x0102 => Some(SignalId::SpO2),
             0x0103 => Some(SignalId::Temperature),
-            // Legacy simple IDs (spec "I.pdf" / some Flutter client implementations)
+            // Legacy simple IDs (spec "Proposition de protocole BLE.pdf" / some Flutter client implementations)
             1 => Some(SignalId::HR),
             2 => Some(SignalId::SpO2),
             3 => Some(SignalId::Temperature),
@@ -1224,5 +1224,144 @@ mod tests {
         // Non-IDT frame (no 0xD17A magic) with fewer than MIN_LEN bytes
         let bytes = vec![0x00u8; AckFrame::MIN_LEN - 1]; // 8 bytes, need ≥ 9
         assert!(InboundFrame::from_ble_bytes(&bytes).is_none());
+    }
+
+    // ── AckFrame::is_acked tests ──────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-025
+    /// is_acked returns true for seq ≤ ack_upto (cumulative path)
+    #[test]
+    fn test_ack_frame_is_acked_cumulative() {
+        let ack = AckFrame {
+            session_id: 1,
+            stream_id: 1,
+            ack_upto: 10,
+            bitmap: [0u8; 8],
+        };
+        assert!(ack.is_acked(1));
+        assert!(ack.is_acked(10));
+        assert!(!ack.is_acked(11));
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-026
+    /// is_acked returns true for seq covered by a set bitmap bit (selective ACK path)
+    #[test]
+    fn test_ack_frame_is_acked_bitmap() {
+        // ack_upto = 5; bitmap bit0 = seq 6 received, bit2 = seq 8 received
+        let mut bitmap = [0u8; 8];
+        bitmap[0] = 0b0000_0101; // bits 0 and 2 set → seq 6 and 8 acknowledged
+        let ack = AckFrame {
+            session_id: 1,
+            stream_id: 1,
+            ack_upto: 5,
+            bitmap,
+        };
+        assert!(ack.is_acked(6)); // bit0 set
+        assert!(!ack.is_acked(7)); // bit1 clear → not acked
+        assert!(ack.is_acked(8)); // bit2 set
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-027
+    /// is_acked returns false for seq beyond the 64-bit bitmap window
+    #[test]
+    fn test_ack_frame_is_acked_beyond_window() {
+        let ack = AckFrame {
+            session_id: 1,
+            stream_id: 1,
+            ack_upto: 0,
+            bitmap: [0xFF; 8], // all 64 bits set → seq 1..64 acked
+        };
+        assert!(ack.is_acked(64)); // last bit in window
+        assert!(!ack.is_acked(65)); // one beyond window
+    }
+
+    // ── AckFrame bitmap parsing ───────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-028
+    /// AckFrame::from_ble_bytes correctly reads an 8-byte non-zero bitmap
+    #[test]
+    fn test_ack_frame_parse_with_bitmap() {
+        let mut buf = make_ack_frame_bytes(2, 3, 7);
+        // Overwrite bitmap bytes [9..17]: bit0 set (seq 8 received)
+        buf[9] = 0x01;
+        let ack = AckFrame::from_ble_bytes(&buf).unwrap();
+        assert_eq!(ack.ack_upto, 7);
+        assert_eq!(ack.bitmap[0], 0x01);
+        assert!(ack.is_acked(8)); // bit0 of bitmap → seq 8
+        assert!(!ack.is_acked(9)); // bit1 clear
+    }
+
+    // ── IdtHeader / DataFrame length guards ───────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-029
+    /// IdtHeader::from_bytes returns None if buffer is shorter than 13 bytes
+    #[test]
+    fn test_idt_header_too_short() {
+        let b = vec![0x7A, 0xD1, 0x01]; // only 3 bytes
+        assert!(IdtHeader::from_bytes(&b).is_none());
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-030
+    /// DataFrame::from_ble_bytes returns None if buffer is shorter than 30 bytes
+    #[test]
+    fn test_data_frame_too_short() {
+        let b = vec![0u8; DataFrame::TOTAL_LEN - 1]; // 29 bytes
+        assert!(DataFrame::from_ble_bytes(&b).is_none());
+    }
+
+    // ── NackFrame CRC guard ───────────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-031
+    /// NackFrame::from_ble_bytes returns None when the CRC is corrupted
+    #[test]
+    fn test_nack_frame_bad_crc() {
+        let mut bytes = make_nack_frame_bytes(1, 1, 2, &[5]);
+        // Flip the last byte of the CRC
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        assert!(NackFrame::from_ble_bytes(&bytes).is_none());
+    }
+
+    // ── parse_tlv_subscribe_req ───────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-032
+    /// parse_tlv_subscribe_req correctly parses the real Flutter hex payload
+    /// (3 signal items: HR=1, SpO2=2, Temp=3)
+    #[test]
+    fn test_parse_tlv_subscribe_req_flutter_hex() {
+        // Exact hex from Flutter's subscribeStreams() in main-central.dart
+        let hex = "20 3F 00 01 02 00 2A 00 02 01 00 02 \
+                   03 18 00 01 01 00 01 02 02 00 01 00 03 01 00 00 04 04 00 00 00 00 00 05 01 00 01 \
+                   03 18 00 01 01 00 01 02 02 00 02 00 03 01 00 00 04 04 00 00 00 00 00 05 01 00 01 \
+                   03 18 00 01 01 00 01 02 02 00 03 00 03 01 00 00 04 04 00 00 00 00 00 05 01 00 01";
+        let bytes: Vec<u8> = hex
+            .split_whitespace()
+            .map(|s| u8::from_str_radix(s, 16).unwrap())
+            .collect();
+
+        let (req_id, signal_ids) = parse_tlv_subscribe_req(&bytes).unwrap();
+        assert_eq!(req_id, 0x002A); // 42 — from bytes[6..8] = 2A 00
+        assert_eq!(signal_ids.len(), 3);
+        // Legacy simple IDs 1, 2, 3 (Flutter sends these, VRConnect normalizes them)
+        assert_eq!(signal_ids[0], 1);
+        assert_eq!(signal_ids[1], 2);
+        assert_eq!(signal_ids[2], 3);
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-033
+    /// parse_tlv_subscribe_req returns None when the first byte is not 0x20
+    #[test]
+    fn test_parse_tlv_subscribe_req_wrong_marker() {
+        let mut bytes = vec![0u8; 39];
+        bytes[0] = 0xAB; // not 0x20
+        assert!(parse_tlv_subscribe_req(&bytes).is_none());
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-034
+    /// parse_tlv_subscribe_req returns None for a buffer that is too short
+    #[test]
+    fn test_parse_tlv_subscribe_req_too_short() {
+        let bytes = vec![0x20u8; 10]; // need ≥ 12 + 27 = 39 bytes
+        assert!(parse_tlv_subscribe_req(&bytes).is_none());
     }
 }
