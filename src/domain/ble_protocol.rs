@@ -1364,4 +1364,92 @@ mod tests {
         let bytes = vec![0x20u8; 10]; // need ≥ 12 + 27 = 39 bytes
         assert!(parse_tlv_subscribe_req(&bytes).is_none());
     }
+
+    // ── Additional coverage tests ──────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-035
+    /// InboundFrame::from_ble_bytes returns None for a buffer with fewer than 2 bytes
+    #[test]
+    fn test_inbound_frame_single_byte_returns_none() {
+        assert!(InboundFrame::from_ble_bytes(&[]).is_none());
+        assert!(InboundFrame::from_ble_bytes(&[0x7A]).is_none());
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-036
+    /// InboundFrame returns None when IDT magic matches but buffer is shorter than IdtHeader::SIZE
+    #[test]
+    fn test_inbound_frame_idt_magic_too_short() {
+        // 4 bytes: magic (0x7A 0xD1) + two padding bytes — length < IdtHeader::SIZE (13)
+        let bytes = vec![0x7Au8, 0xD1, 0x01, 0x21]; // IDT_MAGIC LE + partial header
+        assert!(InboundFrame::from_ble_bytes(&bytes).is_none());
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-037
+    /// SubscribeReq::from_ble_bytes with n=0 items parses successfully and returns empty items vec
+    #[test]
+    fn test_subscribe_req_parse_zero_items() {
+        let buf = make_subscribe_req_bytes(1, 7, SUB_OP_SUBSCRIBE, &[]);
+        match SubscribeReq::from_ble_bytes(&buf) {
+            Some(req) => {
+                assert_eq!(req.op, SUB_OP_SUBSCRIBE);
+                assert!(req.items.is_empty(), "n=0 must yield empty items vec");
+            }
+            None => panic!("Expected Some(SubscribeReq) with n=0"),
+        }
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-038
+    /// SubscribeReq::from_ble_bytes returns None when CRC is corrupted (no valid stride found)
+    #[test]
+    fn test_subscribe_req_bad_crc_returns_none() {
+        let mut buf = make_subscribe_req_bytes(1, 1, SUB_OP_SUBSCRIBE, &[(1, SignalId::HR.as_u16())]);
+        // Corrupt last CRC byte so detect_item_stride finds no valid stride
+        let last = buf.len() - 1;
+        buf[last] ^= 0xFF;
+        assert!(SubscribeReq::from_ble_bytes(&buf).is_none());
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-039
+    /// parse_tlv_subscribe_req returns None when all items have signal_id == 0
+    #[test]
+    fn test_parse_tlv_subscribe_req_all_zero_signal_ids_returns_none() {
+        // Build a TLV payload with 0x20 marker and one item whose signal_id bytes are 0x00 0x00
+        // (signal_id==0 is filtered out → signal_ids stays empty → return None)
+        let hex = "20 3F 00 01 02 00 2A 00 02 01 00 02 \
+                   03 18 00 01 01 00 01 02 02 00 00 00 03 01 00 00 04 04 00 00 00 00 00 05 01 00 01";
+        let bytes: Vec<u8> = hex
+            .split_whitespace()
+            .map(|s| u8::from_str_radix(s, 16).unwrap())
+            .collect();
+        assert!(parse_tlv_subscribe_req(&bytes).is_none());
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-040
+    /// NackFrame::from_ble_bytes with n=0 (empty seq_list) parses cleanly
+    #[test]
+    fn test_nack_frame_zero_seqs() {
+        let buf = make_nack_frame_bytes(1, 2, 2, &[]); // n=0, reason=MISSING
+        let frame = NackFrame::from_ble_bytes(&buf).expect("n=0 NackFrame must parse");
+        assert_eq!(frame.reason, 2);
+        assert!(frame.seq_list.is_empty());
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-041
+    /// AckFrame::is_acked correctly checks bitmap bits in bytes beyond byte 0 (offsets 8–15)
+    #[test]
+    fn test_ack_frame_is_acked_bitmap_high_bytes() {
+        // ack_upto=0; set bit 8 (byte1, bit0) → seq 9 received
+        // and bit 15 (byte1, bit7) → seq 16 received
+        let mut bitmap = [0u8; 8];
+        bitmap[1] = 0b1000_0001; // bit8 (offset=8) and bit15 (offset=15) set
+        let ack = AckFrame {
+            session_id: 1,
+            stream_id: 1,
+            ack_upto: 0,
+            bitmap,
+        };
+        assert!(ack.is_acked(9),  "bit 8 in byte1 → seq 9 must be acked");
+        assert!(ack.is_acked(16), "bit 15 in byte1 → seq 16 must be acked");
+        assert!(!ack.is_acked(10), "bit 9 clear → seq 10 not acked");
+    }
 }

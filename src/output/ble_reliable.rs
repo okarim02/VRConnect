@@ -1240,7 +1240,10 @@ mod tests {
             .count();
 
         assert_eq!(spo2_count, 2, "Two SpO2 aliases (PLETH, PLETH_SPO2)");
-        assert_eq!(temp_count, 5, "Five Temperature aliases (BT, BT1, BT1_TEMP, TEMP, TEMPERATURE)");
+        assert_eq!(
+            temp_count, 5,
+            "Five Temperature aliases (BT, BT1, BT1_TEMP, TEMP, TEMPERATURE)"
+        );
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-012
@@ -1399,5 +1402,78 @@ mod tests {
             assert_eq!(temp_sid, 3);
             assert_eq!(st.streams.len(), 3);
         }
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-018
+    /// build_char_uuid returns Err when the resulting string is not a valid UUID
+    #[test]
+    fn test_build_char_uuid_invalid_base_returns_error() {
+        // A base string of length != 32 that produces an invalid UUID format
+        let result = ReliableBleOutput::build_char_uuid("not-a-valid-uuid-base!!", "90ae");
+        assert!(result.is_err(), "Invalid UUID base must return Err");
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-019
+    /// extract_signal_values with room 0 having no tracks returns an empty Vec
+    #[test]
+    fn test_extract_signal_values_empty_tracks() {
+        let room = ProcessedRoom {
+            room_index: 0,
+            room_name: "BED_01".to_string(),
+            tracks: vec![],
+        };
+        let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+        let values = ReliableBleOutput::extract_signal_values(&data);
+        assert!(
+            values.is_empty(),
+            "Room with no tracks must yield no values"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-020
+    /// extract_signal_values skips a track when raw_value is None and display_value
+    /// cannot be parsed as f32 (e.g., "N/A")
+    #[test]
+    fn test_extract_signal_values_unparseable_display_value_skipped() {
+        let mut track = create_test_track("HR", 0.0, 0, "BED_01");
+        track.raw_value = None;
+        track.display_value = "N/A".to_string(); // cannot parse as f32
+
+        let room = ProcessedRoom {
+            room_index: 0,
+            room_name: "BED_01".to_string(),
+            tracks: vec![track],
+        };
+        let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+        let values = ReliableBleOutput::extract_signal_values(&data);
+        assert!(
+            values.is_empty(),
+            "Unparseable display_value must be skipped"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-021
+    /// extract_signal_values returns an empty Vec when no rooms are present
+    #[test]
+    fn test_extract_signal_values_no_rooms() {
+        let data = ProcessedData::new("VR-TEST".to_string(), vec![]);
+        let values = ReliableBleOutput::extract_signal_values(&data);
+        assert!(values.is_empty());
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-022
+    /// extract_signal_values correctly maps "BT" (an alias) to Temperature signal_id
+    #[test]
+    fn test_extract_signal_values_bt_alias_maps_to_temperature() {
+        let room = ProcessedRoom {
+            room_index: 0,
+            room_name: "BED_01".to_string(),
+            tracks: vec![create_test_track("BT", 36.5, 0, "BED_01")],
+        };
+        let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+        let values = ReliableBleOutput::extract_signal_values(&data);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].0, SignalId::Temperature.as_u16());
+        assert!((values[0].1 - 36.5f32).abs() < f32::EPSILON);
     }
 }

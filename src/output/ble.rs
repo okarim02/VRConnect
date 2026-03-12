@@ -1,6 +1,18 @@
 // /src/output/ble.rs
 // Module: output.ble
 // Purpose: BLE GATT server output using ble-windows-server with per-track characteristics
+//
+// ── LEGACY — DO NOT USE IN NEW CODE ─────────────────────────────────────────
+// This module implements the V3 state-sync BLE protocol (one characteristic per
+// track, ble-windows-server crate).  It has been superseded by the IDT reliable
+// protocol in `ble_reliable.rs` + `ble_session.rs` which provide per-stream
+// sequence tracking, selective ACKs, and Flutter compatibility.
+//
+// This file is retained for reference only.  `BleOutput` is no longer
+// instantiated by `core/processor.rs`; it is exported solely for historical
+// continuity.  All active BLE output goes through `ReliableBleOutput`.
+// ─────────────────────────────────────────────────────────────────────────────
+#![allow(dead_code)]
 
 use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};

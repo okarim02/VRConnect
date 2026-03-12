@@ -884,8 +884,7 @@ mod tests {
         }
 
         let bitmap = [0u8; 8]; // no out-of-order frames
-        let retransmits =
-            session.handle_ack_with_bitmap(1, stream_id, 3, &bitmap);
+        let retransmits = session.handle_ack_with_bitmap(1, stream_id, 3, &bitmap);
 
         assert!(retransmits.is_empty(), "All-zero bitmap → no retransmits");
         assert_eq!(session.get_pending_count(SignalId::HR.as_u16()), 2);
@@ -913,8 +912,7 @@ mod tests {
         // ack_upto=1; bit0=seq2 (0=missing), bit1=seq3 (1=received)
         let mut bitmap = [0u8; 8];
         bitmap[0] = 0b0000_0010; // bit1 set → seq 3 received; bit0 clear → seq 2 missing
-        let retransmits =
-            session.handle_ack_with_bitmap(1, stream_id, 1, &bitmap);
+        let retransmits = session.handle_ack_with_bitmap(1, stream_id, 1, &bitmap);
 
         assert_eq!(retransmits.len(), 1, "Exactly one hole (seq 2)");
         assert_eq!(retransmits[0].header.seq, 2);
@@ -942,8 +940,7 @@ mod tests {
 
         // ack_upto=0, empty bitmap → nothing confirmed above base, frames are in-flight
         let bitmap = [0u8; 8];
-        let retransmits =
-            session.handle_ack_with_bitmap(1, stream_id, 0, &bitmap);
+        let retransmits = session.handle_ack_with_bitmap(1, stream_id, 0, &bitmap);
 
         assert!(
             retransmits.is_empty(),
@@ -968,12 +965,109 @@ mod tests {
         assert_eq!(session.get_pending_count(SignalId::HR.as_u16()), 2);
 
         let bitmap = [0u8; 8];
-        let retransmits =
-            session.handle_ack_with_bitmap(42, stream_id, 0, &bitmap); // new session_id=42
+        let retransmits = session.handle_ack_with_bitmap(42, stream_id, 0, &bitmap); // new session_id=42
 
         assert!(retransmits.is_empty());
         assert_eq!(session.current_session_id, 42);
         assert_eq!(session.total_pending(), 0);
         assert!(session.is_subscribed(SignalId::HR.as_u16()));
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-025
+    /// subscribe_with_stream_id does NOT advance next_stream_id when preferred_id < current next
+    #[test]
+    fn test_subscribe_with_stream_id_lower_than_next_does_not_advance() {
+        let mut session = BleSessionState::new(1);
+        // Advance next_stream_id to 5 by subscribing four signals
+        session.subscribe(0xAA01);
+        session.subscribe(0xAA02);
+        session.subscribe(0xAA03);
+        session.subscribe(0xAA04);
+        assert_eq!(session.next_stream_id, 5);
+
+        // Now subscribe HR with a preferred_stream_id lower than next_stream_id
+        let sid = session.subscribe_with_stream_id(SignalId::HR.as_u16(), 2);
+        // preferred_id=2 already exists so returns its own stream (idempotent)
+        // but 2 < 5 so next_stream_id must NOT be advanced
+        let _ = sid; // stream_id allocation might reuse 2 if it was the HR stream
+        assert_eq!(
+            session.next_stream_id, 5,
+            "next_stream_id must stay at 5 when preferred_id < current next"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-026
+    /// subscribe_with_stream_id with preferred_id < next does not advance counter (fresh signal)
+    #[test]
+    fn test_subscribe_with_stream_id_preferred_lower_than_next_fresh() {
+        let mut session = BleSessionState::new(1);
+        // Subscribe SpO2 first to get stream_id=1, advancing next to 2
+        session.subscribe(SignalId::SpO2.as_u16());
+        assert_eq!(session.next_stream_id, 2);
+
+        // Now subscribe Temperature with preferred_id=1 (< next_stream_id=2)
+        // HR is fresh (not yet subscribed) but preferred_id=1 < next=2 → counter stays at 2
+        let sid = session.subscribe_with_stream_id(SignalId::Temperature.as_u16(), 1);
+        assert_eq!(sid, 1);
+        assert_eq!(session.next_stream_id, 2, "next_stream_id must not regress");
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-027
+    /// unsubscribe on a signal_id that was never subscribed is a silent no-op
+    #[test]
+    fn test_unsubscribe_noop_on_never_subscribed() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe(SignalId::HR.as_u16());
+        // Unsubscribe SpO2 which was never subscribed — must not panic or change state
+        session.unsubscribe(SignalId::SpO2.as_u16());
+        assert!(
+            session.is_subscribed(SignalId::HR.as_u16()),
+            "HR must still be subscribed"
+        );
+        assert_eq!(session.streams.len(), 1);
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-028
+    /// handle_ack with an unknown stream_id is a silent no-op (no panic, no state change)
+    #[test]
+    fn test_handle_ack_unknown_stream_id_noop() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe(SignalId::HR.as_u16());
+        session.add_data(SignalId::HR.as_u16(), 70.0, 0);
+        let pending_before = session.total_pending();
+
+        // ACK for stream_id=999 which does not exist
+        session.handle_ack(1, 999, 100);
+
+        assert_eq!(
+            session.total_pending(),
+            pending_before,
+            "unknown stream ACK must not change buffer"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-029
+    /// get_pending_count for a signal_id that was never subscribed returns 0
+    #[test]
+    fn test_get_pending_count_unsubscribed_returns_zero() {
+        let session = BleSessionState::new(1);
+        assert_eq!(session.get_pending_count(SignalId::Temperature.as_u16()), 0);
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-030
+    /// handle_ack_with_bitmap with unknown stream_id returns empty Vec (no panic)
+    #[test]
+    fn test_handle_ack_with_bitmap_unknown_stream_noop() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe(SignalId::HR.as_u16());
+        session.add_data(SignalId::HR.as_u16(), 70.0, 0);
+
+        let bitmap = [0u8; 8];
+        let retransmits = session.handle_ack_with_bitmap(1, 999, 0, &bitmap);
+        assert!(
+            retransmits.is_empty(),
+            "unknown stream bitmap-ACK must return empty Vec"
+        );
+        assert_eq!(session.total_pending(), 1, "buffer must be unchanged");
     }
 }
