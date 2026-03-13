@@ -70,11 +70,8 @@ use crate::domain::ble_protocol::{
 use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};
 use crate::output::ble_gatt::{CharProperty, GattServer, WriteEvent};
+use crate::utils::chaos;
 use crate::output::ble_session::BleSessionState;
-// Chaos Monkey — uncomment to simulate random BLE packet drops for retransmit testing.
-// Also uncomment the CHAOS MONKEY block inside output() and the imports below.
-// use std::sync::atomic::{AtomicUsize, Ordering};
-// static CHAOS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -688,18 +685,14 @@ impl ReliableBleOutput {
                 //         Flutter hardcodes payloadStart=24 and skips CRC verification.
                 //         See TODO-1 in the module header for the full-compliance upgrade path.
 
-                // // --- CHAOS MONKEY START ---
-                // // Intentionally drop 1 out of every 15 frames to simulate a bad BLE link.
-                // let c = CHAOS_COUNTER.fetch_add(1, Ordering::SeqCst);
-                // if c % 15 == 0 {
-                //     log::warn!(
-                //         "[CHAOS] 💥 Dropped DATA seq={} stream={} into the void!",
-                //         frame.header.seq,
-                //         frame.header.stream_id
-                //     );
-                //     continue; // Skip the BLE notify!
-                // }
-                // // --- CHAOS MONKEY END ---
+                // --- CHAOS MONKEY: packet-drop + network-jitter (env-driven) ---
+                // Controlled by ENABLE_CHAOS_MONKEY / CHAOS_RATIO / CHAOS_NETWORK_JITTER.
+                // Never active when APP_ENV=production. See src/chaos/mod.rs.
+                if chaos::maybe_drop_frame("ble_reliable.rs") {
+                    continue; // Skip the BLE notify — simulates a lossy link.
+                }
+                chaos::maybe_network_jitter("ble_reliable.rs").await;
+                // -------------------------------------------------------------
 
                 let bytes = frame.to_ble_bytes();
                 if let Err(e) = server.notify("Data_OUT", &bytes).await {
