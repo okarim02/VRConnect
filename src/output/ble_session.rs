@@ -333,10 +333,21 @@ impl BleSessionState {
             frame.header.flags |= FLAG_BACKLOG;
         }
 
-        // Buffer for retransmission (oldest frame evicted when limit reached)
+        // Buffer for retransmission (oldest frame evicted when limit reached).
+        // [OBS-1] If the ACK channel is frozen (Flutter debugFreezeAck / debugDropAck),
+        //         the buffer fills to max_buffer_size and oldest frames are silently lost.
+        //         Each eviction is logged at WARN so medical data loss is never silent.
         entry.tx_buffer.push_back(frame.clone());
         while entry.tx_buffer.len() > self.max_buffer_size {
-            entry.tx_buffer.pop_front();
+            if let Some(evicted) = entry.tx_buffer.pop_front() {
+                log::warn!(
+                    "[BLE] Buffer overflow stream {}: evicted seq {} (cap={}) \
+                     — ACK channel may be frozen.",
+                    stream_id,
+                    evicted.header.seq,
+                    self.max_buffer_size
+                );
+            }
         }
 
         Some(frame)

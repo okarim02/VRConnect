@@ -208,7 +208,8 @@ impl ReliableBleOutput {
     /// Description: VRConnect shall start the BLE GATT server:
     ///   1. Set Catalog read value (IDT TLV binary via Catalog::to_ble_bytes)
     ///   2. Spawn the write-handler task (Data_IN / Subscribe / Unsubscribe)
-    ///   3. Start the GATT server (creates Windows GATT service + advertises)
+    ///   3. Spawn the ACK watchdog task (buffer depth monitor, 5 s interval)
+    ///   4. Start the GATT server (creates Windows GATT service + advertises)
     ///
     /// Version: V1.0
     pub async fn start(&self) -> Result<()> {
@@ -242,7 +243,20 @@ impl ReliableBleOutput {
             log::warn!("Write receiver already taken — write handlers won't work");
         }
 
-        // 3. Start GATT server
+        // 3. Spawn ACK watchdog task
+        // [OBS-2] Periodically checks total_pending() across all streams and emits WARN/ERROR
+        //         when the buffer depth suggests the ACK uplink is frozen or congested.
+        //         Surfaces Flutter debugFreezeAck / debugDropAck from the Rust log alone,
+        //         without requiring any Flutter-side instrumentation.
+        {
+            let state = self.state.clone();
+            tokio::spawn(async move {
+                Self::ack_watchdog_loop(state).await;
+            });
+            log::info!("ACK watchdog task started (interval=5s, warn≥50, error≥900 frames)");
+        }
+
+        // 4. Start GATT server
         {
             let mut server = self.server.write().await;
             server.start().await?;
@@ -398,6 +412,48 @@ impl ReliableBleOutput {
             }
         }
         log::info!("Write handler loop ended");
+    }
+
+    /// ID SRS: SRS-FN-BLERELIABLE-006
+    /// Title: ack_watchdog_loop
+    ///
+    /// Description: VRConnect shall periodically check the total number of unacknowledged
+    ///              frames across all active streams.  Emits WARN when pending frames exceed
+    ///              WARN_THRESHOLD (ACK channel slow / congested) and ERROR when near the
+    ///              hard buffer cap (data loss imminent).
+    ///
+    ///              Designed to surface Flutter-side ACK suppression (debugFreezeAck,
+    ///              debugDropAck) from the Rust log alone — no Flutter instrumentation needed.
+    ///              Tagged [OBS-2] — cross-referenced in start().
+    ///
+    /// Version: V1.0
+    async fn ack_watchdog_loop(state: Arc<RwLock<BleSessionState>>) {
+        /// Frames pending before WARN is emitted (~50 s of unacked data at 1 Hz).
+        const WARN_THRESHOLD: usize = 50;
+        /// Frames pending before ERROR is emitted (90 % of the 1 000-frame hard cap).
+        const ERROR_THRESHOLD: usize = 900;
+
+        log::info!("ACK watchdog running (interval=5s, warn≥50, error≥900)");
+
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+            let pending = state.read().await.total_pending();
+
+            if pending >= ERROR_THRESHOLD {
+                log::error!(
+                    "[ACK Watchdog] {} frames pending — buffer near capacity (cap=1000). \
+                     Data loss imminent. ACK channel appears frozen.",
+                    pending
+                );
+            } else if pending >= WARN_THRESHOLD {
+                log::warn!(
+                    "[ACK Watchdog] {} frames pending — ACK channel may be \
+                     slow or frozen (debugFreezeAck / debugDropAck active?).",
+                    pending
+                );
+            }
+        }
     }
 
     /// Handle a SUBSCRIBE_REQ IDT frame:
