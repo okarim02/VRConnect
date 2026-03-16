@@ -1,2 +1,6 @@
 [build]
 rustflags = ["--check-cfg=cfg(tarpaulin_include)"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+

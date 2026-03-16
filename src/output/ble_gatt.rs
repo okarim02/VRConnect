@@ -25,7 +25,7 @@ use windows::{
         GenericAttributeProfile::{
             GattCharacteristicProperties, GattLocalCharacteristic,
             GattLocalCharacteristicParameters, GattServiceProvider,
-            GattWriteRequestedEventArgs,
+            GattServiceProviderAdvertisingParameters, GattWriteRequestedEventArgs,
         },
     },
     Foundation::TypedEventHandler,
@@ -281,9 +281,17 @@ impl GattServer {
             self.local_chars.insert(cfg.name.clone(), local_char);
         }
 
-        // 3. Start advertising
+        // 3. Start advertising (connectable + discoverable)
+        let adv_params = GattServiceProviderAdvertisingParameters::new()
+            .map_err(|e| VitalError::Config(format!("AdvParams::new failed: {}", e)))?;
+        adv_params
+            .SetIsConnectable(true)
+            .map_err(|e| VitalError::Config(format!("SetIsConnectable failed: {}", e)))?;
+        adv_params
+            .SetIsDiscoverable(true)
+            .map_err(|e| VitalError::Config(format!("SetIsDiscoverable failed: {}", e)))?;
         provider
-            .StartAdvertising()
+            .StartAdvertisingWithParameters(&adv_params)
             .map_err(|e| VitalError::Config(format!("StartAdvertising failed: {}", e)))?;
 
         self.provider = Some(provider);
