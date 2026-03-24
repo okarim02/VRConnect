@@ -26,7 +26,7 @@ pub enum VitalError {
     SocketIo(String),
 
     #[error("Bluetooth error: {0}")]
-    Bluetooth(#[from] bluer::Error),
+    Bluetooth(String),  // CHANGED: Remove #[from] bluer::Error
 
     #[error("Configuration error: {0}")]
     Config(String),
@@ -55,26 +55,12 @@ mod tests {
     use super::*;
     use std::io;
 
-    /// ID SRS: SRS-TEST-ERR-001
-    /// Title: Test VitalError variant creation
-    ///
-    /// Description: VRConnect shall validate that all VitalError variants
-    /// can be instantiated correctly with appropriate error messages.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_error_decompression() {
         let err = VitalError::Decompression("test error".to_string());
         assert_eq!(err.to_string(), "Decompression error: test error");
     }
 
-    /// ID SRS: SRS-TEST-ERR-002
-    /// Title: Test JSON parsing error conversion
-    ///
-    /// Description: VRConnect shall properly convert serde_json errors
-    /// into VitalError::JsonParse variant.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_error_json_parse() {
         let json_err = serde_json::from_str::<serde_json::Value>("invalid json");
@@ -87,13 +73,6 @@ mod tests {
         }
     }
 
-    /// ID SRS: SRS-TEST-ERR-003
-    /// Title: Test IO error conversion
-    ///
-    /// Description: VRConnect shall properly convert std::io errors
-    /// into VitalError::Io variant.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_error_io() {
         let io_err = io::Error::new(io::ErrorKind::NotFound, "file not found");
@@ -105,12 +84,6 @@ mod tests {
         }
     }
 
-    /// ID SRS: SRS-TEST-ERR-004
-    /// Title: Test SocketIO error creation
-    ///
-    /// Description: VRConnect shall create SocketIO errors with custom messages.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_error_socketio() {
         let err = VitalError::SocketIo("connection failed".to_string());
@@ -118,36 +91,18 @@ mod tests {
         assert!(err.to_string().contains("connection failed"));
     }
 
-    /// ID SRS: SRS-TEST-ERR-005
-    /// Title: Test Config error creation
-    ///
-    /// Description: VRConnect shall create Config errors with validation messages.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_error_config() {
         let err = VitalError::Config("invalid port".to_string());
         assert!(err.to_string().contains("Configuration error"));
     }
 
-    /// ID SRS: SRS-TEST-ERR-006
-    /// Title: Test Processing error creation
-    ///
-    /// Description: VRConnect shall create Processing errors for data handling issues.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_error_processing() {
         let err = VitalError::Processing("invalid data format".to_string());
         assert!(err.to_string().contains("Data processing error"));
     }
 
-    /// ID SRS: SRS-TEST-ERR-007
-    /// Title: Test Result type alias
-    ///
-    /// Description: VRConnect shall provide Result type alias for error handling.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_result_type() {
         fn test_fn() -> Result<i32> {
@@ -155,5 +110,12 @@ mod tests {
         }
 
         assert_eq!(test_fn().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_error_bluetooth() {
+        let err = VitalError::Bluetooth("adapter not found".to_string());
+        assert!(err.to_string().contains("Bluetooth error"));
+        assert!(err.to_string().contains("adapter not found"));
     }
 }

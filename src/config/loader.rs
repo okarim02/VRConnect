@@ -50,6 +50,14 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Config, String> {
             .unwrap_or_else(|_| "VitalConnect".to_string()),
         output_ble_service_uuid: std::env::var("OUTPUT_BLE_SERVICE_UUID")
             .unwrap_or_else(|_| "12345678-1234-5678-1234-567812345678".to_string()),
+        output_ble_values: std::env::var("BLE_VALUES")
+            .unwrap_or_else(|_| "".to_string()),
+        output_ble_empty_value: std::env::var("BLE_EMPTY_VALUE")
+            .unwrap_or_else(|_| "null".to_string()),
+        output_ble_update_interval_ms: std::env::var("BLE_UPDATE_INTERVAL_MS")
+            .unwrap_or_else(|_| "100".to_string())
+            .parse()
+            .unwrap_or(100),
         output_file_enabled: std::env::var("OUTPUT_FILE_ENABLED")
             .unwrap_or_else(|_| "false".to_string())
             .parse()
@@ -99,6 +107,9 @@ mod tests {
             "OUTPUT_BLE_ENABLED",
             "OUTPUT_BLE_DEVICE_NAME",
             "OUTPUT_BLE_SERVICE_UUID",
+            "BLE_VALUES",
+            "BLE_EMPTY_VALUE",
+            "BLE_UPDATE_INTERVAL_MS",
             "OUTPUT_FILE_ENABLED",
             "OUTPUT_FILE_BASE_PATH",
             "OUTPUT_FILE_MAX_SIZE_MB",
@@ -114,12 +125,6 @@ mod tests {
         }
     }
 
-    /// ID SRS: SRS-TEST-LOADER-001
-    /// Title: Test successful config file loading
-    ///
-    /// Description: VRConnect shall load configuration from valid .env file.
-    ///
-    /// Version: V1.0
     #[test]
     #[serial]
     fn test_load_from_file_success() {
@@ -127,13 +132,15 @@ mod tests {
 
         let mut temp_file = NamedTempFile::new().unwrap();
 
-        // Write test config
         writeln!(temp_file, "SOCKETIO_HOST=192.168.1.1").unwrap();
         writeln!(temp_file, "SOCKETIO_PORT=5000").unwrap();
         writeln!(temp_file, "OUTPUT_CONSOLE_VERBOSE=true").unwrap();
         writeln!(temp_file, "OUTPUT_FILE_ENABLED=true").unwrap();
         writeln!(temp_file, "OUTPUT_FILE_BASE_PATH=/var/data/recording").unwrap();
         writeln!(temp_file, "OUTPUT_FILE_MAX_SIZE_MB=1000").unwrap();
+        writeln!(temp_file, "BLE_VALUES=HR,SPO2").unwrap();
+        writeln!(temp_file, "BLE_EMPTY_VALUE=").unwrap();
+        writeln!(temp_file, "BLE_UPDATE_INTERVAL_MS=200").unwrap();
         writeln!(temp_file, "LOG_LEVEL=DEBUG").unwrap();
         temp_file.flush().unwrap();
 
@@ -147,17 +154,14 @@ mod tests {
         assert!(config.output_file_enabled);
         assert_eq!(config.output_file_base_path, "/var/data/recording");
         assert_eq!(config.output_file_max_size_mb, 1000);
+        assert_eq!(config.output_ble_values, "HR,SPO2");
+        assert_eq!(config.output_ble_empty_value, "");
+        assert_eq!(config.output_ble_update_interval_ms, 200);
         assert_eq!(config.log_level, "DEBUG");
 
         clear_env_vars();
     }
 
-    /// ID SRS: SRS-TEST-LOADER-002
-    /// Title: Test missing config file handling
-    ///
-    /// Description: VRConnect shall return error when config file doesn't exist.
-    ///
-    /// Version: V1.0
     #[test]
     #[serial]
     fn test_load_from_file_missing() {
@@ -167,13 +171,6 @@ mod tests {
         clear_env_vars();
     }
 
-    /// ID SRS: SRS-TEST-LOADER-003
-    /// Title: Test config file with comments and invalid lines
-    ///
-    /// Description: VRConnect shall load valid entries and ignore
-    /// comments and malformed lines in .env files.
-    ///
-    /// Version: V1.0
     #[test]
     #[serial]
     fn test_load_from_file_with_comments() {
@@ -181,7 +178,6 @@ mod tests {
 
         let mut temp_file = NamedTempFile::new().unwrap();
 
-        // Write config with comments (dotenvy supports # comments)
         writeln!(temp_file, "# This is a comment").unwrap();
         writeln!(temp_file, "SOCKETIO_PORT=6000").unwrap();
         writeln!(temp_file, "# Another comment").unwrap();
@@ -197,13 +193,6 @@ mod tests {
         clear_env_vars();
     }
 
-    /// ID SRS: SRS-TEST-LOADER-004
-    /// Title: Test partial config loading
-    ///
-    /// Description: VRConnect shall load partial config and use defaults
-    /// for missing values.
-    ///
-    /// Version: V1.0
     #[test]
     #[serial]
     fn test_load_from_file_partial() {
@@ -211,7 +200,6 @@ mod tests {
 
         let mut temp_file = NamedTempFile::new().unwrap();
 
-        // Only specify some values
         writeln!(temp_file, "SOCKETIO_PORT=8080").unwrap();
         temp_file.flush().unwrap();
 
@@ -220,18 +208,11 @@ mod tests {
 
         let config = result.unwrap();
         assert_eq!(config.socketio_port, 8080);
-        // Others should have defaults
         assert_eq!(config.socketio_host, "127.0.0.1");
 
         clear_env_vars();
     }
 
-    /// ID SRS: SRS-TEST-LOADER-005
-    /// Title: Test boolean value parsing
-    ///
-    /// Description: VRConnect shall correctly parse boolean values from config.
-    ///
-    /// Version: V1.0
     #[test]
     #[serial]
     fn test_load_boolean_values() {
@@ -255,13 +236,6 @@ mod tests {
         clear_env_vars();
     }
 
-    /// ID SRS: SRS-TEST-LOADER-006
-    /// Title: Test environment variable override
-    ///
-    /// Description: VRConnect shall allow environment variables to override
-    /// file values.
-    ///
-    /// Version: V1.0
     #[test]
     #[serial]
     fn test_env_var_override() {
@@ -277,18 +251,11 @@ mod tests {
         assert!(result.is_ok());
 
         let config = result.unwrap();
-        // Env var should override file value
         assert_eq!(config.socketio_port, 9999);
 
         clear_env_vars();
     }
 
-    /// ID SRS: SRS-TEST-LOADER-007
-    /// Title: Test all config fields loading
-    ///
-    /// Description: VRConnect shall load all configuration fields from file.
-    ///
-    /// Version: V1.0
     #[test]
     #[serial]
     fn test_load_all_fields() {
@@ -307,7 +274,10 @@ mod tests {
             temp_file,
             "OUTPUT_BLE_SERVICE_UUID=12345678-1234-5678-1234-567812345678"
         )
-        .unwrap();
+            .unwrap();
+        writeln!(temp_file, "BLE_VALUES=HR,SPO2,NIBP_SYS").unwrap();
+        writeln!(temp_file, "BLE_EMPTY_VALUE=N/A").unwrap();
+        writeln!(temp_file, "BLE_UPDATE_INTERVAL_MS=150").unwrap();
         writeln!(temp_file, "OUTPUT_FILE_ENABLED=true").unwrap();
         writeln!(temp_file, "OUTPUT_FILE_BASE_PATH=/data/recordings").unwrap();
         writeln!(temp_file, "OUTPUT_FILE_MAX_SIZE_MB=250").unwrap();
@@ -330,6 +300,9 @@ mod tests {
         assert!(!config.output_console_colorized);
         assert!(config.output_ble_enabled);
         assert_eq!(config.output_ble_device_name, "TestDevice");
+        assert_eq!(config.output_ble_values, "HR,SPO2,NIBP_SYS");
+        assert_eq!(config.output_ble_empty_value, "N/A");
+        assert_eq!(config.output_ble_update_interval_ms, 150);
         assert!(config.output_file_enabled);
         assert_eq!(config.output_file_base_path, "/data/recordings");
         assert_eq!(config.output_file_max_size_mb, 250);
@@ -343,12 +316,6 @@ mod tests {
         clear_env_vars();
     }
 
-    /// ID SRS: SRS-TEST-LOADER-008
-    /// Title: Test file output config loading
-    ///
-    /// Description: VRConnect shall load file output configuration from file.
-    ///
-    /// Version: V1.0
     #[test]
     #[serial]
     fn test_load_file_output_config() {
@@ -372,6 +339,31 @@ mod tests {
         assert_eq!(config.output_file_max_size_mb, 250);
         assert_eq!(config.output_file_archive_threshold_gb, 10);
         assert_eq!(config.output_file_critical_disk_percent, 90);
+
+        clear_env_vars();
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_ble_config() {
+        clear_env_vars();
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        writeln!(temp_file, "OUTPUT_BLE_ENABLED=true").unwrap();
+        writeln!(temp_file, "BLE_VALUES=HR,SPO2,TEMP").unwrap();
+        writeln!(temp_file, "BLE_EMPTY_VALUE=--").unwrap();
+        writeln!(temp_file, "BLE_UPDATE_INTERVAL_MS=50").unwrap();
+        temp_file.flush().unwrap();
+
+        let result = load_from_file(temp_file.path());
+        assert!(result.is_ok());
+
+        let config = result.unwrap();
+        assert!(config.output_ble_enabled);
+        assert_eq!(config.output_ble_values, "HR,SPO2,TEMP");
+        assert_eq!(config.output_ble_empty_value, "--");
+        assert_eq!(config.output_ble_update_interval_ms, 50);
 
         clear_env_vars();
     }

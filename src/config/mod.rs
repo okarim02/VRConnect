@@ -62,6 +62,18 @@ pub struct Config {
     #[arg(long, default_value = "12345678-1234-5678-1234-567812345678")]
     pub output_ble_service_uuid: String,
 
+    /// BLE track values to transmit (comma-separated, mandatory if BLE enabled)
+    #[arg(long, default_value = "")]
+    pub output_ble_values: String,
+
+    /// BLE empty value placeholder (what to send when track is missing)
+    #[arg(long, default_value = "null")]
+    pub output_ble_empty_value: String,
+
+    /// BLE update interval in milliseconds
+    #[arg(long, default_value = "100")]
+    pub output_ble_update_interval_ms: u64,
+
     // File Output Configuration
     /// Enable file output for complete data recording
     #[arg(long, default_value = "false")]
@@ -117,7 +129,7 @@ impl Config {
         // First pass: check if --config-file is specified
         let args: Vec<String> = std::env::args().collect();
         let mut config_file_path: Option<PathBuf> = None;
-        
+
         for i in 0..args.len() {
             if args[i] == "--config-file" && i + 1 < args.len() {
                 config_file_path = Some(PathBuf::from(&args[i + 1]));
@@ -134,7 +146,7 @@ impl Config {
 
         // Parse CLI arguments
         let mut config = <Config as Parser>::parse();
-        
+
         // Store the config file path
         config.config_file = config_file_path.clone();
 
@@ -181,7 +193,7 @@ impl Config {
                 }
             }
         }
-        
+
         // Console Output
         if !has_arg("--output-console-enabled") {
             if let Ok(val) = std::env::var("OUTPUT_CONSOLE_ENABLED") {
@@ -204,7 +216,7 @@ impl Config {
                 }
             }
         }
-        
+
         // BLE Output
         if !has_arg("--output-ble-enabled") {
             if let Ok(val) = std::env::var("OUTPUT_BLE_ENABLED") {
@@ -223,7 +235,24 @@ impl Config {
                 config.output_ble_service_uuid = val;
             }
         }
-        
+        if !has_arg("--output-ble-values") {
+            if let Ok(val) = std::env::var("BLE_VALUES") {
+                config.output_ble_values = val;
+            }
+        }
+        if !has_arg("--output-ble-empty-value") {
+            if let Ok(val) = std::env::var("BLE_EMPTY_VALUE") {
+                config.output_ble_empty_value = val;
+            }
+        }
+        if !has_arg("--output-ble-update-interval-ms") {
+            if let Ok(val) = std::env::var("BLE_UPDATE_INTERVAL_MS") {
+                if let Ok(interval) = val.parse() {
+                    config.output_ble_update_interval_ms = interval;
+                }
+            }
+        }
+
         // File Output
         if !has_arg("--output-file-enabled") {
             if let Ok(val) = std::env::var("OUTPUT_FILE_ENABLED") {
@@ -258,7 +287,7 @@ impl Config {
                 }
             }
         }
-        
+
         // Debug
         if !has_arg("--debug-enabled") {
             if let Ok(val) = std::env::var("DEBUG_ENABLED") {
@@ -272,7 +301,7 @@ impl Config {
                 config.debug_output_path = val;
             }
         }
-        
+
         // Logging
         if !has_arg("--log-level") {
             if let Ok(val) = std::env::var("LOG_LEVEL") {
@@ -330,6 +359,14 @@ impl Config {
                     "Invalid BLE service UUID: {}",
                     self.output_ble_service_uuid
                 ));
+            }
+
+            // BLE_VALUES is only used by legacy state-sync (ble.rs).
+            // The reliable protocol uses the hardcoded signal catalog instead.
+
+            // Validate update interval
+            if self.output_ble_update_interval_ms == 0 {
+                return Err("BLE update interval must be greater than 0".to_string());
             }
         }
 
@@ -398,6 +435,9 @@ mod tests {
             output_ble_enabled: false,
             output_ble_device_name: "Test".to_string(),
             output_ble_service_uuid: "12345678-1234-5678-1234-567812345678".to_string(),
+            output_ble_values: "HR,SPO2".to_string(),
+            output_ble_empty_value: "null".to_string(),
+            output_ble_update_interval_ms: 100,
             output_file_enabled: false,
             output_file_base_path: "./data/vrconnect/recording".to_string(),
             output_file_max_size_mb: 500,
@@ -410,13 +450,6 @@ mod tests {
         }
     }
 
-    /// ID SRS: SRS-TEST-CFG-001
-    /// Title: Test Config default values
-    ///
-    /// Description: VRConnect shall provide sensible default values for
-    /// all configuration parameters.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_config_defaults() {
         let config = Config::parse_from(vec!["vrconnect"]);
@@ -428,6 +461,9 @@ mod tests {
         assert!(config.output_console_colorized);
         assert!(!config.output_ble_enabled);
         assert_eq!(config.output_ble_device_name, "VRConnect");
+        assert_eq!(config.output_ble_values, "");
+        assert_eq!(config.output_ble_empty_value, "null");
+        assert_eq!(config.output_ble_update_interval_ms, 100);
         assert!(!config.output_file_enabled);
         assert_eq!(
             config.output_file_base_path,
@@ -441,109 +477,54 @@ mod tests {
         assert_eq!(config.log_dir, "./logs");
     }
 
-    /// ID SRS: SRS-TEST-CFG-002
-    /// Title: Test Config CLI parsing - port
-    ///
-    /// Description: VRConnect shall parse Socket.IO port from CLI arguments.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_config_parse_port() {
         let config = Config::parse_from(vec!["vrconnect", "--socketio-port", "5000"]);
         assert_eq!(config.socketio_port, 5000);
     }
 
-    /// ID SRS: SRS-TEST-CFG-003
-    /// Title: Test Config CLI parsing - host
-    ///
-    /// Description: VRConnect shall parse Socket.IO host from CLI arguments.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_config_parse_host() {
         let config = Config::parse_from(vec!["vrconnect", "--socketio-host", "0.0.0.0"]);
         assert_eq!(config.socketio_host, "0.0.0.0");
     }
 
-    /// ID SRS: SRS-TEST-CFG-004
-    /// Title: Test Config CLI parsing - verbose
-    ///
-    /// Description: VRConnect shall parse verbose flag from CLI arguments.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_config_parse_verbose() {
         let config = Config::parse_from(vec!["vrconnect", "--output-console-verbose"]);
         assert!(config.output_console_verbose);
     }
 
-    /// ID SRS: SRS-TEST-CFG-005
-    /// Title: Test Config CLI parsing - BLE device name
-    ///
-    /// Description: VRConnect shall parse BLE device name from CLI arguments.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_config_parse_ble_name() {
         let config = Config::parse_from(vec!["vrconnect", "--output-ble-device-name", "MyDevice"]);
         assert_eq!(config.output_ble_device_name, "MyDevice");
     }
 
-    /// ID SRS: SRS-TEST-CFG-006
-    /// Title: Test Config default BLE disabled
-    ///
-    /// Description: VRConnect shall disable BLE output by default.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_config_ble_disabled_default() {
         let config = Config::parse_from(vec!["vrconnect"]);
         assert!(!config.output_ble_enabled);
     }
 
-    /// ID SRS: SRS-TEST-CFG-007
-    /// Title: Test Config CLI parsing - log level
-    ///
-    /// Description: VRConnect shall parse log level from CLI arguments.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_config_parse_log_level() {
         let config = Config::parse_from(vec!["vrconnect", "--log-level", "debug"]);
         assert_eq!(config.log_level, "debug");
     }
 
-    /// ID SRS: SRS-TEST-CFG-008
-    /// Title: Test Config CLI parsing - log directory
-    ///
-    /// Description: VRConnect shall parse log directory path from CLI arguments.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_config_parse_log_dir() {
         let config = Config::parse_from(vec!["vrconnect", "--log-dir", "/var/log/vrconnect"]);
         assert_eq!(config.log_dir, "/var/log/vrconnect");
     }
 
-    /// ID SRS: SRS-TEST-CFG-009
-    /// Title: Test Config CLI parsing - debug mode
-    ///
-    /// Description: VRConnect shall parse debug mode flag from CLI arguments.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_config_parse_debug_mode() {
         let config = Config::parse_from(vec!["vrconnect", "--debug-enabled"]);
         assert!(config.debug_enabled);
     }
 
-    /// ID SRS: SRS-TEST-CFG-010
-    /// Title: Test Config CLI parsing - multiple arguments
-    ///
-    /// Description: VRConnect shall correctly parse multiple CLI arguments
-    /// simultaneously.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_config_parse_multiple_args() {
         let config = Config::parse_from(vec![
@@ -566,25 +547,12 @@ mod tests {
         assert_eq!(config.log_level, "debug");
     }
 
-    /// ID SRS: SRS-TEST-CFG-011
-    /// Title: Test Config validation - valid configuration
-    ///
-    /// Description: VRConnect shall validate configuration parameters and
-    /// return Ok for valid configurations.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_config_validate_success() {
         let config = Config::parse_from(vec!["vrconnect"]);
         assert!(config.validate().is_ok());
     }
 
-    /// ID SRS: SRS-TEST-CFG-012
-    /// Title: Test Config validation - invalid port
-    ///
-    /// Description: VRConnect shall reject port values outside valid range.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_config_validate_invalid_port() {
         let config = Config::parse_from(vec!["vrconnect", "--socketio-port", "0"]);
@@ -593,13 +561,6 @@ mod tests {
         assert!(result.unwrap_err().contains("port"));
     }
 
-    /// ID SRS: SRS-TEST-CFG-013
-    /// Title: Test Config display
-    ///
-    /// Description: VRConnect shall implement Debug trait for Config
-    /// to display configuration values.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_config_debug_display() {
         let config = Config::parse_from(vec!["vrconnect"]);
@@ -607,58 +568,38 @@ mod tests {
         assert!(debug_str.contains("Config"));
     }
 
-    /// ID SRS: SRS-TEST-CONFIG-014
-    /// Title: Test config with file loading
-    ///
-    /// Description: VRConnect shall attempt to load configuration from file
-    /// when config_file is specified.
-    ///
-    /// Version: V1.0
     #[test]
     #[serial]
     fn test_config_with_file_loading() {
         use std::io::Write;
         use tempfile::NamedTempFile;
 
-        // Clear any existing env vars first
         std::env::remove_var("SOCKETIO_PORT");
         std::env::remove_var("LOG_LEVEL");
 
-        // Create a temp config file
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "SOCKETIO_PORT=7777").unwrap();
         writeln!(temp_file, "LOG_LEVEL=DEBUG").unwrap();
         temp_file.flush().unwrap();
 
-        // Load the file manually (simulating what Config::parse does)
         dotenvy::from_path(temp_file.path()).unwrap();
 
-        // Create config with the file path in args
         let args = vec![
             "vrconnect".to_string(),
             "--config-file".to_string(),
             temp_file.path().to_str().unwrap().to_string(),
         ];
 
-        // Apply env overrides manually
         let base_config = Config::parse_from(&args);
         let config = Config::apply_env_overrides(base_config, &args);
 
         assert_eq!(config.socketio_port, 7777);
         assert_eq!(config.log_level, "DEBUG");
 
-        // Cleanup
         std::env::remove_var("SOCKETIO_PORT");
         std::env::remove_var("LOG_LEVEL");
     }
 
-    /// ID SRS: SRS-TEST-CONFIG-015
-    /// Title: Test config with non-existent file
-    ///
-    /// Description: VRConnect shall ignore non-existent config file
-    /// and use CLI/default values.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_config_with_missing_file() {
         let config = Config::parse_from(&[
@@ -669,16 +610,9 @@ mod tests {
             "5555",
         ]);
 
-        // Should use CLI value since file doesn't exist
         assert_eq!(config.socketio_port, 5555);
     }
 
-    /// ID SRS: SRS-TEST-CONFIG-016
-    /// Title: Test config validation - invalid BLE UUID
-    ///
-    /// Description: VRConnect shall return error for invalid BLE service UUID.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_validate_invalid_ble_uuid() {
         let mut config = create_test_config();
@@ -690,12 +624,6 @@ mod tests {
         assert!(result.unwrap_err().contains("Invalid BLE service UUID"));
     }
 
-    /// ID SRS: SRS-TEST-CONFIG-017
-    /// Title: Test config validation - invalid log level
-    ///
-    /// Description: VRConnect shall return error for invalid log level.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_validate_invalid_log_level() {
         let mut config = create_test_config();
@@ -706,13 +634,6 @@ mod tests {
         assert!(result.unwrap_err().contains("Invalid log level"));
     }
 
-    /// ID SRS: SRS-TEST-CONFIG-018
-    /// Title: Test socket_url generation
-    ///
-    /// Description: VRConnect shall generate correct Socket.IO URL from
-    /// host and port configuration.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_socket_url() {
         let mut config = create_test_config();
@@ -722,12 +643,6 @@ mod tests {
         assert_eq!(config.socket_url(), "http://192.168.1.100:8080");
     }
 
-    /// ID SRS: SRS-TEST-CONFIG-019
-    /// Title: Test merge_with method
-    ///
-    /// Description: VRConnect shall merge file configuration with CLI config.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_merge_with() {
         let cli_config = create_test_config();
@@ -735,18 +650,10 @@ mod tests {
 
         let merged = cli_config.merge_with(file_config);
 
-        // Currently merge_with returns self (CLI config takes precedence)
         assert_eq!(merged.socketio_host, "127.0.0.1");
         assert_eq!(merged.socketio_port, 3000);
     }
 
-    /// ID SRS: SRS-TEST-CONFIG-020
-    /// Title: Test Config validation with valid parse
-    ///
-    /// Description: VRConnect shall successfully parse and validate
-    /// correct configuration.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_parse_with_valid_config() {
         let config = Config::parse_from(&[
@@ -757,25 +664,16 @@ mod tests {
             "0.0.0.0",
         ]);
 
-        // Should not panic
         assert_eq!(config.socketio_port, 5000);
         assert_eq!(config.socketio_host, "0.0.0.0");
     }
 
-    /// ID SRS: SRS-TEST-CONFIG-021
-    /// Title: Test Config::parse default method
-    ///
-    /// Description: VRConnect shall parse configuration using default parse
-    /// method which reads from command line args.
-    ///
-    /// Version: V1.0
     #[test]
     #[serial]
     fn test_config_parse_default() {
         use std::io::Write;
         use tempfile::NamedTempFile;
 
-        // Create a valid temp config file
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "SOCKETIO_PORT=6000").unwrap();
         writeln!(temp_file, "LOG_LEVEL=INFO").unwrap();
@@ -793,13 +691,6 @@ mod tests {
         assert!(config.config_file.is_some());
     }
 
-    /// ID SRS: SRS-TEST-CONFIG-022
-    /// Title: Test Config parse with file merge logic
-    ///
-    /// Description: VRConnect shall load file config and merge when config
-    /// file path is provided.
-    ///
-    /// Version: V1.0
     #[test]
     #[serial]
     fn test_config_file_merge_path() {
@@ -828,18 +719,11 @@ mod tests {
         std::env::remove_var("TEST_CONFIG_FILE");
     }
 
-    /// ID SRS: SRS-TEST-CFG-023
-    /// Title: Test file output configuration validation
-    ///
-    /// Description: VRConnect shall validate file output parameters.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_file_output_validation() {
         let mut config = create_test_config();
         config.output_file_enabled = true;
 
-        // Test invalid max_size_mb
         config.output_file_max_size_mb = 0;
         assert!(config.validate().is_err());
 
@@ -862,12 +746,6 @@ mod tests {
         assert!(config.validate().is_ok());
     }
 
-    /// ID SRS: SRS-TEST-CFG-024
-    /// Title: Test file output CLI parsing
-    ///
-    /// Description: VRConnect shall parse file output parameters from CLI.
-    ///
-    /// Version: V1.0
     #[test]
     fn test_config_parse_file_output() {
         let config = Config::parse_from(vec![
@@ -890,32 +768,22 @@ mod tests {
         assert_eq!(config.output_file_critical_disk_percent, 90);
     }
 
-    /// ID SRS: SRS-TEST-CFG-025
-    /// Title: Test environment variable loading
-    ///
-    /// Description: VRConnect shall load configuration from environment variables.
-    ///
-    /// Version: V1.0
     #[test]
     #[serial]
     fn test_env_var_loading() {
         use std::io::Write;
         use tempfile::NamedTempFile;
 
-        // Clear existing env vars
         std::env::remove_var("SOCKETIO_PORT");
         std::env::remove_var("OUTPUT_FILE_ENABLED");
 
-        // Create a temp config file
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "SOCKETIO_PORT=9999").unwrap();
         writeln!(temp_file, "OUTPUT_FILE_ENABLED=true").unwrap();
         temp_file.flush().unwrap();
 
-        // Load env vars
         dotenvy::from_path(temp_file.path()).unwrap();
 
-        // Create config and apply overrides
         let args = vec![
             "vrconnect".to_string(),
             "--config-file".to_string(),
@@ -927,8 +795,63 @@ mod tests {
         assert_eq!(config.socketio_port, 9999);
         assert!(config.output_file_enabled);
 
-        // Cleanup
         std::env::remove_var("SOCKETIO_PORT");
         std::env::remove_var("OUTPUT_FILE_ENABLED");
+    }
+
+    #[test]
+    fn test_validate_ble_empty_values_allowed() {
+        // BLE_VALUES is only used by legacy state-sync; reliable protocol uses catalog
+        let mut config = create_test_config();
+        config.output_ble_enabled = true;
+        config.output_ble_values = "".to_string();
+
+        let result = config.validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_ble_update_interval() {
+        let mut config = create_test_config();
+        config.output_ble_enabled = true;
+        config.output_ble_values = "HR,SPO2".to_string();
+        config.output_ble_update_interval_ms = 0;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("BLE update interval"));
+    }
+
+    #[test]
+    fn test_config_parse_ble_values() {
+        let config = Config::parse_from(vec![
+            "vrconnect",
+            "--output-ble-values",
+            "HR,SPO2,NIBP_SYS",
+        ]);
+
+        assert_eq!(config.output_ble_values, "HR,SPO2,NIBP_SYS");
+    }
+
+    #[test]
+    fn test_config_parse_ble_empty_value() {
+        let config = Config::parse_from(vec![
+            "vrconnect",
+            "--output-ble-empty-value",
+            "",
+        ]);
+
+        assert_eq!(config.output_ble_empty_value, "");
+    }
+
+    #[test]
+    fn test_config_parse_ble_update_interval() {
+        let config = Config::parse_from(vec![
+            "vrconnect",
+            "--output-ble-update-interval-ms",
+            "200",
+        ]);
+
+        assert_eq!(config.output_ble_update_interval_ms, 200);
     }
 }

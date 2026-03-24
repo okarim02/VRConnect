@@ -145,6 +145,14 @@ impl FileOutput {
         // Check disk space first
         self.check_disk_space().await?;
 
+        // Chaos: simulate a disk-full write failure (env-driven, non-production only).
+        // Controlled by ENABLE_CHAOS_MONKEY + CHAOS_DISK_FULL. See src/utils/chaos.rs.
+        if crate::utils::chaos::maybe_disk_full("file.rs") {
+            return Err(VitalError::Processing(
+                "[CHAOS] Simulated disk-full: write aborted".to_string(),
+            ));
+        }
+
         // Serialize to JSON line
         let json_line = serde_json::to_string(data)
             .map_err(|e| VitalError::Processing(format!("JSON serialization failed: {}", e)))?;
@@ -1767,6 +1775,7 @@ mod tests {
     ///
     /// Version: V1.0
     #[tokio::test]
+    #[allow(unused_variables)]
     #[cfg(unix)]
     async fn test_get_disk_usage_invalid_path() {
         let temp_dir = TempDir::new().unwrap();

@@ -87,7 +87,10 @@ fn print_banner(config: &Config) {
     if config.output_ble_enabled {
         println!("    └─ Device Name: {}", config.output_ble_device_name);
         println!("    └─ Service UUID: {}", config.output_ble_service_uuid);
-        println!("    └─ ⚠️  Waveforms excluded (MTU limit)");
+        println!("    └─ Tracks: {}", config.output_ble_values);
+        println!("    └─ Empty Value: '{}'", config.output_ble_empty_value);
+        println!("    └─ Update Interval: {}ms", config.output_ble_update_interval_ms);
+        println!("    └─ Data Source: Room 0 (BED_01)");
     }
 
     println!(

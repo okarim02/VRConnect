@@ -2,6 +2,7 @@
 /target/
 **/*.rs.bk
 *.pdb
+*.txt
 
 # Cargo
 Cargo.lock
@@ -141,3 +142,4 @@ rust-project.json
 
 # Backup de systemd (si copié localement)
 *.service.bak
+CLAUDE.md

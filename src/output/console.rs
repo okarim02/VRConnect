@@ -76,7 +76,7 @@ impl ConsoleOutput {
         println!("{}", header);
 
         // Display first 5 tracks
-        for track in data.all_tracks.iter().take(5) {
+        for track in data.all_tracks.iter() {
             self.print_track_compact(track);
         }
 

@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::domain::ProcessedData;
 use crate::error::Result;
 use crate::input::SocketIOServer;
-use crate::output::{BleOutput, ConsoleOutput, FileOutput};
+use crate::output::{ConsoleOutput, FileOutput, ReliableBleOutput};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Arc;
@@ -82,19 +82,21 @@ impl VitalProcessor {
     /// ID SRS: SRS-FN-PROCESSOR-003
     /// Title: create_ble_output
     ///
-    /// Description: VRConnect shall create BLE output if enabled.
+    /// Description: VRConnect shall create reliable BLE output if enabled.
+    /// Uses the new binary protocol with sliding window acknowledgment.
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     ///
     /// # Returns
-    /// Optional BleOutput or error
-    async fn create_ble_output(&self) -> Result<Option<Arc<BleOutput>>> {
+    /// Optional ReliableBleOutput or error
+    async fn create_ble_output(&self) -> Result<Option<Arc<ReliableBleOutput>>> {
         if self.config.output_ble_enabled {
-            log::warn!("⚠️  BLE Output: Waveform tracks excluded (MTU limit)");
+            log::info!("🔵 Initializing Reliable BLE output (binary protocol)...");
             Ok(Some(Arc::new(
-                BleOutput::new(
+                ReliableBleOutput::new(
                     self.config.output_ble_device_name.clone(),
                     self.config.output_ble_service_uuid.clone(),
+                    self.config.output_ble_update_interval_ms,
                 )
                 .await?,
             )))
@@ -114,7 +116,7 @@ impl VitalProcessor {
     /// Optional FileOutput or error
     async fn create_file_output(&self) -> Result<Option<Arc<FileOutput>>> {
         if self.config.output_file_enabled {
-            log::info!("🗃️  Initializing file output...");
+            log::info!("🗃️ Initializing file output...");
             Ok(Some(Arc::new(
                 FileOutput::new(
                     self.config.output_file_base_path.clone(),
@@ -135,19 +137,19 @@ impl VitalProcessor {
     /// Description: VRConnect shall process single ProcessedData through
     /// all enabled outputs.
     ///
-    /// Version: V1.0
+    /// Version: V5.0
     ///
     /// # Arguments
     /// * `data` - Processed data
     /// * `console` - Optional console output
-    /// * `ble` - Optional BLE output
+    /// * `ble` - Optional reliable BLE output
     /// * `file` - Optional file output
     /// * `debug_enabled` - Debug flag
     /// * `debug_file` - Debug file handle
     async fn process_single_data(
         data: &ProcessedData,
         console: &Option<Arc<ConsoleOutput>>,
-        ble: &Option<Arc<BleOutput>>,
+        ble: &Option<Arc<ReliableBleOutput>>,
         file: &Option<Arc<FileOutput>>,
         debug_enabled: bool,
         debug_file: &Arc<RwLock<Option<std::fs::File>>>,
@@ -201,17 +203,15 @@ impl VitalProcessor {
         let ble_output = self.create_ble_output().await?;
         let file_output = self.create_file_output().await?;
 
-        // Start BLE server if enabled
-        let ble_task = if let Some(ref ble) = ble_output {
+        // Start BLE server if enabled (don't monitor this task)
+        if let Some(ref ble) = ble_output {
             let ble_clone = ble.clone();
-            Some(tokio::spawn(async move {
+            tokio::spawn(async move {
                 if let Err(e) = ble_clone.start().await {
                     log::error!("BLE server error: {}", e);
                 }
-            }))
-        } else {
-            None
-        };
+            });
+        }
 
         // Start Socket.IO input server
         let socketio_server = SocketIOServer::new(
@@ -251,48 +251,21 @@ impl VitalProcessor {
         });
 
         // Wait for shutdown signal or task completion
-        if let Some(ble_task) = ble_task {
-            // With BLE enabled
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    log::info!("Shutdown signal received");
-                }
-                result = input_task => {
-                    match result {
-                        Ok(_) => log::info!("Socket.IO server stopped"),
-                        Err(e) => log::error!("Socket.IO task panicked: {}", e),
-                    }
-                }
-                result = processing_task => {
-                    match result {
-                        Ok(_) => log::info!("Processing task stopped"),
-                        Err(e) => log::error!("Processing task panicked: {}", e),
-                    }
-                }
-                result = ble_task => {
-                    match result {
-                        Ok(_) => log::info!("BLE server stopped"),
-                        Err(e) => log::error!("BLE task panicked: {}", e),
-                    }
+        // Note: We don't monitor BLE task because it should run indefinitely
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                log::info!("Shutdown signal received");
+            }
+            result = input_task => {
+                match result {
+                    Ok(_) => log::info!("Socket.IO server stopped"),
+                    Err(e) => log::error!("Socket.IO task panicked: {}", e),
                 }
             }
-        } else {
-            // Without BLE
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    log::info!("Shutdown signal received");
-                }
-                result = input_task => {
-                    match result {
-                        Ok(_) => log::info!("Socket.IO server stopped"),
-                        Err(e) => log::error!("Socket.IO task panicked: {}", e),
-                    }
-                }
-                result = processing_task => {
-                    match result {
-                        Ok(_) => log::info!("Processing task stopped"),
-                        Err(e) => log::error!("Processing task panicked: {}", e),
-                    }
+            result = processing_task => {
+                match result {
+                    Ok(_) => log::info!("Processing task stopped"),
+                    Err(e) => log::error!("Processing task panicked: {}", e),
                 }
             }
         }
@@ -414,6 +387,9 @@ mod tests {
             output_ble_enabled: false,
             output_ble_device_name: "Test".to_string(),
             output_ble_service_uuid: "12345678-1234-5678-1234-567812345678".to_string(),
+            output_ble_values: "HR,SPO2".to_string(),
+            output_ble_empty_value: "null".to_string(),
+            output_ble_update_interval_ms: 100,
             output_file_enabled: false,
             output_file_base_path: "./data/test".to_string(),
             output_file_max_size_mb: 500,

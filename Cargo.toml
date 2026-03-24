@@ -15,8 +15,15 @@ tokio-tungstenite = "0.21"
 futures-util = "0.3"
 
 # Bluetooth Low Energy
-bluer = { version = "0.17", features = ["bluetoothd"] }
-uuid = "1.6"
+ble-windows-server = "0.2.1"  # Legacy: used by old state-sync ble.rs only
+uuid = { version = "1.6", features = ["v4"] }
+# Custom GATT server with Write callback support (reliable protocol)
+windows = { version = "0.58", features = [
+    "Devices_Bluetooth",
+    "Devices_Bluetooth_GenericAttributeProfile",
+    "Foundation",
+    "Storage_Streams",
+] }
 
 # Data processing
 serde = { version = "1.0", features = ["derive"] }
@@ -48,6 +55,12 @@ zip = "0.6"
 
 # Unix system calls
 libc = "0.2"
+
+# CRC32C (Castagnoli) for IDT BLE protocol frame integrity
+crc32c = "0.6"
+
+# Binary serialization (kept for non-BLE use)
+bytes = "1.5"
 
 [dev-dependencies]
 mockall = "0.12"
