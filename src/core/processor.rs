@@ -97,6 +97,7 @@ impl VitalProcessor {
                     self.config.output_ble_device_name.clone(),
                     self.config.output_ble_service_uuid.clone(),
                     self.config.output_ble_update_interval_ms,
+                    None, // use default signal registry (HR, SpO2, Temperature)
                 )
                 .await?,
             )))

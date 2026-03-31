@@ -4,7 +4,7 @@
 //          Flutter-compatible wire format (main-central.dart reference implementation)
 //
 // IDT frames: [Header(13b) | Payload(Nb) | CRC32C(4b)]
-// DATA_FRAME:  [Header(13b) | t0ms(8b) | count(1b) | payloadLen(2b) | dt_ms(2b) | value(4b)]  = 30 bytes, NO CRC
+// DATA_FRAME:  [Header(13b) | t0ms(8b) | count(1b) | payloadLen(2b) | dt_ms(2b) | value(4b) | CRC32C(4b)] = 34 bytes
 // ACK_FRAME:   Flutter custom [session_id(2b) | stream_id(2b) | ack_base(4b) | bitmap_len(1b) | bitmap(8b)] = 17 bytes, NO IDT magic
 // All values: little-endian
 //
@@ -203,17 +203,18 @@ impl IdtHeader {
 /// ID SRS: SRS-MOD-BLEPROTOCOL-004
 /// IDT DATA_FRAME for a single float32 sample (count=1).
 ///
-/// Wire format (30 bytes total, NO CRC — matches Flutter's decodeHeader):
-/// [Header(13b)] [t0_ms(8b)] [count=1(1b)] [payloadLen=6(2b)] [dt_ms=0(2b)] [value(4b)]
+/// Wire format (34 bytes total — [TODO-1 resolved] CRC32C appended):
+/// [Header(13b)] [t0_ms(8b)] [count=1(1b)] [payloadLen=6(2b)] [dt_ms=0(2b)] [value(4b)] [CRC32C(4b)]
 ///
 /// Byte offsets:
-/// [0..12]  Header (13 bytes: IDT header without payload_len)
-/// [13..20] t0_ms    u64 LE (milliseconds since Unix epoch)
-/// [21]     count    u8  = 1
+/// [0..12]  Header    13 bytes (IDT header)
+/// [13..20] t0_ms     u64 LE (milliseconds since Unix epoch)
+/// [21]     count     u8  = 1
 /// [22,23]  payloadLen u16 LE = 6 (size of dt_ms+value per sample)
-/// [24,25]  dt_ms    u16 LE = 0 (delta from t0_ms for this sample)
-/// [26..29] value    f32 LE
-/// Total: 30 bytes, NO CRC32C (Flutter does not read a trailing CRC on DATA_FRAME)
+/// [24,25]  dt_ms     u16 LE = 0 (delta from t0_ms for this sample)
+/// [26..29] value     f32 LE
+/// [30..33] CRC32C    u32 LE  crc32c of bytes [0..30]   ← [TODO-1 resolved]
+/// Total: 34 bytes
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataFrame {
     pub header: IdtHeader,
@@ -222,8 +223,11 @@ pub struct DataFrame {
 }
 
 impl DataFrame {
-    /// Total frame size: header(13) + t0ms(8) + count(1) + payloadLen(2) + dt_ms(2) + value(4) = 30
-    pub const TOTAL_LEN: usize = 30;
+    /// Total frame size: header(13) + t0ms(8) + count(1) + payloadLen(2) + dt_ms(2) + value(4) + CRC32C(4) = 34
+    /// [TODO-1 resolved] CRC32C appended; was 30 bytes (DEV-1).
+    pub const TOTAL_LEN: usize = 34;
+    /// Byte count of payload before the CRC32C tail (the region over which CRC is computed)
+    const BODY_LEN: usize = 30;
     /// Per-sample payload size written into the payloadLen field: dt_ms(2) + value(4) = 6
     const SAMPLE_PAYLOAD_LEN: u16 = 6;
 
@@ -235,7 +239,8 @@ impl DataFrame {
         }
     }
 
-    /// Serialize to 30 bytes. No CRC — Flutter's decodeHeader does not expect one.
+    /// Serialize to 34 bytes. CRC32C of bytes [0..30] appended at [30..34].
+    /// [TODO-1 resolved] CRC32C appended.
     pub fn to_ble_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::TOTAL_LEN);
         buf.extend_from_slice(&self.header.to_bytes()); // [0..12]  13 bytes
@@ -244,12 +249,33 @@ impl DataFrame {
         buf.extend_from_slice(&Self::SAMPLE_PAYLOAD_LEN.to_le_bytes()); // [22,23]  payloadLen = 6
         buf.extend_from_slice(&0u16.to_le_bytes()); // [24,25]   dt_ms = 0
         buf.extend_from_slice(&self.value.to_le_bytes()); // [26..29]  4 bytes
+        // [30..33] CRC32C over the preceding 30 bytes [TODO-1 resolved]
+        let crc = crc32c::crc32c(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
         buf
     }
 
-    /// Deserialize from bytes. Returns None on length or magic mismatch.
+    /// Returns true if `bytes` is a well-formed DATA_FRAME with a valid CRC32C tail.
+    /// Checks that bytes.len() >= TOTAL_LEN and crc32c(bytes[0..30]) == bytes[30..34].
+    ///
+    /// ID SRS: SRS-FN-BLEPROTOCOL-011
+    /// Version: V1.0
+    pub fn verify_crc(bytes: &[u8]) -> bool {
+        if bytes.len() < Self::TOTAL_LEN {
+            return false;
+        }
+        let expected = crc32c::crc32c(&bytes[..Self::BODY_LEN]);
+        let actual = u32::from_le_bytes([bytes[30], bytes[31], bytes[32], bytes[33]]);
+        expected == actual
+    }
+
+    /// Deserialize from bytes. Returns None on length, magic, or CRC mismatch.
     pub fn from_ble_bytes(b: &[u8]) -> Option<Self> {
         if b.len() < Self::TOTAL_LEN {
+            return None;
+        }
+        // Verify CRC32C before parsing — returns None on mismatch (does not panic)
+        if !Self::verify_crc(b) {
             return None;
         }
         let header = IdtHeader::from_bytes(&b[0..IdtHeader::SIZE])?;
@@ -825,6 +851,134 @@ pub fn parse_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<u16>)> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// has_idt_magic — inline magic check helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns `true` if `bytes` is at least 2 bytes long and bytes[0..2] encodes
+/// IDT_MAGIC (0xD17A) in little-endian order.
+///
+/// Used to route incoming BLE writes without constructing a full IdtHeader.
+///
+/// ID SRS: SRS-FN-BLEPROTOCOL-012
+/// Version: V1.0
+pub fn has_idt_magic(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && u16::from_le_bytes([bytes[0], bytes[1]]) == IDT_MAGIC
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SignalMeta + SignalRegistry — extensible signal catalog
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Metadata for a single registered signal.
+///
+/// ID SRS: SRS-MOD-BLEPROTOCOL-012
+/// Version: V1.0
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignalMeta {
+    pub signal_id: u16,
+    pub source_id: u8,
+    pub name: String,
+    /// Value encoding — VALUE_TYPE_FLOAT32 (3) for all V1 medical signals
+    pub value_type: u8,
+    /// Physical unit — UNIT_BPM (1), UNIT_PCT (2), UNIT_DEGC (4), UNIT_MMHG (3)
+    pub unit_code: u8,
+    pub nominal_period_ms: u32,
+}
+
+/// Extensible registry of known BLE signals.
+///
+/// Replaces compile-time `SignalId` enum for catalog/subscribe/output lookups.
+/// Coexists with `SignalId` enum for backward-compatible data-pipeline usage.
+/// `SignalRegistry::with_defaults()` pre-registers HR, SpO2, Temperature.
+/// Call `register()` to add further signals at startup.
+///
+/// ID SRS: SRS-MOD-BLEPROTOCOL-013
+/// Version: V1.0
+pub struct SignalRegistry {
+    signals: std::collections::HashMap<u16, SignalMeta>,
+}
+
+impl SignalRegistry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self {
+            signals: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Pre-register the three V1 medical signals: HR (0x0101), SpO2 (0x0102),
+    /// Temperature (0x0103).
+    pub fn with_defaults() -> Self {
+        let mut r = Self::new();
+        for sig in [SignalId::HR, SignalId::SpO2, SignalId::Temperature] {
+            r.register(SignalMeta {
+                signal_id: sig.as_u16(),
+                source_id: sig.source_id(),
+                name: sig.name().to_string(),
+                value_type: sig.value_type(),
+                unit_code: sig.unit_code(),
+                nominal_period_ms: sig.nominal_period_ms(),
+            });
+        }
+        r
+    }
+
+    /// Register a signal. If `signal_id` is already present, the entry is replaced.
+    pub fn register(&mut self, meta: SignalMeta) {
+        self.signals.insert(meta.signal_id, meta);
+    }
+
+    /// Look up a signal by its canonical IDT signal_id (e.g. 0x0101).
+    pub fn get(&self, signal_id: u16) -> Option<&SignalMeta> {
+        self.signals.get(&signal_id)
+    }
+
+    /// Normalize a raw signal ID (legacy 1/2/3 or IDT 0x0101–0x01FF) to the
+    /// canonical signal_id stored in this registry.  Returns `None` if the ID is
+    /// unknown.
+    pub fn normalize_id(&self, raw: u16) -> Option<u16> {
+        // Fast path: direct lookup (handles IDT compound IDs and any custom IDs)
+        if self.signals.contains_key(&raw) {
+            return Some(raw);
+        }
+        // Legacy path: delegate to SignalId enum for the three V1 simple IDs (1/2/3)
+        SignalId::from_u16(raw)
+            .map(|s| s.as_u16())
+            .filter(|id| self.signals.contains_key(id))
+    }
+
+    /// Returns `true` if `raw` resolves (via `normalize_id`) to a registered signal.
+    pub fn contains_normalized(&self, raw: u16) -> bool {
+        self.normalize_id(raw).is_some()
+    }
+
+    /// Returns all registered canonical signal IDs, sorted ascending.
+    pub fn all_signal_ids(&self) -> Vec<u16> {
+        let mut ids: Vec<u16> = self.signals.keys().copied().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Build a `Catalog` from all registered signals (sorted by signal_id).
+    pub fn build_catalog(&self) -> Catalog {
+        let entries = self
+            .all_signal_ids()
+            .into_iter()
+            .filter_map(|id| self.signals.get(&id))
+            .map(|m| CatalogEntry {
+                source_id: m.source_id,
+                signal_id: m.signal_id,
+                value_type: m.value_type,
+                unit_code: m.unit_code,
+                nominal_period_ms: m.nominal_period_ms,
+                name: m.name.clone(),
+            })
+            .collect();
+        Catalog { entries }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -990,7 +1144,7 @@ mod tests {
     fn test_data_frame_total_length() {
         let frame = DataFrame::new(1, 1, 1, 0, 65.0);
         assert_eq!(frame.to_ble_bytes().len(), DataFrame::TOTAL_LEN);
-        assert_eq!(DataFrame::TOTAL_LEN, 30);
+        assert_eq!(DataFrame::TOTAL_LEN, 34); // [TODO-1 resolved] +4 CRC32C
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-008
@@ -1023,8 +1177,9 @@ mod tests {
         let parsed_val = f32::from_le_bytes([bytes[26], bytes[27], bytes[28], bytes[29]]);
         assert!((parsed_val - value).abs() < f32::EPSILON);
 
-        // No CRC in new format (Flutter does not read trailing CRC on DATA_FRAME)
-        assert_eq!(bytes.len(), 30);
+        // CRC32C at [30..34] — [TODO-1 resolved]
+        assert_eq!(bytes.len(), 34);
+        assert_eq!(DataFrame::verify_crc(&bytes), true);
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-009
@@ -1302,10 +1457,10 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-030
-    /// DataFrame::from_ble_bytes returns None if buffer is shorter than 30 bytes
+    /// DataFrame::from_ble_bytes returns None if buffer is shorter than TOTAL_LEN (34) bytes
     #[test]
     fn test_data_frame_too_short() {
-        let b = vec![0u8; DataFrame::TOTAL_LEN - 1]; // 29 bytes
+        let b = vec![0u8; DataFrame::TOTAL_LEN - 1]; // 33 bytes
         assert!(DataFrame::from_ble_bytes(&b).is_none());
     }
 
@@ -1451,5 +1606,113 @@ mod tests {
         assert!(ack.is_acked(9),  "bit 8 in byte1 → seq 9 must be acked");
         assert!(ack.is_acked(16), "bit 15 in byte1 → seq 16 must be acked");
         assert!(!ack.is_acked(10), "bit 9 clear → seq 10 not acked");
+    }
+
+    // ── DataFrame CRC32C tests ─────────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-042
+    /// to_ble_bytes() appends CRC32C of the first 30 bytes at positions [30..34]
+    #[test]
+    fn test_dataframe_crc_appended() {
+        let frame = DataFrame::new(1, 1, 1, 0, 65.0);
+        let bytes = frame.to_ble_bytes();
+        assert_eq!(bytes.len(), 34);
+        let expected = crc32c::crc32c(&bytes[..30]);
+        let actual = u32::from_le_bytes([bytes[30], bytes[31], bytes[32], bytes[33]]);
+        assert_eq!(actual, expected, "CRC32C at [30..34] must equal crc32c(bytes[0..30])");
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-043
+    /// verify_crc returns true for a valid frame and false after any byte is corrupted
+    #[test]
+    fn test_dataframe_verify_crc_pass_and_fail() {
+        let bytes = DataFrame::new(1, 1, 1, 0, 65.0).to_ble_bytes();
+        assert!(DataFrame::verify_crc(&bytes), "valid frame must pass CRC check");
+        // Corrupt a byte in the header
+        let mut corrupted = bytes.clone();
+        corrupted[5] ^= 0xFF;
+        assert!(!DataFrame::verify_crc(&corrupted), "corrupted frame must fail CRC check");
+        // Too-short buffer must fail
+        assert!(!DataFrame::verify_crc(&bytes[..33]), "short buffer must fail CRC check");
+    }
+
+    // ── has_idt_magic tests ────────────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-044
+    /// has_idt_magic returns true only for buffers starting with 0x7A 0xD1 (IDT_MAGIC LE)
+    #[test]
+    fn test_has_idt_magic() {
+        // Valid magic (0xD17A LE = [0x7A, 0xD1, ...])
+        assert!(has_idt_magic(&[0x7A, 0xD1, 0x00]));
+        assert!(has_idt_magic(&[0x7A, 0xD1]));
+        // Wrong magic
+        assert!(!has_idt_magic(&[0x20, 0x00]));
+        assert!(!has_idt_magic(&[0xD1, 0x7A])); // bytes swapped (big-endian) — rejected
+        // Too short
+        assert!(!has_idt_magic(&[]));
+        assert!(!has_idt_magic(&[0x7A]));
+    }
+
+    // ── SignalRegistry tests ───────────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-045
+    /// SignalRegistry::with_defaults registers exactly the three V1 medical signals
+    #[test]
+    fn test_signal_registry_default_has_three_signals() {
+        let r = SignalRegistry::with_defaults();
+        assert!(r.get(0x0101).is_some(), "HR must be registered");
+        assert!(r.get(0x0102).is_some(), "SpO2 must be registered");
+        assert!(r.get(0x0103).is_some(), "Temperature must be registered");
+        assert_eq!(r.all_signal_ids().len(), 3);
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-046
+    /// Registering an extra signal is reflected in all_signal_ids and build_catalog
+    #[test]
+    fn test_signal_registry_register_extra_signal() {
+        let mut r = SignalRegistry::with_defaults();
+        r.register(SignalMeta {
+            signal_id: 0x0201,
+            source_id: 2,
+            name: "IBP_SBP".to_string(),
+            value_type: VALUE_TYPE_FLOAT32,
+            unit_code: UNIT_MMHG,
+            nominal_period_ms: 1000,
+        });
+        assert_eq!(r.all_signal_ids().len(), 4);
+        assert!(r.get(0x0201).is_some());
+        let catalog = r.build_catalog();
+        assert_eq!(catalog.entries.len(), 4);
+        // Sorted by signal_id: 0x0101, 0x0102, 0x0103, 0x0201
+        assert_eq!(catalog.entries[3].signal_id, 0x0201);
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-047
+    /// normalize_id resolves legacy 1/2/3 to IDT compound IDs and unknown IDs to None
+    #[test]
+    fn test_signal_registry_normalize_legacy_ids() {
+        let r = SignalRegistry::with_defaults();
+        assert_eq!(r.normalize_id(1), Some(0x0101));
+        assert_eq!(r.normalize_id(2), Some(0x0102));
+        assert_eq!(r.normalize_id(3), Some(0x0103));
+        assert_eq!(r.normalize_id(0x0101), Some(0x0101)); // canonical — direct hit
+        assert_eq!(r.normalize_id(0x9999), None);          // unknown
+        assert_eq!(r.normalize_id(0), None);               // zero — rejected
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-048
+    /// build_catalog from registry matches Catalog::default_medical_catalog for the three defaults
+    #[test]
+    fn test_signal_registry_build_catalog_matches_default_medical() {
+        let r = SignalRegistry::with_defaults();
+        let from_registry = r.build_catalog();
+        let hardcoded = Catalog::default_medical_catalog();
+        assert_eq!(from_registry.entries.len(), hardcoded.entries.len());
+        for (a, b) in from_registry.entries.iter().zip(hardcoded.entries.iter()) {
+            assert_eq!(a.signal_id, b.signal_id);
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.nominal_period_ms, b.nominal_period_ms);
+            assert_eq!(a.unit_code, b.unit_code);
+        }
     }
 }

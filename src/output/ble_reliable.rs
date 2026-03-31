@@ -1,7 +1,7 @@
 // /src/output/ble_reliable.rs
 // Module: output.ble_reliable
 // Purpose: BLE GATT server output using the IDT ("ICU Data Transport") reliable protocol.
-//          Flutter-compatible implementation: DATA_FRAME (30b, no CRC),
+//          Flutter-compatible implementation: DATA_FRAME (34b with CRC32C [TODO-1 resolved]),
 //          ACK_FRAME (Flutter custom 17b, no IDT magic), NACK_FRAME (IDT),
 //          SUBSCRIBE_REQ / SUBSCRIBE_RSP, per-stream sequence + retransmit buffers.
 //
@@ -21,10 +21,7 @@
 // by current limitations of the Flutter client (flutter_blue_plus / main-central.dart).
 // Each deviation is tagged [DEV-x] and cross-referenced in the relevant code section.
 //
-//   [DEV-1] DATA_FRAME — no CRC32C tail (30 bytes total, spec mandates 35).
-//           Flutter hardcodes payloadStart=24 and does not verify CRC on received frames.
-//           Re-enabling CRC would break the Flutter parser without a coordinated update.
-//
+//   [TODO-1 resolved] DATA_FRAME — CRC32C tail now appended (34 bytes total).
 //   [DEV-2] ACK_FRAME — Flutter-custom 17-byte wire format (no IDT magic / header).
 //           Flutter sends: [session_id(2)][stream_id(2)][ack_upto(4)][bitmap_len=8(1)][bitmap(8)]
 //           The IDT spec expects a full IDT-framed ACK (magic=0xD17A, msg_type=0x20).
@@ -43,8 +40,7 @@
 //
 // ── TODO: full IDT compliance (deferred to v1.1+) ────────────────────────────
 //
-//   [TODO-1] DATA_FRAME CRC: re-add 4-byte CRC32C to DataFrame::to_ble_bytes().
-//            Requires Flutter fix: remove payloadStart=24 hardcode, verify CRC before decode.
+//   [TODO-1] Resolved — DATA_FRAME CRC32C appended; DataFrame now 34 bytes.
 //
 //   [TODO-2] ACK_FRAME wire format: switch to standard IDT framing (magic=0xD17A, full header).
 //            Requires coordinated update to AckFrame serialisation + Flutter sendAck().
@@ -64,14 +60,15 @@
 //            Server-to-client error/state reporting. Not yet implemented.
 
 use crate::domain::ble_protocol::{
-    parse_tlv_subscribe_req, AckFrame, Catalog, InboundFrame, SignalId, SubscribeReq, SubscribeRsp,
-    SubscribeRspItem, SUB_OP_SUBSCRIBE, SUB_OP_UNSUBSCRIBE,
+    has_idt_magic, parse_tlv_subscribe_req, AckFrame, Catalog, InboundFrame, SignalId,
+    SignalRegistry, SubscribeReq, SubscribeRsp, SubscribeRspItem, SUB_OP_SUBSCRIBE,
+    SUB_OP_UNSUBSCRIBE,
 };
 use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};
 use crate::output::ble_gatt::{CharProperty, GattServer, WriteEvent};
-use crate::utils::chaos;
 use crate::output::ble_session::BleSessionState;
+use crate::utils::chaos;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -86,6 +83,9 @@ pub struct ReliableBleOutput {
     server: Arc<RwLock<GattServer>>,
     state: Arc<RwLock<BleSessionState>>,
     catalog: Catalog,
+    /// Extensible signal registry: drives catalog building and subscribe validation.
+    /// Immutable after construction; shared read-only into async handlers via Arc.
+    registry: Arc<SignalRegistry>,
 }
 
 /// Characteristic UUID suffixes (PDF spec)
@@ -108,6 +108,7 @@ impl ReliableBleOutput {
         device_name: String,
         service_uuid_str: String,
         _update_interval_ms: u64,
+        registry: Option<SignalRegistry>,
     ) -> Result<Self> {
         let service_uuid = uuid::Uuid::parse_str(&service_uuid_str)
             .map_err(|e| VitalError::Config(format!("Invalid BLE service UUID: {}", e)))?;
@@ -163,13 +164,15 @@ impl ReliableBleOutput {
             unsubscribe_uuid
         );
 
-        let catalog = Catalog::default_medical_catalog();
+        let registry = Arc::new(registry.unwrap_or_else(SignalRegistry::with_defaults));
+        let catalog = registry.build_catalog();
         let state = BleSessionState::new(1);
 
         Ok(Self {
             server: Arc::new(RwLock::new(server)),
             state: Arc::new(RwLock::new(state)),
             catalog,
+            registry,
         })
     }
 
@@ -232,8 +235,9 @@ impl ReliableBleOutput {
         if let Some(rx) = write_rx {
             let state = self.state.clone();
             let server = self.server.clone();
+            let registry = self.registry.clone();
             tokio::spawn(async move {
-                Self::write_handler_loop(rx, state, server).await;
+                Self::write_handler_loop(rx, state, server, registry).await;
             });
             log::info!("Write handler task started (Data_IN / Subscribe / Unsubscribe)");
         } else {
@@ -268,137 +272,194 @@ impl ReliableBleOutput {
         mut rx: tokio::sync::mpsc::UnboundedReceiver<WriteEvent>,
         state: Arc<RwLock<BleSessionState>>,
         server: Arc<RwLock<GattServer>>,
+        registry: Arc<SignalRegistry>,
     ) {
         log::info!("Write handler loop running (IDT dispatcher)");
 
         while let Some(event) = rx.recv().await {
             match event.characteristic_name.as_str() {
                 // ── Data_IN: ACK_FRAME or NACK_FRAME from client ──────────────
-                // [DEV-2] Flutter sends a custom 17-byte ACK (no IDT magic/header).
-                //         InboundFrame::from_ble_bytes() detects the format automatically
-                //         (Flutter ACK = 17 bytes; IDT ACK = 24 bytes with magic=0xD17A).
-                "Data_IN" => match InboundFrame::from_ble_bytes(&event.data) {
-                    Some(InboundFrame::Ack(ack)) => {
-                        // ELEVATED TO INFO so you can see ACKs arriving
-                        log::info!(
-                            "ACK Recv: stream={}, ack_upto={}, bitmap={:02X?}",
-                            ack.stream_id,
-                            ack.ack_upto,
-                            ack.bitmap
-                        );
-
-                        let retransmits = {
-                            let mut st = state.write().await;
-                            st.handle_ack_with_bitmap(
-                                ack.session_id,
-                                ack.stream_id,
-                                ack.ack_upto,
-                                &ack.bitmap,
-                            )
-                        };
-
-                        if !retransmits.is_empty() {
-                            let srv = server.read().await;
-                            for frame in retransmits {
-                                let bytes = frame.to_ble_bytes();
-                                if let Err(e) = srv.notify("Data_OUT", &bytes).await {
-                                    log::warn!(
-                                        "Retransmit failed for seq {}: {}",
-                                        frame.header.seq,
-                                        e
-                                    );
-                                } else {
-                                    // ELEVATED TO INFO so you can see Rust saving dropped packets
-                                    log::info!(
-                                        "--> RETRANSMITTED seq {} for stream {}",
-                                        frame.header.seq,
-                                        frame.header.stream_id
-                                    );
+                // Magic-based routing:
+                //   len==17       → Flutter custom ACK [DEV-2] (no IDT magic)
+                //   has_idt_magic → IDT NACK_FRAME (only valid IDT type on this char)
+                //   otherwise     → unknown format, discard + warn
+                "Data_IN" => {
+                    let data = &event.data;
+                    if data.len() == 17 {
+                        // [DEV-2] Flutter custom ACK — no IDT magic, fixed 17 bytes (TEST)
+                        match AckFrame::from_ble_bytes(data) {
+                            Some(ack) => {
+                                log::info!(
+                                    "ACK Recv: stream={}, ack_upto={}, bitmap={:02X?}",
+                                    ack.stream_id,
+                                    ack.ack_upto,
+                                    ack.bitmap
+                                );
+                                let retransmits = {
+                                    let mut st = state.write().await;
+                                    st.handle_ack_with_bitmap(
+                                        ack.session_id,
+                                        ack.stream_id,
+                                        ack.ack_upto,
+                                        &ack.bitmap,
+                                    )
+                                };
+                                if !retransmits.is_empty() {
+                                    let srv = server.read().await;
+                                    for frame in retransmits {
+                                        let bytes = frame.to_ble_bytes();
+                                        if let Err(e) = srv.notify("Data_OUT", &bytes).await {
+                                            log::warn!(
+                                                "Retransmit failed for seq {}: {}",
+                                                frame.header.seq,
+                                                e
+                                            );
+                                        } else {
+                                            log::info!(
+                                                "--> RETRANSMITTED seq {} for stream {}",
+                                                frame.header.seq,
+                                                frame.header.stream_id
+                                            );
+                                        }
+                                    }
                                 }
                             }
-                        }
-                    }
-                    Some(InboundFrame::Nack(nack)) => {
-                        log::info!(
-                            "IDT NACK: stream={}, reason={}, {} seq(s) to retransmit",
-                            nack.header.stream_id,
-                            nack.reason,
-                            nack.seq_list.len()
-                        );
-                        let retransmits = {
-                            let st = state.read().await;
-                            st.handle_nack(nack.header.stream_id, &nack.seq_list)
-                        };
-                        if !retransmits.is_empty() {
-                            let srv = server.read().await;
-                            for frame in retransmits {
-                                let bytes = frame.to_ble_bytes();
-                                if let Err(e) = srv.notify("Data_OUT", &bytes).await {
-                                    log::warn!(
-                                        "Retransmit failed for seq {}: {}",
-                                        frame.header.seq,
-                                        e
-                                    );
-                                } else {
-                                    log::debug!("Retransmitted seq {}", frame.header.seq);
-                                }
+                            None => {
+                                log::warn!(
+                                    "Data_IN: 17-byte payload did not parse as Flutter ACK — discarded"
+                                );
                             }
                         }
-                    }
-                    _ => {
+                    } else if has_idt_magic(data) {
+                        // IDT-framed message on Data_IN — only NACK_FRAME is valid here
+                        match InboundFrame::from_ble_bytes(data) {
+                            Some(InboundFrame::Nack(nack)) => {
+                                log::info!(
+                                    "IDT NACK: stream={}, reason={}, {} seq(s) to retransmit",
+                                    nack.header.stream_id,
+                                    nack.reason,
+                                    nack.seq_list.len()
+                                );
+                                let retransmits = {
+                                    let st = state.read().await;
+                                    st.handle_nack(nack.header.stream_id, &nack.seq_list)
+                                };
+                                if !retransmits.is_empty() {
+                                    let srv = server.read().await;
+                                    for frame in retransmits {
+                                        let bytes = frame.to_ble_bytes();
+                                        if let Err(e) = srv.notify("Data_OUT", &bytes).await {
+                                            log::warn!(
+                                                "Retransmit failed for seq {}: {}",
+                                                frame.header.seq,
+                                                e
+                                            );
+                                        } else {
+                                            log::debug!("Retransmitted seq {}", frame.header.seq);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                log::warn!(
+                                    "Data_IN: IDT magic present but not a NACK_FRAME \
+                                     (msg_type=0x{:02X}, {} bytes) — discarded",
+                                    data.get(3).copied().unwrap_or(0),
+                                    data.len()
+                                );
+                            }
+                        }
+                    } else {
                         log::warn!(
-                                "Unrecognized Data_IN frame ({} bytes): not a valid Flutter ACK or IDT NACK",
-                                event.data.len()
-                            );
+                            "Data_IN: unrecognized payload ({} bytes, byte[0]=0x{:02X}) — \
+                             not a Flutter ACK (17b) or IDT frame (magic=0xD17A), discarded",
+                            data.len(),
+                            data.first().copied().unwrap_or(0)
+                        );
                     }
-                },
+                }
 
-                // ── Subscribe: SUBSCRIBE_REQ (IDT) from client ────────────────
-                // [DEV-3] Flutter sends a custom TLV format (byte[0]=0x20) rather than a
-                //         full IDT SUBSCRIBE_REQ frame. Both formats are tried: IDT first,
-                //         then TLV via parse_tlv_subscribe_req(). RSP is delayed 300 ms
-                //         so Flutter has time to enable CCCD before the Notify arrives [DEV-4].
+                // ── Subscribe: SUBSCRIBE_REQ (IDT or Flutter TLV) ────────────
+                // Magic-based routing (TLV takes priority per [DEV-3]):
+                //   byte[0]==0x20 → Flutter TLV SUBSCRIBE_REQ [DEV-3]; warn on parse fail
+                //   has_idt_magic → IDT SUBSCRIBE_REQ; warn + discard if wrong type
+                //   otherwise     → unknown format, discard + warn
+                // RSP is delayed 300 ms so Flutter has time to enable CCCD [DEV-4].
                 "Subscribe" => {
+                    let data = &event.data;
                     // Always dump raw bytes at INFO level — essential for protocol debugging
-                    let hex: String = event
-                        .data
+                    let hex: String = data
                         .iter()
                         .map(|b| format!("{:02X}", b))
                         .collect::<Vec<_>>()
                         .join(" ");
-                    log::info!("Subscribe raw ({} bytes): {}", event.data.len(), hex);
+                    log::info!("Subscribe raw ({} bytes): {}", data.len(), hex);
 
-                    if let Some(InboundFrame::SubscribeReq(req)) =
-                        InboundFrame::from_ble_bytes(&event.data)
-                    {
-                        Self::handle_subscribe_req(req, &state, &server).await;
-                    } else if let Some((req_id, signal_ids)) = parse_tlv_subscribe_req(&event.data)
-                    {
-                        log::info!("TLV subscribe: req_id={}, signals={:?}", req_id, signal_ids);
-                        Self::handle_tlv_subscribe(req_id, signal_ids, &state, &server).await;
+                    if data.first() == Some(&0x20) {
+                        // [DEV-3] Flutter TLV format — byte[0]=0x20 marker, no IDT magic
+                        if let Some((req_id, signal_ids)) = parse_tlv_subscribe_req(data) {
+                            log::info!(
+                                "TLV subscribe: req_id={}, signals={:?}",
+                                req_id,
+                                signal_ids
+                            );
+                            Self::handle_tlv_subscribe(
+                                req_id, signal_ids, &state, &server, &registry,
+                            )
+                            .await;
+                        } else {
+                            log::warn!(
+                                "Subscribe: TLV marker 0x20 present but parse failed ({} bytes) — discarded",
+                                data.len()
+                            );
+                        }
+                    } else if has_idt_magic(data) {
+                        // IDT SUBSCRIBE_REQ
+                        if let Some(InboundFrame::SubscribeReq(req)) =
+                            InboundFrame::from_ble_bytes(data)
+                        {
+                            Self::handle_subscribe_req(req, &state, &server, &registry).await;
+                        } else {
+                            log::warn!(
+                                "Subscribe: IDT magic present but not a valid SUBSCRIBE_REQ \
+                                 (msg_type=0x{:02X}) — discarded",
+                                data.get(3).copied().unwrap_or(0)
+                            );
+                        }
                     } else {
-                        // Log why it failed for diagnosis
-                        Self::log_subscribe_parse_failure(&event.data);
+                        log::warn!(
+                            "Subscribe: unrecognized format ({} bytes, byte[0]=0x{:02X}) — discarded",
+                            data.len(),
+                            data.first().copied().unwrap_or(0)
+                        );
+                        Self::log_subscribe_parse_failure(data);
                     }
                 }
 
                 // ── Unsubscribe: IDT SUBSCRIBE_REQ (op=2) or legacy 2-byte ───
                 "Unsubscribe" => {
-                    if let Some(InboundFrame::SubscribeReq(req)) =
-                        InboundFrame::from_ble_bytes(&event.data)
-                    {
+                    let data = &event.data;
+                    if has_idt_magic(data) {
                         // IDT: full SUBSCRIBE_REQ with op=UNSUBSCRIBE
-                        Self::handle_subscribe_req(req, &state, &server).await;
-                    } else if event.data.len() >= 2 {
+                        if let Some(InboundFrame::SubscribeReq(req)) =
+                            InboundFrame::from_ble_bytes(data)
+                        {
+                            Self::handle_subscribe_req(req, &state, &server, &registry).await;
+                        } else {
+                            log::warn!(
+                                "Unsubscribe: IDT magic present but not a valid SUBSCRIBE_REQ — discarded"
+                            );
+                        }
+                    } else if data.len() >= 2 {
                         // Legacy fallback: 2-byte signal_id LE (old protocol)
-                        let signal_id = u16::from_le_bytes([event.data[0], event.data[1]]);
+                        let signal_id = u16::from_le_bytes([data[0], data[1]]);
                         let mut st = state.write().await;
                         st.unsubscribe(signal_id);
                         log::info!("Unsubscribed (legacy 2b) signal 0x{:04X}", signal_id);
                     } else {
                         log::warn!(
-                            "Invalid Unsubscribe payload ({} bytes): too short",
-                            event.data.len()
+                            "Unsubscribe: payload too short ({} bytes) — discarded",
+                            data.len()
                         );
                     }
                 }
@@ -456,10 +517,12 @@ impl ReliableBleOutput {
     /// Handle a SUBSCRIBE_REQ IDT frame:
     ///   - op=1 (SUBSCRIBE):   allocate stream → send SUBSCRIBE_RSP on Data_OUT
     ///   - op=2 (UNSUBSCRIBE): remove stream, no RSP sent
+    /// Signal IDs are validated against `registry`; unknown IDs are rejected with a warning.
     async fn handle_subscribe_req(
         req: SubscribeReq,
         state: &Arc<RwLock<BleSessionState>>,
         server: &Arc<RwLock<GattServer>>,
+        registry: &Arc<SignalRegistry>,
     ) {
         let session_id = req.header.session_id;
         let req_id = req.req_id;
@@ -470,11 +533,17 @@ impl ReliableBleOutput {
             for item in &req.items {
                 match req.op {
                     SUB_OP_SUBSCRIBE => {
-                        // Normalize legacy simple IDs (1,2,3 per I.pdf) to IDT compound IDs
-                        // (0x0101,0x0102,0x0103 per "Proposition de protocole BLE")
-                        let canonical_id = SignalId::from_u16(item.signal_id)
-                            .map(|s| s.as_u16())
-                            .unwrap_or(item.signal_id);
+                        // Validate + normalize via registry (handles legacy 1/2/3 → IDT 0x01xx)
+                        let canonical_id = match registry.normalize_id(item.signal_id) {
+                            Some(id) => id,
+                            None => {
+                                log::warn!(
+                                    "SUBSCRIBE: unknown signal_id 0x{:04X} — not in registry, rejected",
+                                    item.signal_id
+                                );
+                                continue;
+                            }
+                        };
                         if canonical_id != item.signal_id {
                             log::info!(
                                 "Signal ID: app sent 0x{:04X} → normalized to 0x{:04X} (legacy→IDT)",
@@ -482,18 +551,14 @@ impl ReliableBleOutput {
                                 canonical_id
                             );
                         }
+                        // Safety: normalize_id succeeded, so get() is guaranteed Some
+                        let meta = registry.get(canonical_id).unwrap();
                         let stream_id = st.subscribe(canonical_id);
-                        let (period_ms, source_id) =
-                            if let Some(sig) = SignalId::from_u16(item.signal_id) {
-                                (sig.nominal_period_ms(), sig.source_id())
-                            } else {
-                                (item.period_ms, item.source_id)
-                            };
                         rsp_items.push(SubscribeRspItem {
-                            source_id,
+                            source_id: meta.source_id,
                             signal_id: canonical_id,
                             stream_id,
-                            effective_period_ms: period_ms,
+                            effective_period_ms: meta.nominal_period_ms,
                             effective_batch_max: 1,
                         });
                         log::info!(
@@ -503,9 +568,9 @@ impl ReliableBleOutput {
                         );
                     }
                     SUB_OP_UNSUBSCRIBE => {
-                        // Also normalize on unsubscribe
-                        let canonical_id = SignalId::from_u16(item.signal_id)
-                            .map(|s| s.as_u16())
+                        // Normalize on unsubscribe (registry path)
+                        let canonical_id = registry
+                            .normalize_id(item.signal_id)
                             .unwrap_or(item.signal_id);
                         st.unsubscribe(canonical_id);
                         log::info!("UNSUBSCRIBE: signal 0x{:04X}", canonical_id);
@@ -562,11 +627,13 @@ impl ReliableBleOutput {
     ///
     /// RSP is delayed 300 ms so the client has time to enable CCCD notifications
     /// before the notification arrives.
+    /// Signal IDs are validated against `registry`; unknown IDs are rejected with a warning.
     async fn handle_tlv_subscribe(
         req_id: u16,
         signal_ids: Vec<u16>,
         state: &Arc<RwLock<BleSessionState>>,
         server: &Arc<RwLock<GattServer>>,
+        registry: &Arc<SignalRegistry>,
     ) {
         let session_id = state.read().await.current_session_id;
         let mut rsp_items: Vec<SubscribeRspItem> = Vec::new();
@@ -574,9 +641,17 @@ impl ReliableBleOutput {
         {
             let mut st = state.write().await;
             for raw_id in &signal_ids {
-                let canonical_id = SignalId::from_u16(*raw_id)
-                    .map(|s| s.as_u16())
-                    .unwrap_or(*raw_id);
+                // Validate + normalize via registry (handles legacy 1/2/3 → IDT 0x01xx)
+                let canonical_id = match registry.normalize_id(*raw_id) {
+                    Some(id) => id,
+                    None => {
+                        log::warn!(
+                            "TLV SUBSCRIBE: unknown signal_id 0x{:04X} — not in registry, rejected",
+                            raw_id
+                        );
+                        continue;
+                    }
+                };
                 if canonical_id != *raw_id {
                     log::info!(
                         "TLV Signal ID: app sent 0x{:04X} → normalized to 0x{:04X} (legacy→IDT)",
@@ -584,21 +659,18 @@ impl ReliableBleOutput {
                         canonical_id
                     );
                 }
+                // Safety: normalize_id succeeded, so get() is guaranteed Some
+                let meta = registry.get(canonical_id).unwrap();
                 // Use raw_id directly for DATA_FRAME stream_id (Flutter LE-reads header field)
                 // RSP result item uses stream_id.swap_bytes() so Flutter's BE-read of the RSP
                 // field also recovers raw_id.
                 let preferred_stream_id = *raw_id;
                 let stream_id = st.subscribe_with_stream_id(canonical_id, preferred_stream_id);
-                let (period_ms, source_id) = if let Some(sig) = SignalId::from_u16(*raw_id) {
-                    (sig.nominal_period_ms(), sig.source_id())
-                } else {
-                    (1000, 1)
-                };
                 rsp_items.push(SubscribeRspItem {
-                    source_id,
+                    source_id: meta.source_id,
                     signal_id: canonical_id,
                     stream_id: stream_id.swap_bytes(),
-                    effective_period_ms: period_ms,
+                    effective_period_ms: meta.nominal_period_ms,
                     effective_batch_max: 1,
                 });
                 log::info!(
@@ -689,8 +761,8 @@ impl ReliableBleOutput {
     ///
     /// Description: VRConnect shall transmit live vital sign data via IDT DATA_FRAME.
     ///              For each track in room_index=0 that matches a subscribed signal,
-    ///              a 30-byte IDT DATA_FRAME (with t0_ms timestamp, no CRC — see DEV-1)
-    ///              is notified on Data_OUT.
+    ///              a 34-byte IDT DATA_FRAME (with t0_ms timestamp and CRC32C tail —
+    ///              see TODO-1 resolved) is notified on Data_OUT.
     ///
     /// Version: V1.0
     pub async fn output(&self, data: &ProcessedData) -> Result<()> {
@@ -737,9 +809,9 @@ impl ReliableBleOutput {
 
             // add_data returns Some(frame) only if signal is subscribed
             if let Some(frame) = state.add_data(signal_id, val_f32, t0_ms) {
-                // [DEV-1] DataFrame::to_ble_bytes() produces 30 bytes (no CRC32C tail).
-                //         Flutter hardcodes payloadStart=24 and skips CRC verification.
-                //         See TODO-1 in the module header for the full-compliance upgrade path.
+                // [TODO-1 resolved] DataFrame::to_ble_bytes() produces 34 bytes (CRC32C appended).
+                // Signal name aliases are VitalRecorder-specific; registry governs BLE catalog.
+                // Future: move aliases into SignalMeta.aliases when adding waveform signals.
 
                 // --- CHAOS MONKEY: packet-drop + network-jitter (env-driven) ---
                 // Controlled by ENABLE_CHAOS_MONKEY / CHAOS_RATIO / CHAOS_NETWORK_JITTER.

@@ -241,6 +241,21 @@ impl GattServer {
                                 let value = request.Value()?;
                                 let reader = DataReader::FromBuffer(&value)?;
                                 let len = reader.UnconsumedBufferLength()? as usize;
+
+                                // Minimum-length guard: any valid IDT or ACK frame needs ≥ 2 bytes
+                                // to determine frame type (magic check or length check).
+                                // Discard single-byte or empty writes before touching the channel.
+                                if len < 2 {
+                                    log::warn!(
+                                        "BLE write on '{}': {} byte(s) — too short for any \
+                                         IDT/ACK frame, discarded",
+                                        char_name, len
+                                    );
+                                    let _ = request.Respond();
+                                    deferral.Complete()?;
+                                    return Ok(());
+                                }
+
                                 let mut data = vec![0u8; len];
                                 reader.ReadBytes(&mut data)?;
 
