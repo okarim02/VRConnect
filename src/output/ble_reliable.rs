@@ -1597,4 +1597,68 @@ mod tests {
         assert_eq!(values[0].0, SignalId::Temperature.as_u16());
         assert!((values[0].1 - 36.5f32).abs() < f32::EPSILON);
     }
+
+    // ── Registry validation path tests ───────────────────────────────────────
+    // These tests validate the logic used in handle_subscribe_req / handle_tlv_subscribe
+    // without requiring BLE hardware (GattServer), by exercising the same registry + state
+    // objects that the async handlers use internally.
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-023
+    /// normalize_id returns None for IDs that must be rejected by subscribe handlers
+    ///
+    /// Validates the `normalize_id(unknown) → None → warn+skip` guard used in both
+    /// handle_subscribe_req and handle_tlv_subscribe.
+    #[test]
+    fn test_registry_unknown_signal_normalize_returns_none() {
+        use crate::domain::ble_protocol::SignalRegistry;
+        let r = SignalRegistry::with_defaults();
+        assert_eq!(r.normalize_id(0x9999), None, "unknown IDT compound ID must be rejected");
+        assert_eq!(r.normalize_id(0x0200), None, "unknown source-2 ID must be rejected");
+        assert_eq!(r.normalize_id(0), None,      "zero must always be rejected");
+        assert_eq!(r.normalize_id(99), None,     "unknown legacy simple ID must be rejected");
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-024
+    /// After normalize_id succeeds, registry.get(canonical) returns correct metadata
+    ///
+    /// Validates the invariant relied upon by both subscribe handlers:
+    /// `registry.get(canonical_id).unwrap()` must never panic after `normalize_id` returns Some.
+    #[test]
+    fn test_registry_known_signal_meta_available_after_normalize() {
+        use crate::domain::ble_protocol::SignalRegistry;
+        let r = SignalRegistry::with_defaults();
+        // Legacy path: raw_id=1 (HR) → canonical=0x0101
+        let canonical = r.normalize_id(1).unwrap();
+        let meta = r.get(canonical).unwrap(); // must not panic — handler invariant
+        assert_eq!(meta.source_id, 1);
+        assert_eq!(meta.nominal_period_ms, 1000); // HR = 1 Hz
+        assert_eq!(meta.signal_id, 0x0101);
+        // Canonical path: 0x0103 (Temperature)
+        let temp_meta = r.get(r.normalize_id(0x0103).unwrap()).unwrap();
+        assert_eq!(temp_meta.nominal_period_ms, 2000); // Temperature = 0.5 Hz
+        assert_eq!(temp_meta.source_id, 1);
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-025
+    /// Full normalized-subscribe path: legacy raw_id=1 → 0x0101 → state tracks canonical ID
+    ///
+    /// Validates that subscribe_with_stream_id(canonical, preferred) records the subscription
+    /// at the canonical IDT ID (0x0101), not at the raw legacy ID (1).
+    #[tokio::test]
+    async fn test_subscribe_with_normalized_id_state_reflects_canonical() {
+        use crate::domain::ble_protocol::SignalRegistry;
+        let r = SignalRegistry::with_defaults();
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        {
+            let mut st = state.write().await;
+            // Simulate TLV subscribe path: Flutter sends raw_id=1 → normalize to 0x0101
+            let canonical = r.normalize_id(1).unwrap();
+            assert_eq!(canonical, 0x0101);
+            let stream_id = st.subscribe_with_stream_id(canonical, 1);
+            assert_eq!(stream_id, 1, "preferred_stream_id must be honoured");
+            // State must record subscription at canonical IDT ID, not legacy raw ID
+            assert!(st.is_subscribed(0x0101), "must be subscribed at canonical IDT ID 0x0101");
+            assert!(!st.is_subscribed(1),     "legacy raw ID 1 must NOT appear as subscribed");
+        }
+    }
 }

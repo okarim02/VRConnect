@@ -1715,4 +1715,38 @@ mod tests {
             assert_eq!(a.unit_code, b.unit_code);
         }
     }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-049
+    /// contains_normalized returns true for all resolvable IDs (canonical + legacy) and false
+    /// for unknown/zero IDs
+    #[test]
+    fn test_signal_registry_contains_normalized() {
+        let r = SignalRegistry::with_defaults();
+        // Canonical IDT compound IDs — direct HashMap hit
+        assert!(r.contains_normalized(0x0101), "HR canonical must resolve");
+        assert!(r.contains_normalized(0x0102), "SpO2 canonical must resolve");
+        assert!(r.contains_normalized(0x0103), "Temp canonical must resolve");
+        // Legacy simple IDs — SignalId fallback + filter
+        assert!(r.contains_normalized(1), "legacy HR id=1 must resolve");
+        assert!(r.contains_normalized(2), "legacy SpO2 id=2 must resolve");
+        assert!(r.contains_normalized(3), "legacy Temp id=3 must resolve");
+        // Unknown IDs must not resolve
+        assert!(!r.contains_normalized(0),      "zero must not resolve");
+        assert!(!r.contains_normalized(0x9999), "unknown IDT ID must not resolve");
+        assert!(!r.contains_normalized(99),     "unknown legacy simple ID must not resolve");
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-050
+    /// SignalRegistry::new() creates an empty registry; all lookups return None/false/empty
+    #[test]
+    fn test_signal_registry_new_is_empty() {
+        let r = SignalRegistry::new();
+        assert!(r.all_signal_ids().is_empty(), "fresh registry must have no signal IDs");
+        assert!(r.get(0x0101).is_none(),        "get on empty registry must be None");
+        // normalize_id falls back to SignalId enum, but the .filter() gates on the registry
+        // — so even legacy IDs return None when the registry has no entries
+        assert_eq!(r.normalize_id(1), None, "legacy id=1 must not resolve in empty registry");
+        assert!(!r.contains_normalized(1),  "contains_normalized must be false in empty registry");
+        assert_eq!(r.build_catalog().entries.len(), 0, "catalog from empty registry must be empty");
+    }
 }
