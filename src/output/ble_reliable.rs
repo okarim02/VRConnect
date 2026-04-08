@@ -1,67 +1,23 @@
 // /src/output/ble_reliable.rs
 // Module: output.ble_reliable
-// Purpose: BLE GATT server output using the IDT ("ICU Data Transport") reliable protocol.
-//          Flutter-compatible implementation: DATA_FRAME (34b with CRC32C [TODO-1 resolved]),
-//          ACK_FRAME (Flutter custom 17b, no IDT magic), NACK_FRAME (IDT),
-//          SUBSCRIBE_REQ / SUBSCRIBE_RSP, per-stream sequence + retransmit buffers.
+// Purpose: BLE GATT server output using the IDT ("ICU Data Transport") v1.1 reliable protocol.
+//          Full IDT-compliant implementation: DATA_FRAME (34b with CRC32C), ACK_FRAME (30b IDT),
+//          NACK_FRAME, SUBSCRIBE_REQ / SUBSCRIBE_RSP, per-stream sequence + retransmit buffers.
 //
 // Uses our custom GattServer (ble_gatt.rs) which supports Write callbacks,
 // replacing the ble-windows-server crate that only supports Read + Notify.
 //
 // Characteristics (per PDF "Proposition de protocole BLE"):
 // - Catalog     (0x90ae): Read   - Available signal catalog (TLV binary)
-// - Data_IN     (0x90ac): Write  - ACK_FRAME / NACK_FRAME from client
-// - Data_OUT    (0x90ad): Notify - DATA_FRAME + SUBSCRIBE_RSP to client
-// - Subscribe   (0x90af): Write  - SUBSCRIBE_REQ (IDT) from client
-// - Control     (0x90b0): Notify - (legacy / reserved, no longer used for SUBSCRIBE_RSP)
+// - Data_IN     (0x90ac): Write  - ACK_FRAME / NACK_FRAME from the Central
+// - Data_OUT    (0x90ad): Notify - DATA_FRAME + SUBSCRIBE_RSP to the Central
+// - Subscribe   (0x90af): Write  - SUBSCRIBE_REQ (IDT) from the Central
+// - Control     (0x90b0): Notify - (legacy / reserved)
 // - Unsubscribe (0x90b1): Write  - SUBSCRIBE_REQ with op=UNSUBSCRIBE, or legacy 2b fallback
-//
-// ── Flutter Compatibility Deviations ─────────────────────────────────────────
-// The following behaviours intentionally deviate from the IDT spec and are driven
-// by current limitations of the Flutter client (flutter_blue_plus / main-central.dart).
-// Each deviation is tagged [DEV-x] and cross-referenced in the relevant code section.
-//
-//   [TODO-1 resolved] DATA_FRAME — CRC32C tail now appended (34 bytes total).
-//   [DEV-2] ACK_FRAME — Flutter-custom 17-byte wire format (no IDT magic / header).
-//           Flutter sends: [session_id(2)][stream_id(2)][ack_upto(4)][bitmap_len=8(1)][bitmap(8)]
-//           The IDT spec expects a full IDT-framed ACK (magic=0xD17A, msg_type=0x20).
-//
-//   [DEV-3] SUBSCRIBE_REQ — Flutter-custom TLV format (byte[0]=0x20 marker, not IDT magic).
-//           The IDT spec expects a full SUBSCRIBE_REQ IDT frame (magic=0xD17A, msg_type=0x01).
-//           Both formats are accepted; TLV takes priority via parse_tlv_subscribe_req().
-//
-//   [DEV-4] SUBSCRIBE_RSP — delayed 300 ms after reception of SUBSCRIBE_REQ.
-//           Flutter enables CCCD notifications *after* writing to the Subscribe characteristic,
-//           so without the delay the first Notify would be silently dropped by the stack.
-//
-//   [DEV-5 → resolved by TODO-3] FLAG_BACKLOG was previously set when tx_buffer was
-//           non-empty (incorrect diagnostic use). It is now set only during historical
-//           replay (BACKLOG_THEN_LIVE / BACKLOG_ONLY mode). See ble_session.rs add_data().
-//
-// ── TODO: full IDT compliance (deferred to v1.1+) ────────────────────────────
-//
-//   [TODO-1] Resolved — DATA_FRAME CRC32C appended; DataFrame now 34 bytes.
-//
-//   [TODO-2] ACK_FRAME wire format: switch to standard IDT framing (magic=0xD17A, full header).
-//            Requires coordinated update to AckFrame serialisation + Flutter sendAck().
-//
-//   [TODO-3] Resolved — History / BACKLOG_THEN_LIVE mode implemented:
-//            - BleSessionState.history ring-buffer feeds from output() via record_history().
-//            - handle_tlv_subscribe / handle_subscribe_req call start_replay() on mode=1/2.
-//            - FLAG_BACKLOG set only during replay (is_replaying flag per stream).
-//            - Flutter change still needed: mode byte 0x00 → 0x01 in subscribeStreams().
-//
-//   [TODO-4] PING/PONG heartbeat (IDT msg_type=0x30 / 0x31):
-//            Useful for detecting stale sessions without a full reconnect cycle.
-//            Not needed for the current prototype (flutter_blue_plus handles connectivity).
-//
-//   [TODO-5] STATUS frames (IDT msg_type=0x40):
-//            Server-to-client error/state reporting. Not yet implemented.
 
 use crate::domain::ble_protocol::{
-    has_idt_magic, parse_tlv_subscribe_req, AckFrame, Catalog, InboundFrame, SignalId,
-    SignalRegistry, SubscribeReq, SubscribeRsp, SubscribeRspItem, TlvSubscribeItem,
-    SUB_OP_SUBSCRIBE, SUB_OP_UNSUBSCRIBE,
+    has_idt_magic, AckFrame, Catalog, InboundFrame, SignalId, SignalRegistry, SubscribeReq,
+    SubscribeRsp, SubscribeRspItem, SUB_OP_SUBSCRIBE, SUB_OP_UNSUBSCRIBE,
 };
 use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};
@@ -246,8 +202,6 @@ impl ReliableBleOutput {
         // 3. Spawn ACK watchdog task
         // [OBS-2] Periodically checks total_pending() across all streams and emits WARN/ERROR
         //         when the buffer depth suggests the ACK uplink is frozen or congested.
-        //         Surfaces Flutter debugFreezeAck / debugDropAck from the Rust log alone,
-        //         without requiring any Flutter-side instrumentation.
         {
             let state = self.state.clone();
             tokio::spawn(async move {
@@ -277,113 +231,85 @@ impl ReliableBleOutput {
 
         while let Some(event) = rx.recv().await {
             match event.characteristic_name.as_str() {
-                // ── Data_IN: ACK_FRAME or NACK_FRAME from client ──────────────
-                // Magic-based routing:
-                //   len==17       → Flutter custom ACK [DEV-2] (no IDT magic)
-                //   has_idt_magic → IDT NACK_FRAME (only valid IDT type on this char)
-                //   otherwise     → unknown format, discard + warn
+                // ── Data_IN: ACK_FRAME or NACK_FRAME from the Central ─────────
+                // All inbound frames carry IDT magic and are dispatched via InboundFrame.
                 "Data_IN" => {
                     let data = &event.data;
-                    if data.len() == 17 {
-                        // [DEV-2] Flutter custom ACK — no IDT magic, fixed 17 bytes (TEST)
-                        match AckFrame::from_ble_bytes(data) {
-                            Some(ack) => {
-                                log::info!(
-                                    "ACK Recv: stream={}, ack_upto={}, bitmap={:02X?}",
+                    match InboundFrame::from_ble_bytes(data) {
+                        Some(InboundFrame::Ack(ack)) => {
+                            log::info!(
+                                "ACK Recv: stream={}, ack_upto={}, bitmap={:02X?}",
+                                ack.stream_id,
+                                ack.ack_upto,
+                                ack.bitmap
+                            );
+                            let retransmits = {
+                                let mut st = state.write().await;
+                                st.handle_ack_with_bitmap(
+                                    ack.session_id,
                                     ack.stream_id,
                                     ack.ack_upto,
-                                    ack.bitmap
-                                );
-                                let retransmits = {
-                                    let mut st = state.write().await;
-                                    st.handle_ack_with_bitmap(
-                                        ack.session_id,
-                                        ack.stream_id,
-                                        ack.ack_upto,
-                                        &ack.bitmap,
-                                    )
-                                };
-                                if !retransmits.is_empty() {
-                                    let srv = server.read().await;
-                                    for frame in retransmits {
-                                        let bytes = frame.to_ble_bytes();
-                                        if let Err(e) = srv.notify("Data_OUT", &bytes).await {
-                                            log::warn!(
-                                                "Retransmit failed for seq {}: {}",
-                                                frame.header.seq,
-                                                e
-                                            );
-                                        } else {
-                                            log::info!(
-                                                "--> RETRANSMITTED seq {} for stream {}",
-                                                frame.header.seq,
-                                                frame.header.stream_id
-                                            );
-                                        }
+                                    &ack.bitmap,
+                                )
+                            };
+                            if !retransmits.is_empty() {
+                                let srv = server.read().await;
+                                for frame in retransmits {
+                                    let bytes = frame.to_ble_bytes();
+                                    if let Err(e) = srv.notify("Data_OUT", &bytes).await {
+                                        log::warn!(
+                                            "Retransmit failed for seq {}: {}",
+                                            frame.header.seq,
+                                            e
+                                        );
+                                    } else {
+                                        log::info!(
+                                            "--> RETRANSMITTED seq {} for stream {}",
+                                            frame.header.seq,
+                                            frame.header.stream_id
+                                        );
                                     }
                                 }
                             }
-                            None => {
-                                log::warn!(
-                                    "Data_IN: 17-byte payload did not parse as Flutter ACK — discarded"
-                                );
-                            }
                         }
-                    } else if has_idt_magic(data) {
-                        // IDT-framed message on Data_IN — only NACK_FRAME is valid here
-                        match InboundFrame::from_ble_bytes(data) {
-                            Some(InboundFrame::Nack(nack)) => {
-                                log::info!(
-                                    "IDT NACK: stream={}, reason={}, {} seq(s) to retransmit",
-                                    nack.header.stream_id,
-                                    nack.reason,
-                                    nack.seq_list.len()
-                                );
-                                let retransmits = {
-                                    let st = state.read().await;
-                                    st.handle_nack(nack.header.stream_id, &nack.seq_list)
-                                };
-                                if !retransmits.is_empty() {
-                                    let srv = server.read().await;
-                                    for frame in retransmits {
-                                        let bytes = frame.to_ble_bytes();
-                                        if let Err(e) = srv.notify("Data_OUT", &bytes).await {
-                                            log::warn!(
-                                                "Retransmit failed for seq {}: {}",
-                                                frame.header.seq,
-                                                e
-                                            );
-                                        } else {
-                                            log::debug!("Retransmitted seq {}", frame.header.seq);
-                                        }
+                        Some(InboundFrame::Nack(nack)) => {
+                            log::info!(
+                                "IDT NACK: stream={}, reason={}, {} seq(s) to retransmit",
+                                nack.header.stream_id,
+                                nack.reason,
+                                nack.seq_list.len()
+                            );
+                            let retransmits = {
+                                let st = state.read().await;
+                                st.handle_nack(nack.header.stream_id, &nack.seq_list)
+                            };
+                            if !retransmits.is_empty() {
+                                let srv = server.read().await;
+                                for frame in retransmits {
+                                    let bytes = frame.to_ble_bytes();
+                                    if let Err(e) = srv.notify("Data_OUT", &bytes).await {
+                                        log::warn!(
+                                            "Retransmit failed for seq {}: {}",
+                                            frame.header.seq,
+                                            e
+                                        );
+                                    } else {
+                                        log::debug!("Retransmitted seq {}", frame.header.seq);
                                     }
                                 }
                             }
-                            _ => {
-                                log::warn!(
-                                    "Data_IN: IDT magic present but not a NACK_FRAME \
-                                     (msg_type=0x{:02X}, {} bytes) — discarded",
-                                    data.get(3).copied().unwrap_or(0),
-                                    data.len()
-                                );
-                            }
                         }
-                    } else {
-                        log::warn!(
-                            "Data_IN: unrecognized payload ({} bytes, byte[0]=0x{:02X}) — \
-                             not a Flutter ACK (17b) or IDT frame (magic=0xD17A), discarded",
-                            data.len(),
-                            data.first().copied().unwrap_or(0)
-                        );
+                        _ => {
+                            log::warn!(
+                                "Data_IN: unrecognized payload ({} bytes, byte[0]=0x{:02X}) — discarded",
+                                data.len(),
+                                data.first().copied().unwrap_or(0)
+                            );
+                        }
                     }
                 }
 
-                // ── Subscribe: SUBSCRIBE_REQ (IDT or Flutter TLV) ────────────
-                // Magic-based routing (TLV takes priority per [DEV-3]):
-                //   byte[0]==0x20 → Flutter TLV SUBSCRIBE_REQ [DEV-3]; warn on parse fail
-                //   has_idt_magic → IDT SUBSCRIBE_REQ; warn + discard if wrong type
-                //   otherwise     → unknown format, discard + warn
-                // RSP is delayed 300 ms so Flutter has time to enable CCCD [DEV-4].
+                // ── Subscribe: SUBSCRIBE_REQ (IDT) from the Central ──────────
                 "Subscribe" => {
                     let data = &event.data;
                     // Always dump raw bytes at INFO level — essential for protocol debugging
@@ -394,26 +320,7 @@ impl ReliableBleOutput {
                         .join(" ");
                     log::info!("Subscribe raw ({} bytes): {}", data.len(), hex);
 
-                    if data.first() == Some(&0x20) {
-                        // [DEV-3] Flutter TLV format — byte[0]=0x20 marker, no IDT magic
-                        if let Some((req_id, items)) = parse_tlv_subscribe_req(data) {
-                            log::info!(
-                                "TLV subscribe: req_id={}, {} item(s)",
-                                req_id,
-                                items.len()
-                            );
-                            Self::handle_tlv_subscribe(
-                                req_id, items, &state, &server, &registry,
-                            )
-                            .await;
-                        } else {
-                            log::warn!(
-                                "Subscribe: TLV marker 0x20 present but parse failed ({} bytes) — discarded",
-                                data.len()
-                            );
-                        }
-                    } else if has_idt_magic(data) {
-                        // IDT SUBSCRIBE_REQ
+                    if has_idt_magic(data) {
                         if let Some(InboundFrame::SubscribeReq(req)) =
                             InboundFrame::from_ble_bytes(data)
                         {
@@ -427,7 +334,8 @@ impl ReliableBleOutput {
                         }
                     } else {
                         log::warn!(
-                            "Subscribe: unrecognized format ({} bytes, byte[0]=0x{:02X}) — discarded",
+                            "Subscribe: unrecognized format ({} bytes, byte[0]=0x{:02X}) — \
+                             expected IDT frame (magic=0xD17A), discarded",
                             data.len(),
                             data.first().copied().unwrap_or(0)
                         );
@@ -479,8 +387,6 @@ impl ReliableBleOutput {
     ///              WARN_THRESHOLD (ACK channel slow / congested) and ERROR when near the
     ///              hard buffer cap (data loss imminent).
     ///
-    ///              Designed to surface Flutter-side ACK suppression (debugFreezeAck,
-    ///              debugDropAck) from the Rust log alone — no Flutter instrumentation needed.
     ///              Tagged [OBS-2] — cross-referenced in start().
     ///
     /// Version: V1.0
@@ -505,8 +411,7 @@ impl ReliableBleOutput {
                 );
             } else if pending >= WARN_THRESHOLD {
                 log::warn!(
-                    "[ACK Watchdog] {} frames pending — ACK channel may be \
-                     slow or frozen (debugFreezeAck / debugDropAck active?).",
+                    "[ACK Watchdog] {} frames pending — ACK channel may be slow or frozen.",
                     pending
                 );
             }
@@ -613,7 +518,7 @@ impl ReliableBleOutput {
                     req_id
                 );
             }
-            // Also send on Control char — some Flutter implementations listen here (I.pdf)
+            // Also send on Control char — some older Central implementations listen here
             if let Err(e) = srv.notify("Control", &bytes).await {
                 log::debug!(
                     "SUBSCRIBE_RSP on Control: {} (client may not be subscribed)",
@@ -624,7 +529,7 @@ impl ReliableBleOutput {
             }
         }
 
-        // [TODO-3 resolved] Send historical replay frames for BACKLOG_THEN_LIVE / BACKLOG_ONLY
+        // Send historical replay frames for BACKLOG_THEN_LIVE / BACKLOG_ONLY
         for (canonical_id, stream_id, mode, start_time_ms) in replay_requests {
             let replay_frames = {
                 let mut st = state.write().await;
@@ -657,166 +562,6 @@ impl ReliableBleOutput {
                     }
                 }
             }
-            {
-                let mut st = state.write().await;
-                st.finish_replay(stream_id);
-                if mode == 2 {
-                    st.unsubscribe(canonical_id);
-                    log::info!(
-                        "BACKLOG_ONLY: unsubscribed signal 0x{:04X} after replay",
-                        canonical_id
-                    );
-                }
-            }
-        }
-    }
-
-    /// Handle a TLV-format SUBSCRIBE_REQ from the Flutter app (non-IDT wire format).
-    /// Normalizes legacy signal IDs (1,2,3) to IDT compound IDs (0x0101-0x0103),
-    /// subscribes each signal, and sends SUBSCRIBE_RSP on Data_OUT and Control.
-    ///
-    /// Stream ID assignment: use raw_id directly (1, 2, 3) for the session/DATA_FRAME
-    /// stream_id (stored LE → Flutter LE-reads it correctly).
-    /// The SUBSCRIBE_RSP result item encodes stream_id.swap_bytes() so that Flutter's
-    /// BE-reading of the RSP field also recovers the correct raw_id.
-    ///   raw_id=1 → session stream_id=1 → DATA_FRAME LE [0x01,0x00] → Dart LE-read → 1
-    ///   raw_id=1 → RSP item stream_id=256 → LE [0x00,0x01] → Dart BE-read → 1
-    ///
-    /// RSP is delayed 300 ms so the client has time to enable CCCD notifications
-    /// before the notification arrives.
-    /// Signal IDs are validated against `registry`; unknown IDs are rejected with a warning.
-    async fn handle_tlv_subscribe(
-        req_id: u16,
-        items: Vec<TlvSubscribeItem>,
-        state: &Arc<RwLock<BleSessionState>>,
-        server: &Arc<RwLock<GattServer>>,
-        registry: &Arc<SignalRegistry>,
-    ) {
-        let session_id = state.read().await.current_session_id;
-        let mut rsp_items: Vec<SubscribeRspItem> = Vec::new();
-        // Collect (canonical_id, stream_id, mode, start_time_ms) for post-RSP replay
-        let mut replay_requests: Vec<(u16, u16, u8, u64)> = Vec::new();
-
-        {
-            let mut st = state.write().await;
-            for item in &items {
-                // Validate + normalize via registry (handles legacy 1/2/3 → IDT 0x01xx)
-                let canonical_id = match registry.normalize_id(item.signal_id) {
-                    Some(id) => id,
-                    None => {
-                        log::warn!(
-                            "TLV SUBSCRIBE: unknown signal_id 0x{:04X} — not in registry, rejected",
-                            item.signal_id
-                        );
-                        continue;
-                    }
-                };
-                if canonical_id != item.signal_id {
-                    log::info!(
-                        "TLV Signal ID: app sent 0x{:04X} → normalized to 0x{:04X} (legacy→IDT)",
-                        item.signal_id,
-                        canonical_id
-                    );
-                }
-                // Safety: normalize_id succeeded, so get() is guaranteed Some
-                let meta = registry.get(canonical_id).unwrap();
-                // Use raw_id directly for DATA_FRAME stream_id (Flutter LE-reads header field)
-                // RSP result item uses stream_id.swap_bytes() so Flutter's BE-read of the RSP
-                // field also recovers raw_id.
-                let preferred_stream_id = item.signal_id;
-                let stream_id = st.subscribe_with_stream_id(canonical_id, preferred_stream_id);
-                rsp_items.push(SubscribeRspItem {
-                    source_id: meta.source_id,
-                    signal_id: canonical_id,
-                    stream_id: stream_id.swap_bytes(),
-                    effective_period_ms: meta.nominal_period_ms,
-                    effective_batch_max: 1,
-                });
-                log::info!(
-                    "TLV SUBSCRIBE: signal 0x{:04X} → session stream_id={} → RSP encodes {} (mode={})",
-                    canonical_id,
-                    stream_id,
-                    stream_id.swap_bytes(),
-                    item.mode
-                );
-                // Queue replay if mode=1 (BACKLOG_THEN_LIVE) or mode=2 (BACKLOG_ONLY)
-                if item.mode == 1 || item.mode == 2 {
-                    replay_requests.push((canonical_id, stream_id, item.mode, item.start_time_ms));
-                }
-            }
-        }
-
-        if !rsp_items.is_empty() {
-            // Delay before sending RSP to ensure the client has enabled CCCD notifications.
-            // The Flutter app enables CCCD *after* writing to the Subscribe characteristic,
-            // so without a delay the notify would be silently dropped.
-            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-
-            let rsp = SubscribeRsp {
-                session_id,
-                req_id,
-                status: 0,
-                results: rsp_items,
-            };
-            let bytes = rsp.to_ble_bytes();
-            let srv = server.read().await;
-            if let Err(e) = srv.notify("Data_OUT", &bytes).await {
-                log::warn!("Failed to send TLV SUBSCRIBE_RSP on Data_OUT: {}", e);
-            } else {
-                log::info!(
-                    "TLV SUBSCRIBE_RSP sent on Data_OUT ({} bytes, req_id={})",
-                    bytes.len(),
-                    req_id
-                );
-            }
-            if let Err(e) = srv.notify("Control", &bytes).await {
-                log::debug!(
-                    "TLV SUBSCRIBE_RSP on Control: {} (client may not be subscribed)",
-                    e
-                );
-            } else {
-                log::info!(
-                    "TLV SUBSCRIBE_RSP also sent on Control ({} bytes)",
-                    bytes.len()
-                );
-            }
-        }
-
-        // [TODO-3 resolved] Send historical replay frames for BACKLOG_THEN_LIVE / BACKLOG_ONLY
-        for (canonical_id, stream_id, mode, start_time_ms) in replay_requests {
-            let replay_frames = {
-                let mut st = state.write().await;
-                st.start_replay(canonical_id, start_time_ms)
-            };
-            if replay_frames.is_empty() {
-                log::info!(
-                    "Replay requested for signal 0x{:04X} (stream {}) but history is empty",
-                    canonical_id,
-                    stream_id
-                );
-            } else {
-                log::info!(
-                    "Replaying {} historical frame(s) for signal 0x{:04X} (stream {}, mode={})",
-                    replay_frames.len(),
-                    canonical_id,
-                    stream_id,
-                    mode
-                );
-                let srv = server.read().await;
-                for frame in &replay_frames {
-                    let bytes = frame.to_ble_bytes();
-                    if let Err(e) = srv.notify("Data_OUT", &bytes).await {
-                        log::warn!(
-                            "Replay notify failed for signal 0x{:04X} seq {}: {}",
-                            canonical_id,
-                            frame.header.seq,
-                            e
-                        );
-                    }
-                }
-            }
-            // For both mode=1 and mode=2, clear the replaying flag now that all
-            // historical frames have been sent. For mode=2 (BACKLOG_ONLY), also unsubscribe.
             {
                 let mut st = state.write().await;
                 st.finish_replay(stream_id);
@@ -873,8 +618,8 @@ impl ReliableBleOutput {
     ///
     /// Description: VRConnect shall transmit live vital sign data via IDT DATA_FRAME.
     ///              For each track in room_index=0 that matches a subscribed signal,
-    ///              a 34-byte IDT DATA_FRAME (with t0_ms timestamp and CRC32C tail —
-    ///              see TODO-1 resolved) is notified on Data_OUT.
+    ///              a 34-byte IDT DATA_FRAME (with t0_ms timestamp and CRC32C tail)
+    ///              is notified on Data_OUT.
     ///
     /// Version: V1.0
     pub async fn output(&self, data: &ProcessedData) -> Result<()> {
@@ -919,15 +664,14 @@ impl ReliableBleOutput {
             // Sample timestamp (milliseconds since Unix epoch)
             let t0_ms = track.timestamp.timestamp_millis() as u64;
 
-            // [TODO-3 resolved] Always record to history buffer so replay is available
+            // Always record to history buffer so replay is available
             // regardless of whether any client is currently subscribed.
             state.record_history(signal_id, val_f32, t0_ms);
 
             // add_data returns Some(frame) only if signal is subscribed
             if let Some(frame) = state.add_data(signal_id, val_f32, t0_ms) {
-                // [TODO-1 resolved] DataFrame::to_ble_bytes() produces 34 bytes (CRC32C appended).
+                // DataFrame::to_ble_bytes() produces 34 bytes (IDT header + payload + CRC32C).
                 // Signal name aliases are VitalRecorder-specific; registry governs BLE catalog.
-                // Future: move aliases into SignalMeta.aliases when adding waveform signals.
 
                 // --- CHAOS MONKEY: packet-drop + network-jitter (env-driven) ---
                 // Controlled by ENABLE_CHAOS_MONKEY / CHAOS_RATIO / CHAOS_NETWORK_JITTER.
@@ -1144,7 +888,8 @@ mod tests {
     use super::*;
     use crate::domain::ble_protocol::{
         AckFrame, IdtHeader, InboundFrame, SubscribeRsp, SubscribeRspItem, FLAG_RETRANSMIT,
-        IDT_MAGIC, IDT_VERSION, MSG_SUBSCRIBE_REQ, MSG_SUBSCRIBE_RSP, SUB_OP_SUBSCRIBE,
+        IDT_MAGIC, IDT_VERSION, MSG_ACK_FRAME, MSG_SUBSCRIBE_REQ, MSG_SUBSCRIBE_RSP,
+        SUB_OP_SUBSCRIBE,
     };
     use crate::domain::{ProcessedRoom, ProcessedTrack, TrackType};
     use chrono::Utc;
@@ -1172,14 +917,24 @@ mod tests {
         }
     }
 
-    /// Helper: build a valid Flutter ACK buffer (17 bytes, no IDT magic)
+    /// Helper: build a valid IDT ACK_FRAME buffer (30 bytes, IDT magic)
     fn make_ack_bytes(session_id: u16, stream_id: u16, ack_upto: u32) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(17);
-        buf.extend_from_slice(&session_id.to_le_bytes()); // [0,1]
-        buf.extend_from_slice(&stream_id.to_le_bytes()); // [2,3]
-        buf.extend_from_slice(&ack_upto.to_le_bytes()); // [4..7]
-        buf.push(8u8); // [8] bitmap_len = 8
-        buf.extend_from_slice(&0u64.to_le_bytes()); // [9..16] bitmap = zeros
+        let header = IdtHeader {
+            magic: IDT_MAGIC,
+            version: IDT_VERSION,
+            msg_type: MSG_ACK_FRAME,
+            flags: 0,
+            session_id,
+            stream_id,
+            seq: 0,
+        };
+        let mut buf = Vec::with_capacity(AckFrame::TOTAL_LEN);
+        buf.extend_from_slice(&header.to_bytes()); // [0..12]  13 bytes
+        buf.extend_from_slice(&ack_upto.to_le_bytes()); // [13..16]  4 bytes
+        buf.push(8u8); // [17]      bitmap_len = 8
+        buf.extend_from_slice(&0u64.to_le_bytes()); // [18..25]  bitmap = zeros
+        let crc = crc32c::crc32c(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes()); // [26..29]  CRC32C
         buf
     }
 
@@ -1330,13 +1085,12 @@ mod tests {
             assert_eq!(st.get_pending_count(SignalId::HR.as_u16()), 3);
         }
 
-        // Build a Flutter ACK (17 bytes, no IDT magic) acknowledging seq 1 and 2
+        // Build an IDT ACK_FRAME acknowledging seq 1 and 2
         let ack_bytes = make_ack_bytes(1, stream_id, 2);
         let ack = AckFrame::from_ble_bytes(&ack_bytes).unwrap();
 
         {
             let mut st = state.write().await;
-            // Flutter ACK: fields directly on AckFrame (no header)
             st.handle_ack(ack.session_id, ack.stream_id, ack.ack_upto);
             // Only seq 3 should remain
             assert_eq!(st.get_pending_count(SignalId::HR.as_u16()), 1);
@@ -1527,41 +1281,14 @@ mod tests {
         assert!((values[0].1 - 82.0f32).abs() < f32::EPSILON);
     }
 
-    // ── TLV subscribe parsing ─────────────────────────────────────────────────
-
-    /// ID SRS: SRS-TEST-BLERELIABLE-014
-    /// Title: Test parse_tlv_subscribe_req with the real Flutter hex payload
-    ///
-    /// Description: The exact bytes from Flutter's subscribeStreams() must yield
-    ///              req_id=42 and signal_ids=[1,2,3].
-    #[test]
-    fn test_parse_tlv_subscribe_req_real_flutter_bytes() {
-        let hex = "20 3F 00 01 02 00 2A 00 02 01 00 02 \
-                   03 18 00 01 01 00 01 02 02 00 01 00 03 01 00 00 04 04 00 00 00 00 00 05 01 00 01 \
-                   03 18 00 01 01 00 01 02 02 00 02 00 03 01 00 00 04 04 00 00 00 00 00 05 01 00 01 \
-                   03 18 00 01 01 00 01 02 02 00 03 00 03 01 00 00 04 04 00 00 00 00 00 05 01 00 01";
-        let bytes: Vec<u8> = hex
-            .split_whitespace()
-            .map(|s| u8::from_str_radix(s, 16).unwrap())
-            .collect();
-
-        let (req_id, items) = parse_tlv_subscribe_req(&bytes).unwrap();
-        assert_eq!(req_id, 42);
-        assert_eq!(
-            items.iter().map(|i| i.signal_id).collect::<Vec<_>>(),
-            vec![1u16, 2, 3]
-        );
-    }
-
     // ── FLAG_BACKLOG on outgoing frames ───────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLERELIABLE-015
     /// Title: Live frames must NOT carry FLAG_BACKLOG outside of replay
     ///
-    /// Description: [TODO-3 resolved] FLAG_BACKLOG is restricted to historical-replay frames
-    ///              only (is_replaying=true). Live frames — even when the retransmit buffer
-    ///              is non-empty — must have FLAG_BACKLOG clear. Replaces the old [DEV-5]
-    ///              behaviour where the flag was set whenever the tx buffer was non-empty.
+    /// Description: FLAG_BACKLOG is restricted to historical-replay frames only
+    ///              (is_replaying=true). Live frames — even when the retransmit buffer
+    ///              is non-empty — must have FLAG_BACKLOG clear.
     #[tokio::test]
     async fn test_flag_backlog_not_set_on_live_frames() {
         use crate::domain::ble_protocol::FLAG_BACKLOG;
@@ -1579,7 +1306,7 @@ mod tests {
             assert_eq!(
                 f2.header.flags & FLAG_BACKLOG,
                 0,
-                "Second live frame: unacked buffer must NOT set FLAG_BACKLOG (only replay does)"
+                "Second live frame: FLAG_BACKLOG must be clear outside replay"
             );
         }
     }
@@ -1589,7 +1316,7 @@ mod tests {
     /// ID SRS: SRS-TEST-BLERELIABLE-016
     /// Title: Test handle_ack_with_bitmap returns lost frames for retransmission
     ///
-    /// Description: 4 frames buffered (seq 1-4). Flutter ACK: ack_upto=1, bitmap
+    /// Description: 4 frames buffered (seq 1-4). ACK: ack_upto=1, bitmap
     ///              bit1=1 (seq 3 received, seq 2 missing). handle_ack_with_bitmap
     ///              must return seq 2 with FLAG_RETRANSMIT, and purge seq 1.
     #[tokio::test]
@@ -1629,7 +1356,7 @@ mod tests {
     /// ID SRS: SRS-TEST-BLERELIABLE-017
     /// Title: Test subscribe_with_stream_id assigns IDs 1, 2, 3 for HR/SpO2/Temp
     ///
-    /// Description: The TLV subscribe path uses preferred_stream_id = raw_id (1,2,3).
+    /// Description: subscribe_with_stream_id with preferred_stream_id = 1, 2, 3.
     ///              All three signals must get independent fixed stream IDs.
     #[tokio::test]
     async fn test_subscribe_with_stream_id_all_signals() {
@@ -1721,7 +1448,7 @@ mod tests {
     }
 
     // ── Registry validation path tests ───────────────────────────────────────
-    // These tests validate the logic used in handle_subscribe_req / handle_tlv_subscribe
+    // These tests validate the logic used in handle_subscribe_req
     // without requiring BLE hardware (GattServer), by exercising the same registry + state
     // objects that the async handlers use internally.
 
@@ -1773,7 +1500,7 @@ mod tests {
         let state = Arc::new(RwLock::new(BleSessionState::new(1)));
         {
             let mut st = state.write().await;
-            // Simulate TLV subscribe path: Flutter sends raw_id=1 → normalize to 0x0101
+            // Legacy simple ID raw_id=1 → normalize to canonical 0x0101
             let canonical = r.normalize_id(1).unwrap();
             assert_eq!(canonical, 0x0101);
             let stream_id = st.subscribe_with_stream_id(canonical, 1);

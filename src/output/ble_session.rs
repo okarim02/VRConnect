@@ -39,7 +39,7 @@ pub struct StreamEntry {
     /// Retransmit buffer: bounded VecDeque of sent-but-unacknowledged frames
     pub tx_buffer: VecDeque<DataFrame>,
     /// True while historical replay frames are being sent (BACKLOG_THEN_LIVE / BACKLOG_ONLY).
-    /// FLAG_BACKLOG is set on live DATA_FRAMEs only when this flag is true. [TODO-3]
+    /// FLAG_BACKLOG is set on DATA_FRAMEs only when this flag is true (historical replay).
     pub is_replaying: bool,
 }
 
@@ -249,8 +249,6 @@ impl BleSessionState {
     }
 
     /// Subscribe with a caller-chosen stream_id instead of auto-allocation.
-    /// Used by the TLV path to assign stream IDs that the Flutter app can match
-    /// regardless of its endianness assumptions.
     /// Idempotent: if signal_id is already subscribed, the existing stream_id is returned.
     pub fn subscribe_with_stream_id(&mut self, signal_id: u16, preferred_stream_id: u16) -> u16 {
         if let Some(&existing) = self.signal_to_stream.get(&signal_id) {
@@ -349,16 +347,15 @@ impl BleSessionState {
 
         let mut frame = DataFrame::new(self.current_session_id, stream_id, seq, t0_ms, value);
 
-        // [TODO-3 resolved — DEV-5 removed] FLAG_BACKLOG is now set only when this stream
-        // is actively replaying historical data (BACKLOG_THEN_LIVE / BACKLOG_ONLY mode).
-        // The previous [DEV-5] behaviour (set when tx_buffer non-empty) has been removed.
+        // FLAG_BACKLOG is set only when this stream is actively replaying historical data
+        // (BACKLOG_THEN_LIVE / BACKLOG_ONLY mode).
         if entry.is_replaying {
             frame.header.flags |= FLAG_BACKLOG;
         }
 
         // Buffer for retransmission (oldest frame evicted when limit reached).
-        // [OBS-1] If the ACK channel is frozen (Flutter debugFreezeAck / debugDropAck),
-        //         the buffer fills to max_buffer_size and oldest frames are silently lost.
+        // [OBS-1] If the ACK channel is frozen, the buffer fills to max_buffer_size
+        //         and oldest frames are silently lost.
         //         Each eviction is logged at WARN so medical data loss is never silent.
         entry.tx_buffer.push_back(frame.clone());
         while entry.tx_buffer.len() > self.max_buffer_size {
@@ -945,11 +942,10 @@ mod tests {
     // ── FLAG_BACKLOG behaviour ─────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-017
-    /// Title: Test FLAG_BACKLOG is NOT set on normal live frames (DEV-5 removed)
+    /// Title: Test FLAG_BACKLOG is NOT set on normal live frames
     ///
-    /// Description: Since TODO-3 is now resolved, FLAG_BACKLOG must NOT be set on live
-    ///              DATA_FRAMEs when the stream is not in replay mode — even if the
-    ///              retransmit buffer is non-empty.  [DEV-5] behavior removed.
+    /// Description: FLAG_BACKLOG must NOT be set on live DATA_FRAMEs when the stream
+    ///              is not in replay mode — even if the retransmit buffer is non-empty.
     #[test]
     fn test_flag_backlog_not_set_on_live_frames() {
         let mut session = BleSessionState::new(1);
@@ -968,7 +964,7 @@ mod tests {
         assert_eq!(
             f2.header.flags & FLAG_BACKLOG,
             0,
-            "Second live frame: not replaying → FLAG_BACKLOG must NOT be set (DEV-5 removed)"
+            "Second live frame: not replaying → FLAG_BACKLOG must NOT be set"
         );
     }
 
