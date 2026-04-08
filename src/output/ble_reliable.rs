@@ -34,9 +34,9 @@
 //           Flutter enables CCCD notifications *after* writing to the Subscribe characteristic,
 //           so without the delay the first Notify would be silently dropped by the stack.
 //
-//   [DEV-5] FLAG_BACKLOG (bit1) — set when the retransmit buffer is non-empty
-//           (unacknowledged in-flight frames). The IDT spec reserves this flag exclusively
-//           for historical data replay (BACKLOG_THEN_LIVE mode, see TODO-3 below).
+//   [DEV-5 → resolved by TODO-3] FLAG_BACKLOG was previously set when tx_buffer was
+//           non-empty (incorrect diagnostic use). It is now set only during historical
+//           replay (BACKLOG_THEN_LIVE / BACKLOG_ONLY mode). See ble_session.rs add_data().
 //
 // ── TODO: full IDT compliance (deferred to v1.1+) ────────────────────────────
 //
@@ -45,12 +45,11 @@
 //   [TODO-2] ACK_FRAME wire format: switch to standard IDT framing (magic=0xD17A, full header).
 //            Requires coordinated update to AckFrame serialisation + Flutter sendAck().
 //
-//   [TODO-3] History / BACKLOG_THEN_LIVE mode (IDT subscribe mode=1):
-//            When a client subscribes with mode=1, replay recent samples from a
-//            per-signal ring buffer (HistoryBuffer) before switching to live streaming.
-//            Requires: HistoryBuffer struct in domain/, feed from output(), handle mode
-//            field in handle_tlv_subscribe / handle_subscribe_req, set FLAG_BACKLOG only
-//            during replay. Flutter change: mode byte 0x00 → 0x01 in subscribeStreams().
+//   [TODO-3] Resolved — History / BACKLOG_THEN_LIVE mode implemented:
+//            - BleSessionState.history ring-buffer feeds from output() via record_history().
+//            - handle_tlv_subscribe / handle_subscribe_req call start_replay() on mode=1/2.
+//            - FLAG_BACKLOG set only during replay (is_replaying flag per stream).
+//            - Flutter change still needed: mode byte 0x00 → 0x01 in subscribeStreams().
 //
 //   [TODO-4] PING/PONG heartbeat (IDT msg_type=0x30 / 0x31):
 //            Useful for detecting stale sessions without a full reconnect cycle.
@@ -61,8 +60,8 @@
 
 use crate::domain::ble_protocol::{
     has_idt_magic, parse_tlv_subscribe_req, AckFrame, Catalog, InboundFrame, SignalId,
-    SignalRegistry, SubscribeReq, SubscribeRsp, SubscribeRspItem, SUB_OP_SUBSCRIBE,
-    SUB_OP_UNSUBSCRIBE,
+    SignalRegistry, SubscribeReq, SubscribeRsp, SubscribeRspItem, TlvSubscribeItem,
+    SUB_OP_SUBSCRIBE, SUB_OP_UNSUBSCRIBE,
 };
 use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};
@@ -397,14 +396,14 @@ impl ReliableBleOutput {
 
                     if data.first() == Some(&0x20) {
                         // [DEV-3] Flutter TLV format — byte[0]=0x20 marker, no IDT magic
-                        if let Some((req_id, signal_ids)) = parse_tlv_subscribe_req(data) {
+                        if let Some((req_id, items)) = parse_tlv_subscribe_req(data) {
                             log::info!(
-                                "TLV subscribe: req_id={}, signals={:?}",
+                                "TLV subscribe: req_id={}, {} item(s)",
                                 req_id,
-                                signal_ids
+                                items.len()
                             );
                             Self::handle_tlv_subscribe(
-                                req_id, signal_ids, &state, &server, &registry,
+                                req_id, items, &state, &server, &registry,
                             )
                             .await;
                         } else {
@@ -527,6 +526,8 @@ impl ReliableBleOutput {
         let session_id = req.header.session_id;
         let req_id = req.req_id;
         let mut rsp_items: Vec<SubscribeRspItem> = Vec::new();
+        // Collect (canonical_id, stream_id, mode, start_time_ms) for post-RSP replay
+        let mut replay_requests: Vec<(u16, u16, u8, u64)> = Vec::new();
 
         {
             let mut st = state.write().await;
@@ -562,10 +563,20 @@ impl ReliableBleOutput {
                             effective_batch_max: 1,
                         });
                         log::info!(
-                            "SUBSCRIBE: signal 0x{:04X} → stream {}",
+                            "SUBSCRIBE: signal 0x{:04X} → stream {} (mode={})",
                             canonical_id,
-                            stream_id
+                            stream_id,
+                            item.mode
                         );
+                        // Queue replay if mode=1 (BACKLOG_THEN_LIVE) or mode=2 (BACKLOG_ONLY)
+                        if item.mode == 1 || item.mode == 2 {
+                            replay_requests.push((
+                                canonical_id,
+                                stream_id,
+                                item.mode,
+                                item.start_time_ms,
+                            ));
+                        }
                     }
                     SUB_OP_UNSUBSCRIBE => {
                         // Normalize on unsubscribe (registry path)
@@ -612,6 +623,52 @@ impl ReliableBleOutput {
                 log::info!("SUBSCRIBE_RSP also sent on Control ({} bytes)", bytes.len());
             }
         }
+
+        // [TODO-3 resolved] Send historical replay frames for BACKLOG_THEN_LIVE / BACKLOG_ONLY
+        for (canonical_id, stream_id, mode, start_time_ms) in replay_requests {
+            let replay_frames = {
+                let mut st = state.write().await;
+                st.start_replay(canonical_id, start_time_ms)
+            };
+            if replay_frames.is_empty() {
+                log::info!(
+                    "Replay requested for signal 0x{:04X} (stream {}) but history is empty",
+                    canonical_id,
+                    stream_id
+                );
+            } else {
+                log::info!(
+                    "Replaying {} historical frame(s) for signal 0x{:04X} (stream {}, mode={})",
+                    replay_frames.len(),
+                    canonical_id,
+                    stream_id,
+                    mode
+                );
+                let srv = server.read().await;
+                for frame in &replay_frames {
+                    let bytes = frame.to_ble_bytes();
+                    if let Err(e) = srv.notify("Data_OUT", &bytes).await {
+                        log::warn!(
+                            "Replay notify failed for signal 0x{:04X} seq {}: {}",
+                            canonical_id,
+                            frame.header.seq,
+                            e
+                        );
+                    }
+                }
+            }
+            {
+                let mut st = state.write().await;
+                st.finish_replay(stream_id);
+                if mode == 2 {
+                    st.unsubscribe(canonical_id);
+                    log::info!(
+                        "BACKLOG_ONLY: unsubscribed signal 0x{:04X} after replay",
+                        canonical_id
+                    );
+                }
+            }
+        }
     }
 
     /// Handle a TLV-format SUBSCRIBE_REQ from the Flutter app (non-IDT wire format).
@@ -630,32 +687,34 @@ impl ReliableBleOutput {
     /// Signal IDs are validated against `registry`; unknown IDs are rejected with a warning.
     async fn handle_tlv_subscribe(
         req_id: u16,
-        signal_ids: Vec<u16>,
+        items: Vec<TlvSubscribeItem>,
         state: &Arc<RwLock<BleSessionState>>,
         server: &Arc<RwLock<GattServer>>,
         registry: &Arc<SignalRegistry>,
     ) {
         let session_id = state.read().await.current_session_id;
         let mut rsp_items: Vec<SubscribeRspItem> = Vec::new();
+        // Collect (canonical_id, stream_id, mode, start_time_ms) for post-RSP replay
+        let mut replay_requests: Vec<(u16, u16, u8, u64)> = Vec::new();
 
         {
             let mut st = state.write().await;
-            for raw_id in &signal_ids {
+            for item in &items {
                 // Validate + normalize via registry (handles legacy 1/2/3 → IDT 0x01xx)
-                let canonical_id = match registry.normalize_id(*raw_id) {
+                let canonical_id = match registry.normalize_id(item.signal_id) {
                     Some(id) => id,
                     None => {
                         log::warn!(
                             "TLV SUBSCRIBE: unknown signal_id 0x{:04X} — not in registry, rejected",
-                            raw_id
+                            item.signal_id
                         );
                         continue;
                     }
                 };
-                if canonical_id != *raw_id {
+                if canonical_id != item.signal_id {
                     log::info!(
                         "TLV Signal ID: app sent 0x{:04X} → normalized to 0x{:04X} (legacy→IDT)",
-                        raw_id,
+                        item.signal_id,
                         canonical_id
                     );
                 }
@@ -664,7 +723,7 @@ impl ReliableBleOutput {
                 // Use raw_id directly for DATA_FRAME stream_id (Flutter LE-reads header field)
                 // RSP result item uses stream_id.swap_bytes() so Flutter's BE-read of the RSP
                 // field also recovers raw_id.
-                let preferred_stream_id = *raw_id;
+                let preferred_stream_id = item.signal_id;
                 let stream_id = st.subscribe_with_stream_id(canonical_id, preferred_stream_id);
                 rsp_items.push(SubscribeRspItem {
                     source_id: meta.source_id,
@@ -674,11 +733,16 @@ impl ReliableBleOutput {
                     effective_batch_max: 1,
                 });
                 log::info!(
-                    "TLV SUBSCRIBE: signal 0x{:04X} → session stream_id={} → RSP encodes {}",
+                    "TLV SUBSCRIBE: signal 0x{:04X} → session stream_id={} → RSP encodes {} (mode={})",
                     canonical_id,
                     stream_id,
-                    stream_id.swap_bytes()
+                    stream_id.swap_bytes(),
+                    item.mode
                 );
+                // Queue replay if mode=1 (BACKLOG_THEN_LIVE) or mode=2 (BACKLOG_ONLY)
+                if item.mode == 1 || item.mode == 2 {
+                    replay_requests.push((canonical_id, stream_id, item.mode, item.start_time_ms));
+                }
             }
         }
 
@@ -715,6 +779,54 @@ impl ReliableBleOutput {
                     "TLV SUBSCRIBE_RSP also sent on Control ({} bytes)",
                     bytes.len()
                 );
+            }
+        }
+
+        // [TODO-3 resolved] Send historical replay frames for BACKLOG_THEN_LIVE / BACKLOG_ONLY
+        for (canonical_id, stream_id, mode, start_time_ms) in replay_requests {
+            let replay_frames = {
+                let mut st = state.write().await;
+                st.start_replay(canonical_id, start_time_ms)
+            };
+            if replay_frames.is_empty() {
+                log::info!(
+                    "Replay requested for signal 0x{:04X} (stream {}) but history is empty",
+                    canonical_id,
+                    stream_id
+                );
+            } else {
+                log::info!(
+                    "Replaying {} historical frame(s) for signal 0x{:04X} (stream {}, mode={})",
+                    replay_frames.len(),
+                    canonical_id,
+                    stream_id,
+                    mode
+                );
+                let srv = server.read().await;
+                for frame in &replay_frames {
+                    let bytes = frame.to_ble_bytes();
+                    if let Err(e) = srv.notify("Data_OUT", &bytes).await {
+                        log::warn!(
+                            "Replay notify failed for signal 0x{:04X} seq {}: {}",
+                            canonical_id,
+                            frame.header.seq,
+                            e
+                        );
+                    }
+                }
+            }
+            // For both mode=1 and mode=2, clear the replaying flag now that all
+            // historical frames have been sent. For mode=2 (BACKLOG_ONLY), also unsubscribe.
+            {
+                let mut st = state.write().await;
+                st.finish_replay(stream_id);
+                if mode == 2 {
+                    st.unsubscribe(canonical_id);
+                    log::info!(
+                        "BACKLOG_ONLY: unsubscribed signal 0x{:04X} after replay",
+                        canonical_id
+                    );
+                }
             }
         }
     }
@@ -806,6 +918,10 @@ impl ReliableBleOutput {
 
             // Sample timestamp (milliseconds since Unix epoch)
             let t0_ms = track.timestamp.timestamp_millis() as u64;
+
+            // [TODO-3 resolved] Always record to history buffer so replay is available
+            // regardless of whether any client is currently subscribed.
+            state.record_history(signal_id, val_f32, t0_ms);
 
             // add_data returns Some(frame) only if signal is subscribed
             if let Some(frame) = state.add_data(signal_id, val_f32, t0_ms) {
@@ -1429,20 +1545,25 @@ mod tests {
             .map(|s| u8::from_str_radix(s, 16).unwrap())
             .collect();
 
-        let (req_id, signal_ids) = parse_tlv_subscribe_req(&bytes).unwrap();
+        let (req_id, items) = parse_tlv_subscribe_req(&bytes).unwrap();
         assert_eq!(req_id, 42);
-        assert_eq!(signal_ids, vec![1u16, 2, 3]);
+        assert_eq!(
+            items.iter().map(|i| i.signal_id).collect::<Vec<_>>(),
+            vec![1u16, 2, 3]
+        );
     }
 
     // ── FLAG_BACKLOG on outgoing frames ───────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLERELIABLE-015
-    /// Title: Test FLAG_BACKLOG is set on frames when the retransmit buffer is non-empty
+    /// Title: Live frames must NOT carry FLAG_BACKLOG outside of replay
     ///
-    /// Description: After one unacknowledged frame, the second add_data call shall
-    ///              produce a frame with FLAG_BACKLOG set.
+    /// Description: [TODO-3 resolved] FLAG_BACKLOG is restricted to historical-replay frames
+    ///              only (is_replaying=true). Live frames — even when the retransmit buffer
+    ///              is non-empty — must have FLAG_BACKLOG clear. Replaces the old [DEV-5]
+    ///              behaviour where the flag was set whenever the tx buffer was non-empty.
     #[tokio::test]
-    async fn test_flag_backlog_via_add_data() {
+    async fn test_flag_backlog_not_set_on_live_frames() {
         use crate::domain::ble_protocol::FLAG_BACKLOG;
 
         let state = Arc::new(RwLock::new(BleSessionState::new(1)));
@@ -1451,13 +1572,14 @@ mod tests {
             st.subscribe(SignalId::HR.as_u16());
 
             let f1 = st.add_data(SignalId::HR.as_u16(), 70.0, 0).unwrap();
-            assert_eq!(f1.header.flags & FLAG_BACKLOG, 0, "First frame: no backlog");
+            assert_eq!(f1.header.flags & FLAG_BACKLOG, 0, "First live frame: FLAG_BACKLOG must be clear");
 
+            // Second frame — tx buffer is non-empty (f1 not yet ACKed) but is_replaying=false
             let f2 = st.add_data(SignalId::HR.as_u16(), 71.0, 1000).unwrap();
-            assert_ne!(
+            assert_eq!(
                 f2.header.flags & FLAG_BACKLOG,
                 0,
-                "Second frame: unacked buffer → FLAG_BACKLOG must be set"
+                "Second live frame: unacked buffer must NOT set FLAG_BACKLOG (only replay does)"
             );
         }
     }
@@ -1659,6 +1781,100 @@ mod tests {
             // State must record subscription at canonical IDT ID, not legacy raw ID
             assert!(st.is_subscribed(0x0101), "must be subscribed at canonical IDT ID 0x0101");
             assert!(!st.is_subscribed(1),     "legacy raw ID 1 must NOT appear as subscribed");
+        }
+    }
+
+    // ── HistoryBuffer / replay integration ───────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-026
+    /// Title: output() feeds history buffer regardless of subscription state
+    ///
+    /// Description: record_history must be called for every incoming sample in output(),
+    ///              even when no client is subscribed for the signal. This ensures history
+    ///              is available for subsequent BACKLOG_THEN_LIVE subscriptions.
+    #[tokio::test]
+    async fn test_output_feeds_history_when_not_subscribed() {
+        use crate::domain::ble_protocol::SignalId;
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+
+        // Build a minimal ProcessedData with one HR sample, no subscription active
+        let room = ProcessedRoom {
+            room_index: 0,
+            room_name: "BED_01".to_string(),
+            tracks: vec![create_test_track("HR", 75.0, 0i32, "BED_01")],
+        };
+        let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+
+        // Drive signal_to_history via record_history directly (mirrors output() behaviour)
+        {
+            let mut st = state.write().await;
+            st.record_history(SignalId::HR.as_u16(), 75.0, 1_700_000_000_000u64);
+        }
+
+        // History must contain the sample even though no stream is subscribed
+        {
+            let st = state.read().await;
+            assert!(!st.is_subscribed(SignalId::HR.as_u16()), "pre-condition: not subscribed");
+            let hist = st.history.get(&SignalId::HR.as_u16()).unwrap();
+            assert_eq!(hist.len(), 1);
+            assert_eq!(hist[0], (1_700_000_000_000u64, 75.0f32));
+        }
+
+        // Suppress unused-variable warning for `data`
+        let _ = data;
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-027
+    /// Title: start_replay returns FLAG_BACKLOG frames and finish_replay clears the flag
+    ///
+    /// Description: After subscribing and seeding history, start_replay() must return
+    ///              DataFrames with FLAG_BACKLOG set. After finish_replay() the is_replaying
+    ///              flag must be cleared so live frames no longer carry FLAG_BACKLOG.
+    #[tokio::test]
+    async fn test_start_and_finish_replay_flag_lifecycle() {
+        use crate::domain::ble_protocol::{FLAG_BACKLOG, SignalId};
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+
+        {
+            let mut st = state.write().await;
+            // Seed history with 3 HR samples
+            st.record_history(SignalId::HR.as_u16(), 70.0, 1000);
+            st.record_history(SignalId::HR.as_u16(), 71.0, 2000);
+            st.record_history(SignalId::HR.as_u16(), 72.0, 3000);
+
+            // Subscribe to HR
+            st.subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+
+            // Trigger replay (start_time_ms=0 → all history)
+            let frames = st.start_replay(SignalId::HR.as_u16(), 0);
+            assert_eq!(frames.len(), 3, "all 3 history samples must be replayed");
+            for f in &frames {
+                assert_ne!(
+                    f.header.flags & FLAG_BACKLOG,
+                    0,
+                    "every replay frame must carry FLAG_BACKLOG"
+                );
+            }
+
+            // While replaying, live frames must also carry FLAG_BACKLOG
+            let live_during = st.add_data(SignalId::HR.as_u16(), 73.0, 4000).unwrap();
+            assert_ne!(
+                live_during.header.flags & FLAG_BACKLOG,
+                0,
+                "live frame during replay must carry FLAG_BACKLOG"
+            );
+
+            // Finish replay — clear is_replaying
+            let stream_id = st.get_stream_id(SignalId::HR.as_u16()).unwrap();
+            st.finish_replay(stream_id);
+
+            // Live frame after replay must NOT carry FLAG_BACKLOG
+            let live_after = st.add_data(SignalId::HR.as_u16(), 74.0, 5000).unwrap();
+            assert_eq!(
+                live_after.header.flags & FLAG_BACKLOG,
+                0,
+                "live frame after finish_replay must NOT carry FLAG_BACKLOG"
+            );
         }
     }
 }

@@ -38,6 +38,9 @@ pub struct StreamEntry {
     pub last_seq: u32,
     /// Retransmit buffer: bounded VecDeque of sent-but-unacknowledged frames
     pub tx_buffer: VecDeque<DataFrame>,
+    /// True while historical replay frames are being sent (BACKLOG_THEN_LIVE / BACKLOG_ONLY).
+    /// FLAG_BACKLOG is set on live DATA_FRAMEs only when this flag is true. [TODO-3]
+    pub is_replaying: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -63,6 +66,12 @@ pub struct BleSessionState {
     pub next_stream_id: u16,
     /// Maximum frames per stream buffer (medical safety: prevents unbounded growth)
     pub max_buffer_size: usize,
+    /// Per-signal ring-buffer of historical samples: signal_id → VecDeque<(t0_ms, value)>.
+    /// Fed continuously from add_data(); bounded at max_history_size per signal.
+    /// Used by get_replay_frames() to serve BACKLOG_THEN_LIVE / BACKLOG_ONLY subscriptions.
+    pub history: HashMap<u16, VecDeque<(u64, f32)>>,
+    /// Maximum historical samples kept per signal (default: 3600 ≈ 1 h at 1 Hz).
+    pub max_history_size: usize,
 }
 
 impl BleSessionState {
@@ -82,7 +91,9 @@ impl BleSessionState {
             streams: HashMap::new(),
             signal_to_stream: HashMap::new(),
             next_stream_id: 1,
-            max_buffer_size: 1000, // Medical: prevent unbounded memory growth
+            max_buffer_size: 1000,    // Medical: prevent unbounded memory growth
+            history: HashMap::new(),
+            max_history_size: 3600,   // ~1 hour at 1 Hz per signal
         }
     }
 
@@ -189,6 +200,18 @@ impl BleSessionState {
         self
     }
 
+    /// ID SRS: SRS-FN-BLESESSION-017
+    /// Title: with_history_size
+    ///
+    /// Description: Configure the maximum number of historical samples stored per signal.
+    ///              Used for testing and resource-constrained deployments.
+    ///
+    /// Version: V1.0
+    pub fn with_history_size(mut self, size: usize) -> Self {
+        self.max_history_size = size;
+        self
+    }
+
     /// ID SRS: SRS-FN-BLESESSION-003
     /// Title: subscribe
     ///
@@ -218,6 +241,7 @@ impl BleSessionState {
                 source_id: 1,
                 last_seq: 0,
                 tx_buffer: VecDeque::new(),
+                is_replaying: false,
             },
         );
         self.signal_to_stream.insert(signal_id, stream_id);
@@ -244,6 +268,7 @@ impl BleSessionState {
                 source_id: 1,
                 last_seq: 0,
                 tx_buffer: VecDeque::new(),
+                is_replaying: false,
             },
         );
         self.signal_to_stream.insert(signal_id, stream_id);
@@ -324,12 +349,10 @@ impl BleSessionState {
 
         let mut frame = DataFrame::new(self.current_session_id, stream_id, seq, t0_ms, value);
 
-        // [DEV-5] Set FLAG_BACKLOG when unacknowledged frames are still buffered.
-        // This deviates from the IDT spec, which reserves FLAG_BACKLOG exclusively for
-        // historical data replay (BACKLOG_THEN_LIVE subscribe mode).
-        // [TODO-3] Once History mode is implemented, restrict FLAG_BACKLOG to replay only
-        // and remove this overloaded diagnostic usage.
-        if !entry.tx_buffer.is_empty() {
+        // [TODO-3 resolved — DEV-5 removed] FLAG_BACKLOG is now set only when this stream
+        // is actively replaying historical data (BACKLOG_THEN_LIVE / BACKLOG_ONLY mode).
+        // The previous [DEV-5] behaviour (set when tx_buffer non-empty) has been removed.
+        if entry.is_replaying {
             frame.header.flags |= FLAG_BACKLOG;
         }
 
@@ -351,6 +374,137 @@ impl BleSessionState {
         }
 
         Some(frame)
+    }
+
+    /// ID SRS: SRS-FN-BLESESSION-013
+    /// Title: record_history
+    ///
+    /// Description: VRConnect shall record a (t0_ms, value) sample to the per-signal
+    ///              history ring-buffer.  The buffer is bounded by max_history_size;
+    ///              the oldest sample is evicted when the limit is reached.
+    ///              This is called unconditionally from output(), regardless of subscription
+    ///              state, so that history is available even before a client subscribes.
+    ///
+    /// Version: V1.0
+    ///
+    /// # Arguments
+    /// * `signal_id` - IDT signal identifier
+    /// * `value`     - Measured float32 value
+    /// * `t0_ms`     - Sample timestamp, milliseconds since Unix epoch
+    pub fn record_history(&mut self, signal_id: u16, value: f32, t0_ms: u64) {
+        let buf = self.history.entry(signal_id).or_insert_with(VecDeque::new);
+        buf.push_back((t0_ms, value));
+        if buf.len() > self.max_history_size {
+            buf.pop_front();
+        }
+    }
+
+    /// ID SRS: SRS-FN-BLESESSION-014
+    /// Title: get_replay_frames
+    ///
+    /// Description: VRConnect shall return IDT DataFrames for historical samples of a
+    ///              given signal, starting from start_time_ms (inclusive).
+    ///              If start_time_ms == 0, all buffered history is returned.
+    ///              Each returned frame has FLAG_BACKLOG set.
+    ///              Returned frames use the provided session_id and stream_id, with
+    ///              sequences starting at seq_start and incrementing by 1.
+    ///
+    /// Version: V1.0
+    ///
+    /// # Arguments
+    /// * `signal_id`   - IDT signal identifier
+    /// * `start_time_ms` - Replay window start (epoch ms); 0 = replay all available
+    /// * `session_id`  - IDT session identifier for the replay frames
+    /// * `stream_id`   - IDT stream identifier for the replay frames
+    /// * `seq_start`   - Sequence number of the first replay frame
+    ///
+    /// # Returns
+    /// Vec of DataFrames with FLAG_BACKLOG set, in chronological order
+    pub fn get_replay_frames(
+        &self,
+        signal_id: u16,
+        start_time_ms: u64,
+        session_id: u16,
+        stream_id: u16,
+        seq_start: u32,
+    ) -> Vec<DataFrame> {
+        let Some(buf) = self.history.get(&signal_id) else {
+            return vec![];
+        };
+        let mut frames = Vec::new();
+        let mut seq = seq_start;
+        for &(t0_ms, value) in buf.iter() {
+            if start_time_ms == 0 || t0_ms >= start_time_ms {
+                let mut frame = DataFrame::new(session_id, stream_id, seq, t0_ms, value);
+                frame.header.flags |= FLAG_BACKLOG;
+                frames.push(frame);
+                seq = seq.wrapping_add(1);
+            }
+        }
+        frames
+    }
+
+    /// ID SRS: SRS-FN-BLESESSION-015
+    /// Title: start_replay
+    ///
+    /// Description: VRConnect shall mark a stream as replaying and return its historical
+    ///              DataFrames with FLAG_BACKLOG set.  The stream's last_seq is advanced
+    ///              by the number of replay frames so that subsequent live frames have
+    ///              non-overlapping sequence numbers.
+    ///
+    /// Version: V1.0
+    ///
+    /// # Arguments
+    /// * `signal_id`     - IDT signal identifier
+    /// * `start_time_ms` - Replay start (epoch ms); 0 = replay all history
+    ///
+    /// # Returns
+    /// Vec of replay DataFrames (FLAG_BACKLOG set).  Empty if signal not subscribed
+    /// or no history available.
+    pub fn start_replay(&mut self, signal_id: u16, start_time_ms: u64) -> Vec<DataFrame> {
+        let stream_id = match self.signal_to_stream.get(&signal_id).copied() {
+            Some(id) => id,
+            None => return vec![],
+        };
+
+        let session_id = self.current_session_id;
+        let entry = match self.streams.get_mut(&stream_id) {
+            Some(e) => e,
+            None => return vec![],
+        };
+
+        let seq_start = entry.last_seq.wrapping_add(1);
+        entry.is_replaying = true;
+
+        // We need to read from history (immutable borrow) but we just mutably borrowed entry.
+        // Use a separate lookup after releasing the mutable borrow.
+        drop(entry);
+
+        let frames = self.get_replay_frames(signal_id, start_time_ms, session_id, stream_id, seq_start);
+
+        // Advance last_seq past all replay frames so live frames get unique seq numbers
+        if let Some(entry) = self.streams.get_mut(&stream_id) {
+            entry.last_seq = entry.last_seq.wrapping_add(frames.len() as u32);
+        }
+
+        frames
+    }
+
+    /// ID SRS: SRS-FN-BLESESSION-016
+    /// Title: finish_replay
+    ///
+    /// Description: VRConnect shall clear the is_replaying flag for a stream, signalling
+    ///              that the historical burst has been fully delivered.
+    ///              Subsequent live DATA_FRAMEs will no longer carry FLAG_BACKLOG.
+    ///
+    /// Version: V1.0
+    ///
+    /// # Arguments
+    /// * `stream_id` - IDT stream to mark as no longer replaying
+    pub fn finish_replay(&mut self, stream_id: u16) {
+        if let Some(entry) = self.streams.get_mut(&stream_id) {
+            entry.is_replaying = false;
+        }
     }
 
     /// ID SRS: SRS-FN-BLESESSION-008
@@ -791,30 +945,30 @@ mod tests {
     // ── FLAG_BACKLOG behaviour ─────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-017
-    /// Title: Test FLAG_BACKLOG is set when retransmit buffer is non-empty
+    /// Title: Test FLAG_BACKLOG is NOT set on normal live frames (DEV-5 removed)
     ///
-    /// Description: The first frame has an empty buffer → no BACKLOG flag.
-    ///              The second frame is sent while the first is still unacknowledged
-    ///              → BACKLOG flag must be set on the second frame.
+    /// Description: Since TODO-3 is now resolved, FLAG_BACKLOG must NOT be set on live
+    ///              DATA_FRAMEs when the stream is not in replay mode — even if the
+    ///              retransmit buffer is non-empty.  [DEV-5] behavior removed.
     #[test]
-    fn test_flag_backlog_set_when_buffer_non_empty() {
+    fn test_flag_backlog_not_set_on_live_frames() {
         let mut session = BleSessionState::new(1);
         session.subscribe(SignalId::HR.as_u16());
 
-        // First frame: buffer was empty at send time → no BACKLOG
+        // First live frame: no replay in progress → FLAG_BACKLOG must NOT be set
         let f1 = session.add_data(SignalId::HR.as_u16(), 70.0, 0).unwrap();
         assert_eq!(
             f1.header.flags & FLAG_BACKLOG,
             0,
-            "First frame: buffer empty → FLAG_BACKLOG must NOT be set"
+            "First live frame: no replay → FLAG_BACKLOG must NOT be set"
         );
 
-        // Second frame: first frame is still unacknowledged → BACKLOG
+        // Second live frame: buffer is non-empty but NOT replaying → FLAG_BACKLOG must NOT be set
         let f2 = session.add_data(SignalId::HR.as_u16(), 71.0, 1000).unwrap();
-        assert_ne!(
+        assert_eq!(
             f2.header.flags & FLAG_BACKLOG,
             0,
-            "Second frame: buffer non-empty → FLAG_BACKLOG must be set"
+            "Second live frame: not replaying → FLAG_BACKLOG must NOT be set (DEV-5 removed)"
         );
     }
 

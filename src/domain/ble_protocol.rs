@@ -805,6 +805,22 @@ impl InboundFrame {
 // TLV Subscribe parser — Flutter app wire format (non-IDT)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Parsed item from a Flutter TLV SUBSCRIBE_REQ.
+/// Decoded from the proprietary Flutter TLV format (byte[0]=0x20).
+///
+/// ID SRS: SRS-MOD-BLEPROTOCOL-014
+/// Version: V1.0
+#[derive(Debug, Clone, PartialEq)]
+pub struct TlvSubscribeItem {
+    /// IDT signal identifier (legacy simple ID from Flutter: 1=HR, 2=SpO2, 3=Temp)
+    pub signal_id: u16,
+    /// Subscribe mode: 0=LIVE_ONLY, 1=BACKLOG_THEN_LIVE, 2=BACKLOG_ONLY
+    pub mode: u8,
+    /// Replay start time (epoch ms). 0 = replay all available history.
+    /// Not present in the Flutter TLV format; always 0 for this path.
+    pub start_time_ms: u64,
+}
+
 /// ID SRS: SRS-MOD-BLEPROTOCOL-011
 /// Parse theTLV-based SUBSCRIBE_REQ (non-IDT format).
 ///
@@ -817,7 +833,21 @@ impl InboundFrame {
 ///   - signal_id located at item_base + 10 (LE u16, legacy simple IDs 1/2/3)
 ///
 /// Returns (req_id, signal_ids) on success, None if format is not recognized.
-pub fn parse_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<u16>)> {
+/// Parse a Flutter TLV SUBSCRIBE_REQ and return rich item data.
+///
+/// Returns `(req_id, items)` where each item carries `signal_id`, `mode`, and `start_time_ms`.
+/// The `mode` byte is at item_base + 15 in the nested TLV structure:
+///   item[0..3]   = tag(0x03) + len_u16_le(0x18 0x00)
+///   item[3..7]   = sub-TLV source_id  (tag=01, len=1, value)
+///   item[7..12]  = sub-TLV signal_id  (tag=02, len=2, value_u16_le)
+///   item[12..16] = sub-TLV mode       (tag=03, len=1, value)  ← mode at item_base+15
+///   item[16..23] = sub-TLV period_ms  (tag=04, len=4, value_u32_le)
+///   item[23..27] = sub-TLV batch_max  (tag=05, len=1, value)
+///
+/// `start_time_ms` is not present in the Flutter TLV format and is always 0 (replay all).
+///
+/// Returns None if the marker byte is wrong or no valid items are found.
+pub fn parse_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<TlvSubscribeItem>)> {
     // Byte[0] must be 0x20 (TLV SUBSCRIBE_CMD marker)
     if data.len() < 12 + 27 || data[0] != 0x20 {
         return None;
@@ -827,15 +857,21 @@ pub fn parse_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<u16>)> {
 
     // Scan items starting at offset 12
     let mut pos = 12;
-    let mut signal_ids = Vec::new();
+    let mut items = Vec::new();
 
     while pos + 27 <= data.len() {
         // Item header: tag=0x03, len_u16_le=24 (0x18 0x00)
         if data[pos] == 0x03 && data[pos + 1] == 0x18 && data[pos + 2] == 0x00 {
             // signal_id (LE u16) is at item_base + 10
             let signal_id = u16::from_le_bytes([data[pos + 10], data[pos + 11]]);
+            // mode byte is at item_base + 15 (value of sub-TLV tag=03)
+            let mode = if data[pos + 12] == 0x03 { data[pos + 15] } else { 0 };
             if signal_id > 0 {
-                signal_ids.push(signal_id);
+                items.push(TlvSubscribeItem {
+                    signal_id,
+                    mode,
+                    start_time_ms: 0, // Not present in Flutter TLV format; 0 = replay all
+                });
             }
             pos += 27; // 3 (item header) + 24 (item value)
         } else {
@@ -843,10 +879,10 @@ pub fn parse_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<u16>)> {
         }
     }
 
-    if signal_ids.is_empty() {
+    if items.is_empty() {
         None
     } else {
-        Some((req_id, signal_ids))
+        Some((req_id, items))
     }
 }
 
@@ -1494,13 +1530,19 @@ mod tests {
             .map(|s| u8::from_str_radix(s, 16).unwrap())
             .collect();
 
-        let (req_id, signal_ids) = parse_tlv_subscribe_req(&bytes).unwrap();
+        let (req_id, items) = parse_tlv_subscribe_req(&bytes).unwrap();
         assert_eq!(req_id, 0x002A); // 42 — from bytes[6..8] = 2A 00
-        assert_eq!(signal_ids.len(), 3);
+        assert_eq!(items.len(), 3);
         // Legacy simple IDs 1, 2, 3 (Flutter sends these, VRConnect normalizes them)
-        assert_eq!(signal_ids[0], 1);
-        assert_eq!(signal_ids[1], 2);
-        assert_eq!(signal_ids[2], 3);
+        assert_eq!(items[0].signal_id, 1);
+        assert_eq!(items[1].signal_id, 2);
+        assert_eq!(items[2].signal_id, 3);
+        // Flutter hex has mode=0x00 (LIVE_ONLY) in each item
+        assert_eq!(items[0].mode, 0);
+        assert_eq!(items[1].mode, 0);
+        assert_eq!(items[2].mode, 0);
+        // start_time_ms is always 0 for Flutter TLV path
+        assert_eq!(items[0].start_time_ms, 0);
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-033
@@ -1748,5 +1790,29 @@ mod tests {
         assert_eq!(r.normalize_id(1), None, "legacy id=1 must not resolve in empty registry");
         assert!(!r.contains_normalized(1),  "contains_normalized must be false in empty registry");
         assert_eq!(r.build_catalog().entries.len(), 0, "catalog from empty registry must be empty");
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-051
+    /// Title: parse_tlv_subscribe_req returns mode and start_time_ms
+    ///
+    /// Description: Items parsed from Flutter TLV shall carry mode=0 (LIVE) and
+    ///              start_time_ms=0 for the standard Flutter hex payload.
+    #[test]
+    fn test_parse_tlv_subscribe_req_returns_mode() {
+        let hex = "20 3F 00 01 02 00 2A 00 02 01 00 02 \
+                   03 18 00 01 01 00 01 02 02 00 01 00 03 01 00 00 04 04 00 00 00 00 00 05 01 00 01 \
+                   03 18 00 01 01 00 01 02 02 00 02 00 03 01 00 00 04 04 00 00 00 00 00 05 01 00 01 \
+                   03 18 00 01 01 00 01 02 02 00 03 00 03 01 00 01 04 04 00 00 00 00 00 05 01 00 01";
+        let bytes: Vec<u8> = hex
+            .split_whitespace()
+            .map(|s| u8::from_str_radix(s, 16).unwrap())
+            .collect();
+
+        let (req_id, items) = parse_tlv_subscribe_req(&bytes).unwrap();
+        assert_eq!(req_id, 0x002A);
+        assert_eq!(items[0].mode, 0); // first two items: LIVE
+        assert_eq!(items[1].mode, 0);
+        assert_eq!(items[2].mode, 1); // third item patched to mode=1 (BACKLOG_THEN_LIVE)
+        assert_eq!(items[0].start_time_ms, 0);
     }
 }
