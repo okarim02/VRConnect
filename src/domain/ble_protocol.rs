@@ -352,6 +352,50 @@ impl AckFrame {
         })
     }
 
+    /// Deserialize from a Flutter custom ACK (17 bytes, no IDT magic) — [DEV-2].
+    ///
+    /// Flutter's `sendAck()` wire format:
+    /// ```text
+    /// [session_id(2b LE)] [stream_id(2b LE)] [ack_upto(4b LE)] [bitmap_len(1b)] [bitmap(8b)]
+    /// ```
+    /// Total = 17 bytes. No IDT magic, no CRC.
+    ///
+    /// Returns `None` if the buffer is too short or accidentally has IDT magic
+    /// (in which case `from_ble_bytes` should be used instead).
+    ///
+    /// ID SRS: SRS-FN-BLEPROTOCOL-014
+    /// Version: V1.0
+    pub fn from_flutter_bytes(b: &[u8]) -> Option<Self> {
+        const FLUTTER_LEN: usize = 17;
+        const FLUTTER_MIN: usize = 9; // session(2)+stream(2)+ack_upto(4)+bitmap_len(1)
+        if b.len() < FLUTTER_MIN {
+            return None;
+        }
+        // Guard: must not have IDT magic — if it does, use from_ble_bytes instead
+        if has_idt_magic(b) {
+            return None;
+        }
+        let session_id = u16::from_le_bytes([b[0], b[1]]);
+        let stream_id  = u16::from_le_bytes([b[2], b[3]]);
+        let ack_upto   = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+        let bitmap_len = b[8] as usize;
+        let mut bitmap = [0u8; 8];
+        let available  = b.len().saturating_sub(9);
+        let copy_len   = bitmap_len.min(8).min(available);
+        if copy_len > 0 {
+            bitmap[..copy_len].copy_from_slice(&b[9..9 + copy_len]);
+        }
+        // Warn if the frame is shorter than the canonical 17 bytes
+        if b.len() < FLUTTER_LEN {
+            log::debug!(
+                "Flutter ACK: short frame ({} bytes, expected {}), bitmap may be incomplete",
+                b.len(),
+                FLUTTER_LEN
+            );
+        }
+        Some(Self { session_id, stream_id, ack_upto, bitmap })
+    }
+
     /// Returns true if `seq` is acknowledged — either cumulatively (seq ≤ ack_upto)
     /// or selectively (bit set in bitmap for seq in [ack_upto+1 .. ack_upto+64]).
     pub fn is_acked(&self, seq: u32) -> bool {
@@ -927,6 +971,62 @@ impl SignalRegistry {
             })
             .collect();
         Catalog { entries }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// parse_tlv_subscribe_req — Flutter TLV SUBSCRIBE_REQ fallback parser
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parse a Flutter-custom TLV SUBSCRIBE_REQ (byte[0]=0x20, no IDT magic).
+///
+/// Flutter sends this format instead of an IDT-framed SUBSCRIBE_REQ:
+/// ```text
+/// [marker=0x20(1b)] [total_len(2b LE)] [version(1b)] [flags/op(2b)] [req_id(2b LE)] [n(1b)]
+/// [items: n × { tag=0x03(1b) len=24(2b LE) [nested TLVs] }]
+/// ```
+/// Each item contains a 2-byte LE signal_id at item_base+10 (inside the nested TLV).
+///
+/// Returns `Some((req_id, signal_ids))` on success, `None` if the frame is not a valid
+/// Flutter TLV subscribe (wrong marker, too short, or all signal_ids are zero).
+///
+/// [DEV-3] cross-reference: Flutter sends this format; IDT spec requires a full
+/// IDT-framed SUBSCRIBE_REQ. Both are accepted; TLV is tried as fallback.
+///
+/// ID SRS: SRS-FN-BLEPROTOCOL-013
+/// Version: V1.0
+pub fn parse_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<u16>)> {
+    // Byte[0] must be 0x20 (TLV SUBSCRIBE_CMD marker); minimum: 9-byte header + 1 item (27b)
+    // Minimum: 8-byte header + at least one 27-byte item
+    if data.len() < 8 + 27 || data[0] != 0x20 {
+        return None;
+    }
+
+    let req_id = u16::from_le_bytes([data[6], data[7]]);
+
+    // Items start immediately after the 8-byte header:
+    // marker(1) + total_len(2) + version(1) + flags(2) + req_id(2) = 8 bytes
+    let mut pos = 8;
+    let mut signal_ids = Vec::new();
+
+    while pos + 27 <= data.len() {
+        // Each item: tag=0x03, len_u16_le=24 (0x18 0x00)
+        if data[pos] == 0x03 && data[pos + 1] == 0x18 && data[pos + 2] == 0x00 {
+            // signal_id (LE u16) is at item_base + 10 (inside nested TLV tag=2, len=2)
+            let signal_id = u16::from_le_bytes([data[pos + 10], data[pos + 11]]);
+            if signal_id > 0 {
+                signal_ids.push(signal_id);
+            }
+            pos += 27; // 3 (item tag+len) + 24 (item value)
+        } else {
+            break;
+        }
+    }
+
+    if signal_ids.is_empty() {
+        None
+    } else {
+        Some((req_id, signal_ids))
     }
 }
 
@@ -1654,6 +1754,56 @@ mod tests {
         assert_eq!(r.normalize_id(1), None, "legacy id=1 must not resolve in empty registry");
         assert!(!r.contains_normalized(1),  "contains_normalized must be false in empty registry");
         assert_eq!(r.build_catalog().entries.len(), 0, "catalog from empty registry must be empty");
+    }
+
+    // ── parse_tlv_subscribe_req ───────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-020
+    /// parse_tlv_subscribe_req parses the exact 89-byte payload captured from the Flutter app
+    #[test]
+    fn test_parse_tlv_subscribe_req_real_flutter_bytes() {
+        let bytes: Vec<u8> = vec![
+            0x20, 0x56, 0x00, 0x01, 0x02, 0x00, 0x2A, 0x00, // header (8b)
+            0x03, 0x18, 0x00, // item 1 tag+len
+            0x01, 0x01, 0x00, 0x01, // nested TLV: source_id=1
+            0x02, 0x02, 0x00, 0x01, 0x00, // nested TLV: signal_id=1 (HR)
+            0x03, 0x01, 0x00, 0x00, // nested TLV: mode=0
+            0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, // nested TLV: period_ms=0
+            0x05, 0x01, 0x00, 0x01, // nested TLV: batch_max=1
+            0x03, 0x18, 0x00, // item 2 tag+len
+            0x01, 0x01, 0x00, 0x01,
+            0x02, 0x02, 0x00, 0x02, 0x00, // signal_id=2 (SpO2)
+            0x03, 0x01, 0x00, 0x00,
+            0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x05, 0x01, 0x00, 0x01,
+            0x03, 0x18, 0x00, // item 3 tag+len
+            0x01, 0x01, 0x00, 0x01,
+            0x02, 0x02, 0x00, 0x03, 0x00, // signal_id=3 (Temperature)
+            0x03, 0x01, 0x00, 0x00,
+            0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x05, 0x01, 0x00, 0x01,
+        ];
+        assert_eq!(bytes.len(), 89);
+        let (req_id, signal_ids) = parse_tlv_subscribe_req(&bytes).unwrap();
+        assert_eq!(req_id, 42);
+        assert_eq!(signal_ids, vec![1u16, 2u16, 3u16]);
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-021
+    /// parse_tlv_subscribe_req returns None for wrong marker byte
+    #[test]
+    fn test_parse_tlv_subscribe_req_wrong_marker() {
+        let mut bytes = vec![0u8; 8 + 27];
+        bytes[0] = 0x7A; // not 0x20
+        assert!(parse_tlv_subscribe_req(&bytes).is_none());
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-022
+    /// parse_tlv_subscribe_req returns None for a buffer that is too short
+    #[test]
+    fn test_parse_tlv_subscribe_req_too_short() {
+        let bytes = vec![0x20u8; 30]; // 8 + 22 < 8 + 27
+        assert!(parse_tlv_subscribe_req(&bytes).is_none());
     }
 
 }

@@ -16,8 +16,9 @@
 // - Unsubscribe (0x90b1): Write  - SUBSCRIBE_REQ with op=UNSUBSCRIBE, or legacy 2b fallback
 
 use crate::domain::ble_protocol::{
-    has_idt_magic, AckFrame, Catalog, InboundFrame, SignalId, SignalRegistry, SubscribeReq,
-    SubscribeRsp, SubscribeRspItem, SUB_OP_SUBSCRIBE, SUB_OP_UNSUBSCRIBE,
+    has_idt_magic, parse_tlv_subscribe_req, AckFrame, Catalog, InboundFrame, SignalId,
+    SignalRegistry, SubscribeReq, SubscribeRsp, SubscribeRspItem, SUB_OP_SUBSCRIBE,
+    SUB_OP_UNSUBSCRIBE,
 };
 use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};
@@ -300,11 +301,49 @@ impl ReliableBleOutput {
                             }
                         }
                         _ => {
-                            log::warn!(
-                                "Data_IN: unrecognized payload ({} bytes, byte[0]=0x{:02X}) — discarded",
-                                data.len(),
-                                data.first().copied().unwrap_or(0)
-                            );
+                            // [DEV-2] Flutter sends a custom 17-byte ACK without IDT magic.
+                            // Try Flutter ACK fallback before giving up.
+                            if let Some(ack) = AckFrame::from_flutter_bytes(data) {
+                                log::debug!(
+                                    "Flutter ACK: stream={}, ack_upto={}, bitmap={:02X?}",
+                                    ack.stream_id,
+                                    ack.ack_upto,
+                                    ack.bitmap
+                                );
+                                let retransmits = {
+                                    let mut st = state.write().await;
+                                    st.handle_ack_with_bitmap(
+                                        ack.session_id,
+                                        ack.stream_id,
+                                        ack.ack_upto,
+                                        &ack.bitmap,
+                                    )
+                                };
+                                if !retransmits.is_empty() {
+                                    let srv = server.read().await;
+                                    for frame in retransmits {
+                                        let bytes = frame.to_ble_bytes();
+                                        if let Err(e) = srv.notify("Data_OUT", &bytes).await {
+                                            log::warn!(
+                                                "Retransmit failed for seq {}: {}",
+                                                frame.header.seq,
+                                                e
+                                            );
+                                        } else {
+                                            log::debug!(
+                                                "Retransmitted seq {} (Flutter ACK-triggered)",
+                                                frame.header.seq
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                log::warn!(
+                                    "Data_IN: unrecognized payload ({} bytes, byte[0]=0x{:02X}) — discarded",
+                                    data.len(),
+                                    data.first().copied().unwrap_or(0)
+                                );
+                            }
                         }
                     }
                 }
@@ -332,10 +371,20 @@ impl ReliableBleOutput {
                                 data.get(3).copied().unwrap_or(0)
                             );
                         }
+                    } else if let Some((req_id, signal_ids)) = parse_tlv_subscribe_req(data) {
+                        // [DEV-3] Flutter central sends a custom TLV format (byte[0]=0x20)
+                        // instead of an IDT-framed SUBSCRIBE_REQ. Accept as fallback.
+                        log::info!(
+                            "Subscribe: Flutter TLV format detected — req_id={}, signals={:?}",
+                            req_id,
+                            signal_ids
+                        );
+                        Self::handle_tlv_subscribe(req_id, signal_ids, &state, &server, &registry)
+                            .await;
                     } else {
                         log::warn!(
                             "Subscribe: unrecognized format ({} bytes, byte[0]=0x{:02X}) — \
-                             expected IDT frame (magic=0xD17A), discarded",
+                             expected IDT frame (magic=0xD17A) or Flutter TLV (marker=0x20), discarded",
                             data.len(),
                             data.first().copied().unwrap_or(0)
                         );
@@ -573,6 +622,97 @@ impl ReliableBleOutput {
                     );
                 }
             }
+        }
+    }
+
+    /// Handle a Flutter TLV SUBSCRIBE_REQ (byte[0]=0x20, [DEV-3]).
+    ///
+    /// Normalizes legacy signal IDs (1/2/3) to IDT compound IDs via the registry,
+    /// assigns stream IDs matching the raw signal ID (HR=1, SpO2=2, Temp=3) so Flutter's
+    /// hardcoded `activeStreams` map aligns, then sends SUBSCRIBE_RSP on Data_OUT.
+    ///
+    /// A 300 ms delay before the RSP notify is required because the Flutter app enables
+    /// CCCD *after* writing to the Subscribe characteristic [DEV-4].
+    async fn handle_tlv_subscribe(
+        req_id: u16,
+        signal_ids: Vec<u16>,
+        state: &Arc<RwLock<BleSessionState>>,
+        server: &Arc<RwLock<GattServer>>,
+        registry: &Arc<SignalRegistry>,
+    ) {
+        let session_id = state.read().await.current_session_id;
+        let mut rsp_items: Vec<SubscribeRspItem> = Vec::new();
+
+        {
+            let mut st = state.write().await;
+            for raw_id in &signal_ids {
+                let canonical_id = match registry.normalize_id(*raw_id) {
+                    Some(id) => id,
+                    None => {
+                        log::warn!(
+                            "TLV SUBSCRIBE: unknown signal_id 0x{:04X} — not in registry, rejected",
+                            raw_id
+                        );
+                        continue;
+                    }
+                };
+                if canonical_id != *raw_id {
+                    log::info!(
+                        "TLV Signal ID: app sent 0x{:04X} → normalized to 0x{:04X} (legacy→IDT)",
+                        raw_id,
+                        canonical_id
+                    );
+                }
+                // Flutter expects stream IDs 1/2/3 matching the raw signal ID (legacy).
+                // Use subscribe_with_stream_id so DATA_FRAMEs go to the right stream.
+                let stream_id = st.subscribe_with_stream_id(canonical_id, *raw_id);
+                let meta = registry.get(canonical_id).unwrap();
+                // RSP stream_id encoded as-is (Flutter ignores SUBSCRIBE_RSP per DEV-4/FLUTTER_COMPAT §4).
+                // Future IDT-compliant clients will read it correctly in LE.
+                rsp_items.push(SubscribeRspItem {
+                    source_id: meta.source_id,
+                    signal_id: canonical_id,
+                    stream_id,
+                    effective_period_ms: meta.nominal_period_ms,
+                    effective_batch_max: 1,
+                });
+                log::info!(
+                    "TLV SUBSCRIBE: signal 0x{:04X} → stream {}",
+                    canonical_id,
+                    stream_id
+                );
+            }
+        }
+
+        if rsp_items.is_empty() {
+            return;
+        }
+
+        // [DEV-4] Delay before RSP so Flutter has time to enable CCCD after the Write.
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        let rsp = SubscribeRsp {
+            session_id,
+            req_id,
+            status: 0,
+            results: rsp_items,
+        };
+        let bytes = rsp.to_ble_bytes();
+        let srv = server.read().await;
+        if let Err(e) = srv.notify("Data_OUT", &bytes).await {
+            log::warn!("Failed to send TLV SUBSCRIBE_RSP on Data_OUT: {}", e);
+        } else {
+            log::info!(
+                "TLV SUBSCRIBE_RSP sent on Data_OUT ({} bytes, req_id={})",
+                bytes.len(),
+                req_id
+            );
+        }
+        if let Err(e) = srv.notify("Control", &bytes).await {
+            log::debug!(
+                "TLV SUBSCRIBE_RSP on Control: {} (client may not be subscribed)",
+                e
+            );
         }
     }
 
