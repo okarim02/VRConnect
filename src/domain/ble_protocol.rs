@@ -28,7 +28,7 @@ pub const IDT_VERSION: u8 = 0x01;
 // msg_type constants
 pub const MSG_SUBSCRIBE_REQ: u8 = 0x01;
 pub const MSG_SUBSCRIBE_RSP: u8 = 0x02;
-pub const MSG_DATA_FRAME: u8 = 0x10;
+pub const MSG_DATA_FRAME: u8 = 0x00; // Flutter/MyPredi Central expects 0x00 (simulator reference)
 pub const MSG_ACK_FRAME: u8 = 0x20;
 pub const MSG_NACK_FRAME: u8 = 0x21;
 
@@ -396,6 +396,54 @@ impl AckFrame {
         Some(Self { session_id, stream_id, ack_upto, bitmap })
     }
 
+    /// Parse MyPredi ACK format: IDT-like 24-byte header + 17-byte payload + CRC32C = 45 bytes.
+    ///
+    /// MyPredi uses the same 24-byte header structure for all frames (including ACK),
+    /// unlike the IDT spec which uses a 13-byte header for ACK_FRAME.
+    ///
+    /// Wire layout:
+    /// ```text
+    /// [0..2]   magic=0xD17A  [2] version  [3] msgType=0x20  [4] flags
+    /// [5..7]   sessionId     [7..9] streamId  [9..13] seq=ackBase
+    /// [13..21] t0ms          [21] count=0  [22..24] payloadLen=17
+    /// [24..26] sessionId (payload)  [26..28] streamId (payload)
+    /// [28..32] ackBase       [32] bitmapLen=8  [33..41] bitmap
+    /// [41..45] CRC32C
+    /// ```
+    pub fn from_mypredi_bytes(b: &[u8]) -> Option<Self> {
+        const HEADER_LEN: usize = 24;
+        const PAYLOAD_LEN: usize = 17; // sessionId(2)+streamId(2)+ackBase(4)+bitmapLen(1)+bitmap(8)
+        const CRC_LEN: usize = 4;
+        const TOTAL: usize = HEADER_LEN + PAYLOAD_LEN + CRC_LEN; // 45
+
+        if b.len() < TOTAL { return None; }
+        if !has_idt_magic(b) { return None; }
+        if b[3] != MSG_ACK_FRAME { return None; }
+
+        // Verify CRC32C over everything except the trailing 4-byte CRC
+        let crc_offset = b.len() - CRC_LEN;
+        let expected = crc32c::crc32c(&b[..crc_offset]);
+        let actual = u32::from_le_bytes(b[crc_offset..crc_offset + 4].try_into().ok()?);
+        if expected != actual {
+            log::debug!("MyPredi ACK: CRC32C mismatch — ignored");
+            return None;
+        }
+
+        // Parse payload at offset 24
+        let p = HEADER_LEN;
+        let session_id = u16::from_le_bytes([b[p],     b[p + 1]]);
+        let stream_id  = u16::from_le_bytes([b[p + 2], b[p + 3]]);
+        let ack_upto   = u32::from_le_bytes([b[p + 4], b[p + 5], b[p + 6], b[p + 7]]);
+        let bitmap_len = b[p + 8] as usize;
+        let mut bitmap = [0u8; 8];
+        let copy_len = bitmap_len.min(8).min(b.len().saturating_sub(p + 9));
+        if copy_len > 0 {
+            bitmap[..copy_len].copy_from_slice(&b[p + 9..p + 9 + copy_len]);
+        }
+
+        Some(Self { session_id, stream_id, ack_upto, bitmap })
+    }
+
     /// Returns true if `seq` is acknowledged — either cumulatively (seq ≤ ack_upto)
     /// or selectively (bit set in bitmap for seq in [ack_upto+1 .. ack_upto+64]).
     pub fn is_acked(&self, seq: u32) -> bool {
@@ -724,6 +772,53 @@ impl SubscribeRsp {
         let crc = crc32c::crc32c(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
         buf
+    }
+
+    /// Serialize to the TLV format expected by the Flutter/MyPredi Central app.
+    ///
+    /// Wire format (mirrors `buildSubscribeRsp()` in the Flutter peripheral simulator):
+    /// ```
+    /// tlv(0x21, [
+    ///   tlv(0x01, req_id_2b_le),
+    ///   tlv(0x02, [status]),
+    ///   tlv(0x03, [                    ← one per stream
+    ///     tlv(0x01, stream_id_2b_le),
+    ///     tlv(0x02, [source_id]),
+    ///     tlv(0x03, signal_id_2b_le),  ← simple ID (1/2/3), not compound
+    ///     tlv(0x04, period_ms_4b_le),
+    ///     tlv(0x05, [batch_max]),
+    ///   ]),
+    ///   ...
+    /// ])
+    /// ```
+    /// Each TLV field is encoded as `[type(1b), len_lo(1b), len_hi(1b), ...value]`.
+    /// Signal IDs are simple (1, 2, 3) — lower byte of the compound IDT ID (0x0101 → 0x01).
+    pub fn to_flutter_tlv_bytes(&self) -> Vec<u8> {
+        fn tlv(t: u8, value: &[u8]) -> Vec<u8> {
+            let len = value.len();
+            let mut out = vec![t, (len & 0xFF) as u8, ((len >> 8) & 0xFF) as u8];
+            out.extend_from_slice(value);
+            out
+        }
+
+        let mut payload: Vec<u8> = Vec::new();
+
+        payload.extend(tlv(0x01, &self.req_id.to_le_bytes()));
+        payload.extend(tlv(0x02, &[self.status]));
+
+        for r in &self.results {
+            let mut sp: Vec<u8> = Vec::new();
+            sp.extend(tlv(0x01, &r.stream_id.to_le_bytes()));
+            sp.extend(tlv(0x02, &[r.source_id]));
+            // Simple signal ID: lower byte of compound IDT ID (0x0101→1, 0x0102→2, 0x0103→3)
+            let simple_id: u16 = r.signal_id & 0x00FF;
+            sp.extend(tlv(0x03, &simple_id.to_le_bytes()));
+            sp.extend(tlv(0x04, &r.effective_period_ms.to_le_bytes()));
+            sp.extend(tlv(0x05, &[r.effective_batch_max]));
+            payload.extend(tlv(0x03, &sp));
+        }
+
+        tlv(0x21, &payload)
     }
 }
 

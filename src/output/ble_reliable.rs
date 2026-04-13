@@ -18,7 +18,7 @@
 use crate::domain::ble_protocol::{
     has_idt_magic, parse_tlv_subscribe_req, AckFrame, Catalog, InboundFrame, SignalId,
     SignalRegistry, SubscribeReq, SubscribeRsp, SubscribeRspItem, SUB_OP_SUBSCRIBE,
-    SUB_OP_UNSUBSCRIBE,
+    SUB_OP_UNSUBSCRIBE, MSG_SUBSCRIBE_REQ,
 };
 use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};
@@ -301,9 +301,45 @@ impl ReliableBleOutput {
                             }
                         }
                         _ => {
-                            // [DEV-2] Flutter sends a custom 17-byte ACK without IDT magic.
-                            // Try Flutter ACK fallback before giving up.
-                            if let Some(ack) = AckFrame::from_flutter_bytes(data) {
+                            // [DEV-5] MyPredi sends ACK with a 24-byte header (not IDT 13b):
+                            // magic+header(24b)+payload(17b)+CRC32C(4b) = 45 bytes total.
+                            // Try MyPredi format first, then legacy Flutter 17-byte fallback.
+                            if let Some(ack) = AckFrame::from_mypredi_bytes(data) {
+                                log::info!(
+                                    "MyPredi ACK: stream={}, ack_upto={}, bitmap={:02X?}",
+                                    ack.stream_id,
+                                    ack.ack_upto,
+                                    ack.bitmap
+                                );
+                                let retransmits = {
+                                    let mut st = state.write().await;
+                                    st.handle_ack_with_bitmap(
+                                        ack.session_id,
+                                        ack.stream_id,
+                                        ack.ack_upto,
+                                        &ack.bitmap,
+                                    )
+                                };
+                                if !retransmits.is_empty() {
+                                    let srv = server.read().await;
+                                    for frame in retransmits {
+                                        let bytes = frame.to_ble_bytes();
+                                        if let Err(e) = srv.notify("Data_OUT", &bytes).await {
+                                            log::warn!(
+                                                "Retransmit failed for seq {}: {}",
+                                                frame.header.seq,
+                                                e
+                                            );
+                                        } else {
+                                            log::info!(
+                                                "--> RETRANSMITTED seq {} for stream {}",
+                                                frame.header.seq,
+                                                frame.header.stream_id
+                                            );
+                                        }
+                                    }
+                                }
+                            } else if let Some(ack) = AckFrame::from_flutter_bytes(data) {
                                 log::debug!(
                                     "Flutter ACK: stream={}, ack_upto={}, bitmap={:02X?}",
                                     ack.stream_id,
@@ -363,7 +399,37 @@ impl ReliableBleOutput {
                         if let Some(InboundFrame::SubscribeReq(req)) =
                             InboundFrame::from_ble_bytes(data)
                         {
+                            // IDT strict: 13-byte header + binary items
                             Self::handle_subscribe_req(req, &state, &server, &registry).await;
+                        } else if data.get(3).copied() == Some(MSG_SUBSCRIBE_REQ)
+                            && data.len() > 28
+                        {
+                            // [DEV-5] MyPredi format: 24-byte header + TLV payload + CRC32C.
+                            // TLV payload starts at offset 24; CRC is the last 4 bytes.
+                            let tlv_payload = &data[24..data.len().saturating_sub(4)];
+                            if let Some((req_id, signal_ids)) =
+                                parse_tlv_subscribe_req(tlv_payload)
+                            {
+                                log::info!(
+                                    "Subscribe: MyPredi format — req_id={}, signals={:?}",
+                                    req_id,
+                                    signal_ids
+                                );
+                                Self::handle_tlv_subscribe(
+                                    req_id,
+                                    signal_ids,
+                                    &state,
+                                    &server,
+                                    &registry,
+                                )
+                                .await;
+                            } else {
+                                log::warn!(
+                                    "Subscribe: MyPredi header OK but TLV payload invalid \
+                                     ({} bytes) — discarded",
+                                    tlv_payload.len()
+                                );
+                            }
                         } else {
                             log::warn!(
                                 "Subscribe: IDT magic present but not a valid SUBSCRIBE_REQ \
@@ -548,7 +614,8 @@ impl ReliableBleOutput {
         }
 
         // Send SUBSCRIBE_RSP for SUBSCRIBE op with allocated streams.
-        // Notify on both Data_OUT (per IDT spec) and Control (per I.pdf / legacy clients).
+        // - IDT binary on Data_OUT (for future IDT-compliant Central)
+        // - Flutter TLV (0x21) on Control — MyPredi listens here and expects this format
         if req.op == SUB_OP_SUBSCRIBE && !rsp_items.is_empty() {
             let rsp = SubscribeRsp {
                 session_id,
@@ -556,25 +623,30 @@ impl ReliableBleOutput {
                 status: 0, // 0 = OK
                 results: rsp_items,
             };
-            let bytes = rsp.to_ble_bytes();
+            let idt_bytes = rsp.to_ble_bytes();
+            let tlv_bytes = rsp.to_flutter_tlv_bytes();
             let srv = server.read().await;
-            if let Err(e) = srv.notify("Data_OUT", &bytes).await {
+            if let Err(e) = srv.notify("Data_OUT", &idt_bytes).await {
                 log::warn!("Failed to send SUBSCRIBE_RSP on Data_OUT: {}", e);
             } else {
                 log::info!(
                     "SUBSCRIBE_RSP sent on Data_OUT ({} bytes, req_id={})",
-                    bytes.len(),
+                    idt_bytes.len(),
                     req_id
                 );
             }
-            // Also send on Control char — some older Central implementations listen here
-            if let Err(e) = srv.notify("Control", &bytes).await {
+            // Flutter/MyPredi Central listens on Control (90b0) and expects TLV 0x21 format
+            if let Err(e) = srv.notify("Control", &tlv_bytes).await {
                 log::debug!(
-                    "SUBSCRIBE_RSP on Control: {} (client may not be subscribed)",
+                    "SUBSCRIBE_RSP TLV on Control: {} (client may not be subscribed)",
                     e
                 );
             } else {
-                log::info!("SUBSCRIBE_RSP also sent on Control ({} bytes)", bytes.len());
+                log::info!(
+                    "SUBSCRIBE_RSP TLV sent on Control ({} bytes, req_id={})",
+                    tlv_bytes.len(),
+                    req_id
+                );
             }
         }
 
@@ -697,21 +769,29 @@ impl ReliableBleOutput {
             status: 0,
             results: rsp_items,
         };
-        let bytes = rsp.to_ble_bytes();
+        let idt_bytes = rsp.to_ble_bytes();
+        let tlv_bytes = rsp.to_flutter_tlv_bytes();
         let srv = server.read().await;
-        if let Err(e) = srv.notify("Data_OUT", &bytes).await {
+        if let Err(e) = srv.notify("Data_OUT", &idt_bytes).await {
             log::warn!("Failed to send TLV SUBSCRIBE_RSP on Data_OUT: {}", e);
         } else {
             log::info!(
                 "TLV SUBSCRIBE_RSP sent on Data_OUT ({} bytes, req_id={})",
-                bytes.len(),
+                idt_bytes.len(),
                 req_id
             );
         }
-        if let Err(e) = srv.notify("Control", &bytes).await {
+        // Flutter/MyPredi Central expects TLV 0x21 format on Control (90b0)
+        if let Err(e) = srv.notify("Control", &tlv_bytes).await {
             log::debug!(
                 "TLV SUBSCRIBE_RSP on Control: {} (client may not be subscribed)",
                 e
+            );
+        } else {
+            log::info!(
+                "TLV SUBSCRIBE_RSP sent on Control ({} bytes, req_id={})",
+                tlv_bytes.len(),
+                req_id
             );
         }
     }
