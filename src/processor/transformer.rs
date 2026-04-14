@@ -140,7 +140,12 @@ impl VitalDataTransformer {
 
         let timestamp = record
             .get_effective_timestamp()
-            .and_then(|ts| Utc.timestamp_millis_opt(ts).single())
+            .and_then(|ts| {
+                // VitalRecorder sends "dt" in seconds (10 digits, e.g. 1776153853).
+                // Flutter simulators send in milliseconds (13 digits, e.g. 1776090179422).
+                let ts_ms = if ts < 10_000_000_000 { ts * 1000 } else { ts };
+                Utc.timestamp_millis_opt(ts_ms).single()
+            })
             .unwrap_or_else(Utc::now);
 
         ProcessedTrack {
