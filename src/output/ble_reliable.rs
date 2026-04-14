@@ -614,8 +614,8 @@ impl ReliableBleOutput {
         }
 
         // Send SUBSCRIBE_RSP for SUBSCRIBE op with allocated streams.
-        // - IDT binary on Data_OUT (for future IDT-compliant Central)
-        // - Flutter TLV (0x21) on Control — MyPredi listens here and expects this format
+        // - TLV 0x21 on Control (90b0) only — MyPredi listens here, ignores RSP content
+        // - Data_OUT is intentionally skipped: MyPredi treats all Data_OUT frames as DATA_FRAMEs [DEV-5]
         if req.op == SUB_OP_SUBSCRIBE && !rsp_items.is_empty() {
             let rsp = SubscribeRsp {
                 session_id,
@@ -623,18 +623,11 @@ impl ReliableBleOutput {
                 status: 0, // 0 = OK
                 results: rsp_items,
             };
-            let idt_bytes = rsp.to_ble_bytes();
             let tlv_bytes = rsp.to_flutter_tlv_bytes();
             let srv = server.read().await;
-            if let Err(e) = srv.notify("Data_OUT", &idt_bytes).await {
-                log::warn!("Failed to send SUBSCRIBE_RSP on Data_OUT: {}", e);
-            } else {
-                log::info!(
-                    "SUBSCRIBE_RSP sent on Data_OUT ({} bytes, req_id={})",
-                    idt_bytes.len(),
-                    req_id
-                );
-            }
+            // NOTE: Do NOT notify Data_OUT with SUBSCRIBE_RSP — MyPredi's _processBuffer
+            // reads ALL Data_OUT notifications as DATA_FRAMEs; sending RSP there corrupts
+            // its frame buffer (reads period_ms bytes as payloadLen → "Bad Magic"). [DEV-5]
             // Flutter/MyPredi Central listens on Control (90b0) and expects TLV 0x21 format
             if let Err(e) = srv.notify("Control", &tlv_bytes).await {
                 log::debug!(
@@ -769,18 +762,11 @@ impl ReliableBleOutput {
             status: 0,
             results: rsp_items,
         };
-        let idt_bytes = rsp.to_ble_bytes();
         let tlv_bytes = rsp.to_flutter_tlv_bytes();
         let srv = server.read().await;
-        if let Err(e) = srv.notify("Data_OUT", &idt_bytes).await {
-            log::warn!("Failed to send TLV SUBSCRIBE_RSP on Data_OUT: {}", e);
-        } else {
-            log::info!(
-                "TLV SUBSCRIBE_RSP sent on Data_OUT ({} bytes, req_id={})",
-                idt_bytes.len(),
-                req_id
-            );
-        }
+        // NOTE: Do NOT notify Data_OUT with SUBSCRIBE_RSP — MyPredi's _processBuffer
+        // reads ALL Data_OUT notifications as DATA_FRAMEs; sending RSP there corrupts
+        // its frame buffer (reads period_ms bytes as payloadLen → "Bad Magic"). [DEV-5]
         // Flutter/MyPredi Central expects TLV 0x21 format on Control (90b0)
         if let Err(e) = srv.notify("Control", &tlv_bytes).await {
             log::debug!(

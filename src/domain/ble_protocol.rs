@@ -28,7 +28,7 @@ pub const IDT_VERSION: u8 = 0x01;
 // msg_type constants
 pub const MSG_SUBSCRIBE_REQ: u8 = 0x01;
 pub const MSG_SUBSCRIBE_RSP: u8 = 0x02;
-pub const MSG_DATA_FRAME: u8 = 0x00; // Flutter/MyPredi Central expects 0x00 (simulator reference)
+pub const MSG_DATA_FRAME: u8 = 0x10; // IDT v1.1 DATA_FRAME msg_type (MyPredi does not check this field)
 pub const MSG_ACK_FRAME: u8 = 0x20;
 pub const MSG_NACK_FRAME: u8 = 0x21;
 
