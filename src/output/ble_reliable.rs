@@ -673,7 +673,13 @@ impl ReliableBleOutput {
                             frame.header.seq,
                             e
                         );
+                        // Stop replay on first notify failure (device likely disconnected)
+                        break;
                     }
+                    // Rate-limit replay to ~50 frames/s (20 ms inter-frame gap).
+                    // Without this, a full 3600-frame backlog floods the BLE stack
+                    // (~367 KB burst) causing Android to drop the connection. [DEV-6]
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
                 }
             }
             {
