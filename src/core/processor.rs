@@ -217,12 +217,17 @@ impl VitalProcessor {
         }
 
         // Start Socket.IO input server
-        let socketio_server = SocketIOServer::new(
+        let mut socketio_server = SocketIOServer::new(
             self.config.socketio_host.clone(),
             self.config.socketio_port,
             self.config.debug_enabled,
             self.debug_file.clone(),
         );
+
+        // Wire health hooks when BLE is active so sio_connected is tracked.
+        if let Some(ref ble) = ble_output {
+            socketio_server.set_health_hooks(ble.health_state(), ble.health_notify());
+        }
 
         let input_task = tokio::spawn(async move {
             if let Err(e) = socketio_server.start(tx).await {

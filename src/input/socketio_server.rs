@@ -5,6 +5,7 @@
 use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};
 use crate::input::decompressor::VitalDataDecompressor;
+use crate::output::health::GateHealthState;
 use crate::processor::{VitalDataCleaner, VitalDataTransformer};
 use futures_util::{SinkExt, StreamExt};
 use std::fs::File;
@@ -12,7 +13,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Notify, RwLock};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 /// ID SRS: SRS-MOD-SOCKETIO-001
@@ -30,6 +31,10 @@ pub struct SocketIOServer {
     decompressor: VitalDataDecompressor,
     cleaner: VitalDataCleaner,
     transformer: VitalDataTransformer,
+    /// Optional health hooks — wired up by processor.rs when BLE is enabled.
+    /// sio_connected is set true on connect, false on disconnect; notify fires immediately.
+    health_state: Option<Arc<RwLock<GateHealthState>>>,
+    health_notify: Option<Arc<Notify>>,
 }
 
 impl SocketIOServer {
@@ -63,7 +68,27 @@ impl SocketIOServer {
             decompressor: VitalDataDecompressor::new(),
             cleaner: VitalDataCleaner::new(),
             transformer: VitalDataTransformer::new(),
+            health_state: None,
+            health_notify: None,
         }
+    }
+
+    /// ID SRS: SRS-FN-SOCKETIO-005
+    /// Title: set_health_hooks
+    ///
+    /// Description: VRConnect shall wire the health state updater into the Socket.IO
+    /// server. When set, sio_connected is toggled on connect/disconnect and
+    /// health_notify fires immediately so the health task pushes a fresh payload.
+    /// Called by processor.rs when BLE output is enabled; no-op otherwise.
+    ///
+    /// Version: V1.0
+    pub fn set_health_hooks(
+        &mut self,
+        health_state: Arc<RwLock<GateHealthState>>,
+        health_notify: Arc<Notify>,
+    ) {
+        self.health_state = Some(health_state);
+        self.health_notify = Some(health_notify);
     }
 
     /// ID SRS: SRS-FN-SOCKETIO-002
@@ -95,6 +120,8 @@ impl SocketIOServer {
         let transformer = Arc::new(self.transformer.clone());
         let debug_file = self.debug_file.clone();
         let debug_enabled = self.debug_enabled;
+        let health_state = self.health_state.clone();
+        let health_notify = self.health_notify.clone();
 
         loop {
             match listener.accept().await {
@@ -104,6 +131,8 @@ impl SocketIOServer {
                     let cleaner = cleaner.clone();
                     let transformer = transformer.clone();
                     let debug_file = debug_file.clone();
+                    let health_state = health_state.clone();
+                    let health_notify = health_notify.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_connection(
@@ -115,6 +144,8 @@ impl SocketIOServer {
                             transformer,
                             debug_enabled,
                             debug_file,
+                            health_state,
+                            health_notify,
                         )
                         .await
                         {
@@ -159,8 +190,16 @@ impl SocketIOServer {
         transformer: Arc<VitalDataTransformer>,
         debug_enabled: bool,
         debug_file: Arc<RwLock<Option<File>>>,
+        health_state: Option<Arc<RwLock<GateHealthState>>>,
+        health_notify: Option<Arc<Notify>>,
     ) -> Result<()> {
         log::info!("New Socket.IO v4 connection from {}", addr);
+
+        // sio connected → immediate health push
+        if let (Some(ref hs), Some(ref hn)) = (&health_state, &health_notify) {
+            hs.write().await.sio_connected = true;
+            hn.notify_one();
+        }
 
         let ws_stream = accept_async(stream)
             .await
@@ -313,6 +352,12 @@ impl SocketIOServer {
                     break;
                 }
             }
+        }
+
+        // sio disconnected → immediate health push
+        if let (Some(ref hs), Some(ref hn)) = (&health_state, &health_notify) {
+            hs.write().await.sio_connected = false;
+            hn.notify_one();
         }
 
         log::info!("Connection handler finished for {}", addr);
