@@ -76,6 +76,16 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Config, String> {
             .unwrap_or_else(|_| "95".to_string())
             .parse()
             .unwrap_or(95),
+        health_check_interval_sec: std::env::var("HEALTH_CHECK_INTERVAL_SEC")
+            .unwrap_or_else(|_| "30".to_string())
+            .parse()
+            .unwrap_or(30),
+        health_ble_flow_timeout_sec: std::env::var("HEALTH_BLE_FLOW_TIMEOUT_SEC")
+            .unwrap_or_else(|_| "60".to_string())
+            .parse()
+            .unwrap_or(60),
+        health_file: std::env::var("HEALTH_FILE")
+            .unwrap_or_else(|_| "logs/health.json".to_string()),
         debug_enabled: std::env::var("DEBUG_ENABLED")
             .unwrap_or_else(|_| "false".to_string())
             .parse()

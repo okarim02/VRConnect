@@ -95,6 +95,19 @@ pub struct Config {
     #[arg(long, default_value = "95")]
     pub output_file_critical_disk_percent: u8,
 
+    // Health Monitoring Configuration
+    /// Health check interval in seconds (heartbeat period for BLE health notify)
+    #[arg(long, default_value = "30")]
+    pub health_check_interval_sec: u64,
+
+    /// BLE flow timeout in seconds — flow=0 if no ProcessedData received within this window
+    #[arg(long, default_value = "60")]
+    pub health_ble_flow_timeout_sec: u64,
+
+    /// Path to health.json written by HealthWriter.ps1
+    #[arg(long, default_value = "logs/health.json")]
+    pub health_file: String,
+
     // Debug Configuration
     /// Enable debug mode
     #[arg(long, default_value = "false")]
@@ -288,6 +301,27 @@ impl Config {
             }
         }
 
+        // Health
+        if !has_arg("--health-check-interval-sec") {
+            if let Ok(val) = std::env::var("HEALTH_CHECK_INTERVAL_SEC") {
+                if let Ok(interval) = val.parse() {
+                    config.health_check_interval_sec = interval;
+                }
+            }
+        }
+        if !has_arg("--health-ble-flow-timeout-sec") {
+            if let Ok(val) = std::env::var("HEALTH_BLE_FLOW_TIMEOUT_SEC") {
+                if let Ok(timeout) = val.parse() {
+                    config.health_ble_flow_timeout_sec = timeout;
+                }
+            }
+        }
+        if !has_arg("--health-file") {
+            if let Ok(val) = std::env::var("HEALTH_FILE") {
+                config.health_file = val;
+            }
+        }
+
         // Debug
         if !has_arg("--debug-enabled") {
             if let Ok(val) = std::env::var("DEBUG_ENABLED") {
@@ -393,6 +427,14 @@ impl Config {
             }
         }
 
+        // Validate health config
+        if self.health_check_interval_sec == 0 {
+            return Err("health_check_interval_sec must be greater than 0".to_string());
+        }
+        if self.health_ble_flow_timeout_sec == 0 {
+            return Err("health_ble_flow_timeout_sec must be greater than 0".to_string());
+        }
+
         // Validate log level
         let valid_levels = ["SUCCESS", "INFO", "WARNING", "ERROR", "DEBUG"];
         if !valid_levels.contains(&self.log_level.to_uppercase().as_str()) {
@@ -443,6 +485,9 @@ mod tests {
             output_file_max_size_mb: 500,
             output_file_archive_threshold_gb: 5,
             output_file_critical_disk_percent: 95,
+            health_check_interval_sec: 30,
+            health_ble_flow_timeout_sec: 60,
+            health_file: "logs/health.json".to_string(),
             debug_enabled: false,
             debug_output_path: "./debug.log".to_string(),
             log_level: "INFO".to_string(),
@@ -853,5 +898,70 @@ mod tests {
         ]);
 
         assert_eq!(config.output_ble_update_interval_ms, 200);
+    }
+
+    // --- Health config tests ---
+
+    #[test]
+    fn test_health_defaults() {
+        let config = Config::parse_from(vec!["vrconnect"]);
+        assert_eq!(config.health_check_interval_sec, 30);
+        assert_eq!(config.health_ble_flow_timeout_sec, 60);
+        assert_eq!(config.health_file, "logs/health.json");
+    }
+
+    #[test]
+    fn test_health_parse_args() {
+        let config = Config::parse_from(vec![
+            "vrconnect",
+            "--health-check-interval-sec", "10",
+            "--health-ble-flow-timeout-sec", "120",
+            "--health-file", "custom/health.json",
+        ]);
+        assert_eq!(config.health_check_interval_sec, 10);
+        assert_eq!(config.health_ble_flow_timeout_sec, 120);
+        assert_eq!(config.health_file, "custom/health.json");
+    }
+
+    #[test]
+    fn test_health_validate_interval_zero() {
+        let mut config = create_test_config();
+        config.health_check_interval_sec = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("health_check_interval_sec"));
+    }
+
+    #[test]
+    fn test_health_validate_flow_timeout_zero() {
+        let mut config = create_test_config();
+        config.health_ble_flow_timeout_sec = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("health_ble_flow_timeout_sec"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_health_env_override() {
+        std::env::remove_var("HEALTH_CHECK_INTERVAL_SEC");
+        std::env::remove_var("HEALTH_BLE_FLOW_TIMEOUT_SEC");
+        std::env::remove_var("HEALTH_FILE");
+
+        std::env::set_var("HEALTH_CHECK_INTERVAL_SEC", "45");
+        std::env::set_var("HEALTH_BLE_FLOW_TIMEOUT_SEC", "90");
+        std::env::set_var("HEALTH_FILE", "logs/custom_health.json");
+
+        let args = vec!["vrconnect".to_string()];
+        let base = Config::parse_from(&args);
+        let config = Config::apply_env_overrides(base, &args);
+
+        assert_eq!(config.health_check_interval_sec, 45);
+        assert_eq!(config.health_ble_flow_timeout_sec, 90);
+        assert_eq!(config.health_file, "logs/custom_health.json");
+
+        std::env::remove_var("HEALTH_CHECK_INTERVAL_SEC");
+        std::env::remove_var("HEALTH_BLE_FLOW_TIMEOUT_SEC");
+        std::env::remove_var("HEALTH_FILE");
     }
 }
