@@ -24,9 +24,12 @@ use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};
 use crate::output::ble_gatt::{CharProperty, GattServer, WriteEvent};
 use crate::output::ble_session::BleSessionState;
+use crate::output::health::{build_payload, read_os_snapshot, GateHealthState};
 use crate::utils::chaos;
+use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+use tokio::sync::{Notify, RwLock};
 
 /// ID SRS: SRS-MOD-BLERELIABLE-001
 /// Title: ReliableBleOutput
@@ -42,6 +45,15 @@ pub struct ReliableBleOutput {
     /// Extensible signal registry: drives catalog building and subscribe validation.
     /// Immutable after construction; shared read-only into async handlers via Arc.
     registry: Arc<SignalRegistry>,
+    /// Shared GATE health indicators — updated by output(), write_handler_loop(),
+    /// and by the SIO task (processor.rs). Exposed via health_state() accessor.
+    pub health_state: Arc<RwLock<GateHealthState>>,
+    /// Fired on any health state change → health_task wakes and sends an immediate notify.
+    health_notify: Arc<Notify>,
+    /// Heartbeat period and stale-file threshold for health_task.
+    health_check_interval_sec: u64,
+    /// Path to health.json written by HealthWriter.ps1.
+    health_file: String,
 }
 
 /// Characteristic UUID suffixes (PDF spec)
@@ -65,6 +77,8 @@ impl ReliableBleOutput {
         service_uuid_str: String,
         _update_interval_ms: u64,
         registry: Option<SignalRegistry>,
+        health_check_interval_sec: u64,
+        health_file: String,
     ) -> Result<Self> {
         let service_uuid = uuid::Uuid::parse_str(&service_uuid_str)
             .map_err(|e| VitalError::Config(format!("Invalid BLE service UUID: {}", e)))?;
@@ -124,11 +138,20 @@ impl ReliableBleOutput {
         let catalog = registry.build_catalog();
         let state = BleSessionState::new(1);
 
+        let health_state = Arc::new(RwLock::new(GateHealthState {
+            flow_timeout_sec: health_check_interval_sec,
+            ..Default::default()
+        }));
+
         Ok(Self {
             server: Arc::new(RwLock::new(server)),
             state: Arc::new(RwLock::new(state)),
             catalog,
             registry,
+            health_state,
+            health_notify: Arc::new(Notify::new()),
+            health_check_interval_sec,
+            health_file,
         })
     }
 
@@ -192,8 +215,11 @@ impl ReliableBleOutput {
             let state = self.state.clone();
             let server = self.server.clone();
             let registry = self.registry.clone();
+            let health_state = self.health_state.clone();
+            let health_notify = self.health_notify.clone();
             tokio::spawn(async move {
-                Self::write_handler_loop(rx, state, server, registry).await;
+                Self::write_handler_loop(rx, state, server, registry, health_state, health_notify)
+                    .await;
             });
             log::info!("Write handler task started (Data_IN / Subscribe / Unsubscribe)");
         } else {
@@ -211,7 +237,24 @@ impl ReliableBleOutput {
             log::info!("ACK watchdog task started (interval=5s, warn≥50, error≥900 frames)");
         }
 
-        // 4. Start GATT server
+        // 4. Spawn health task
+        {
+            let health_state = self.health_state.clone();
+            let server = self.server.clone();
+            let health_notify = self.health_notify.clone();
+            let interval = self.health_check_interval_sec;
+            let health_file = self.health_file.clone();
+            tokio::spawn(async move {
+                Self::health_task(health_state, server, health_notify, interval, health_file).await;
+            });
+            log::info!(
+                "Health task started (interval={}s, file={})",
+                self.health_check_interval_sec,
+                self.health_file
+            );
+        }
+
+        // 5. Start GATT server
         {
             let mut server = self.server.write().await;
             server.start().await?;
@@ -227,6 +270,8 @@ impl ReliableBleOutput {
         state: Arc<RwLock<BleSessionState>>,
         server: Arc<RwLock<GattServer>>,
         registry: Arc<SignalRegistry>,
+        health_state: Arc<RwLock<GateHealthState>>,
+        health_notify: Arc<Notify>,
     ) {
         log::info!("Write handler loop running (IDT dispatcher)");
 
@@ -456,6 +501,15 @@ impl ReliableBleOutput {
                         );
                         Self::log_subscribe_parse_failure(data);
                     }
+                    // Resync ble_subscriber from ground truth after any subscribe event.
+                    // Fires health_notify only on actual state transition (0→1 or 1→0).
+                    let ble_active = !state.read().await.signal_to_stream.is_empty();
+                    let mut hs = health_state.write().await;
+                    if hs.ble_subscriber != ble_active {
+                        hs.ble_subscriber = ble_active;
+                        drop(hs);
+                        health_notify.notify_one();
+                    }
                 }
 
                 // ── Unsubscribe: IDT SUBSCRIBE_REQ (op=2) or legacy 2-byte ───
@@ -483,6 +537,14 @@ impl ReliableBleOutput {
                             "Unsubscribe: payload too short ({} bytes) — discarded",
                             data.len()
                         );
+                    }
+                    // Resync ble_subscriber after unsubscribe.
+                    let ble_active = !state.read().await.signal_to_stream.is_empty();
+                    let mut hs = health_state.write().await;
+                    if hs.ble_subscriber != ble_active {
+                        hs.ble_subscriber = ble_active;
+                        drop(hs);
+                        health_notify.notify_one();
                     }
                 }
 
@@ -835,6 +897,10 @@ impl ReliableBleOutput {
     ///
     /// Version: V1.0
     pub async fn output(&self, data: &ProcessedData) -> Result<()> {
+        // Update flow timestamp on every call — no health notify needed here;
+        // flow state changes slowly (only meaningful after flow_timeout_sec elapses).
+        self.health_state.write().await.last_processed_data = Some(Instant::now());
+
         let mut state = self.state.write().await;
         let server = self.server.read().await;
 
@@ -962,6 +1028,109 @@ impl ReliableBleOutput {
     pub async fn get_session_stats(&self) -> (u16, usize) {
         let state = self.state.read().await;
         (state.current_session_id, state.total_pending())
+    }
+
+    /// ID SRS: SRS-FN-BLERELIABLE-008
+    /// Title: notify_control
+    ///
+    /// Description: VRConnect shall send a raw byte payload on the Control GATT
+    ///              characteristic (0x90b0, Notify). If no Central is subscribed to the
+    ///              Control CCCD, the Windows BLE stack returns an error — this method
+    ///              silently discards it (no-op). All other errors are logged at DEBUG.
+    ///
+    /// Version: V1.0
+    pub async fn notify_control(&self, data: &[u8]) -> Result<()> {
+        let server = self.server.read().await;
+        if let Err(e) = server.notify("Control", data).await {
+            // No subscriber on Control is the common case — demote to debug.
+            log::debug!("[health] Control notify: {} (no subscriber?)", e);
+        }
+        Ok(())
+    }
+
+    /// ID SRS: SRS-FN-BLERELIABLE-009
+    /// Title: health_state
+    ///
+    /// Description: Returns the shared GateHealthState so external tasks (SIO, processor)
+    ///              can update sio_connected and last_processed_data.
+    ///
+    /// Version: V1.0
+    pub fn health_state(&self) -> Arc<RwLock<GateHealthState>> {
+        self.health_state.clone()
+    }
+
+    /// ID SRS: SRS-FN-BLERELIABLE-010
+    /// Title: health_notify
+    ///
+    /// Description: Returns the shared Notify handle so external tasks can trigger an
+    ///              immediate health push (e.g. on SIO connect/disconnect).
+    ///
+    /// Version: V1.0
+    pub fn health_notify(&self) -> Arc<Notify> {
+        self.health_notify.clone()
+    }
+
+    /// ID SRS: SRS-FN-BLERELIABLE-011
+    /// Title: health_task
+    ///
+    /// Description: Periodic task that builds a HealthPayload from OsHealthSnapshot +
+    ///              GateHealthState and emits it on the Control characteristic.
+    ///
+    ///              Runs on two triggers (whichever comes first):
+    ///                1. `health_notify` fires → immediate push on any state change
+    ///                   (sio connect/disconnect, ble subscribe/unsubscribe)
+    ///                2. `check_interval_sec` timer expires → heartbeat push
+    ///
+    ///              `notify_control()` is a no-op when no Central subscribes to Control CCCD.
+    ///
+    /// Version: V1.0
+    async fn health_task(
+        health_state: Arc<RwLock<GateHealthState>>,
+        server: Arc<RwLock<GattServer>>,
+        health_notify: Arc<Notify>,
+        check_interval_sec: u64,
+        health_file: String,
+    ) {
+        let interval = Duration::from_secs(check_interval_sec);
+        let stale_threshold = check_interval_sec.saturating_mul(2);
+
+        log::info!(
+            "[health] Task started (interval={}s, file={}, stale_threshold={}s)",
+            check_interval_sec,
+            health_file,
+            stale_threshold
+        );
+
+        loop {
+            // Wait for a state-change trigger OR the heartbeat timer — whichever fires first.
+            let _ = tokio::time::timeout(interval, health_notify.notified()).await;
+
+            let os = read_os_snapshot(Path::new(&health_file), stale_threshold);
+            let gate = health_state.read().await;
+            let payload = build_payload(&os, &gate);
+            drop(gate);
+
+            match serde_json::to_vec(&payload) {
+                Ok(bytes) => {
+                    let srv = server.read().await;
+                    if let Err(e) = srv.notify("Control", &bytes).await {
+                        log::debug!(
+                            "[health] Control notify: {} (no subscriber — payload not sent)",
+                            e
+                        );
+                    } else {
+                        log::debug!(
+                            "[health] Health payload sent ({} bytes, ok={})",
+                            bytes.len(),
+                            payload.ok
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::error!("[health] Failed to serialize HealthPayload: {}", e);
+                }
+            }
+        }
     }
 
     /// Diagnostic helper: logs why a SUBSCRIBE_REQ frame failed to parse.

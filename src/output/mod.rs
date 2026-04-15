@@ -8,6 +8,7 @@ pub mod ble_reliable;  // Reliable stream BLE output (active protocol)
 pub mod ble_session;   // Sliding window engine (protocol state)
 pub mod console;
 pub mod file;
+pub mod health;        // Health monitoring — OS snapshot + GATE state → BLE Control notify
 
 pub use ble::BleOutput;
 pub use ble_reliable::ReliableBleOutput;
