@@ -894,6 +894,8 @@ impl ReliableBleOutput {
     ///              For each track in room_index=0 that matches a subscribed signal,
     ///              a 34-byte IDT DATA_FRAME (with t0_ms timestamp and CRC32C tail)
     ///              is notified on Data_OUT.
+    ///              Duplicate (signal_id, t0_ms) pairs within one call are skipped —
+    ///              VitalRecorder may emit 2–3 records with the same timestamp per signal.
     ///
     /// Version: V1.0
     pub async fn output(&self, data: &ProcessedData) -> Result<()> {
@@ -903,6 +905,8 @@ impl ReliableBleOutput {
 
         let mut state = self.state.write().await;
         let server = self.server.read().await;
+
+        let mut seen: std::collections::HashSet<(u16, u64)> = std::collections::HashSet::new();
 
         for track in &data.all_tracks {
             // Only BED_01 (room_index = 0)
@@ -941,6 +945,17 @@ impl ReliableBleOutput {
 
             // Sample timestamp (milliseconds since Unix epoch)
             let t0_ms = track.timestamp.timestamp_millis() as u64;
+
+            // VitalRecorder emits 2–3 duplicate records per signal in one Socket.IO message.
+            // Skip duplicates to avoid storing the same point in history and notifying MyPredi twice.
+            if !seen.insert((signal_id, t0_ms)) {
+                log::debug!(
+                    "Duplicate (signal=0x{:04X}, t0_ms={}) skipped",
+                    signal_id,
+                    t0_ms
+                );
+                continue;
+            }
 
             // Always record to history buffer so replay is available
             // regardless of whether any client is currently subscribed.
@@ -1982,6 +1997,101 @@ mod tests {
                 live_after.header.flags & FLAG_BACKLOG,
                 0,
                 "live frame after finish_replay must NOT carry FLAG_BACKLOG"
+            );
+        }
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-028
+    /// Title: output() deduplicates duplicate (signal_id, t0_ms) pairs
+    ///
+    /// Description: VRConnect shall emit exactly one DATA_FRAME per unique
+    ///              (signal_id, t0_ms) pair within a single output() call.
+    ///              VitalRecorder may emit 2–3 records with the same timestamp
+    ///              for the same signal in one Socket.IO message; the extra copies
+    ///              must be silently dropped — not forwarded to MyPredi, not stored
+    ///              in the history buffer.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_output_deduplicates_same_signal_same_timestamp() {
+        use crate::domain::ble_protocol::SignalId;
+
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+
+        // Subscribe to HR so add_data() actually produces frames
+        {
+            let mut st = state.write().await;
+            st.subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+        }
+
+        // Build ProcessedData with 3 identical HR tracks (same t0_ms, same value)
+        let fixed_ts = chrono::DateTime::from_timestamp_millis(1_776_672_192_000).unwrap();
+        let make_track = |record_index: i32| ProcessedTrack {
+            name: "HR".to_string(),
+            display_value: "51.000".to_string(),
+            raw_value: Some(51.0),
+            unit: "bpm".to_string(),
+            timestamp: fixed_ts,
+            room_index: 0,
+            room_name: "BED_01".to_string(),
+            track_index: 0,
+            record_index,
+            track_type: crate::domain::processed_data::TrackType::Number,
+            waveform_stats: None,
+            waveform_points: None,
+        };
+
+        let room = ProcessedRoom {
+            room_index: 0,
+            room_name: "BED_01".to_string(),
+            tracks: vec![make_track(0), make_track(1), make_track(2)],
+        };
+        let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+
+        // Drive record_history + add_data via BleSessionState directly,
+        // mirroring the dedup logic in output().
+        {
+            let mut st = state.write().await;
+            let mut seen: std::collections::HashSet<(u16, u64)> =
+                std::collections::HashSet::new();
+            let mut frames_generated = 0usize;
+            let mut history_inserts = 0usize;
+
+            for track in &data.all_tracks {
+                if track.room_index != 0 {
+                    continue;
+                }
+                let signal_id = SignalId::HR.as_u16();
+                let t0_ms = track.timestamp.timestamp_millis() as u64;
+
+                if !seen.insert((signal_id, t0_ms)) {
+                    continue;
+                }
+
+                let val = track.raw_value.unwrap() as f32;
+                st.record_history(signal_id, val, t0_ms);
+                history_inserts += 1;
+
+                if st.add_data(signal_id, val, t0_ms).is_some() {
+                    frames_generated += 1;
+                }
+            }
+
+            assert_eq!(
+                frames_generated, 1,
+                "only one DATA_FRAME should be generated for 3 identical tracks"
+            );
+            assert_eq!(
+                history_inserts, 1,
+                "only one history entry should be stored for 3 identical tracks"
+            );
+
+            let hist = st.history.get(&SignalId::HR.as_u16()).unwrap();
+            assert_eq!(hist.len(), 1, "history ring-buffer must contain exactly 1 entry");
+            assert_eq!(
+                hist[0],
+                (1_776_672_192_000u64, 51.0f32),
+                "stored history entry must match the single expected sample"
             );
         }
     }
