@@ -17,8 +17,8 @@
 
 use crate::domain::ble_protocol::{
     has_idt_magic, parse_tlv_subscribe_req, AckFrame, Catalog, InboundFrame, SignalId,
-    SignalRegistry, SubscribeReq, SubscribeRsp, SubscribeRspItem, SUB_OP_SUBSCRIBE,
-    SUB_OP_UNSUBSCRIBE, MSG_SUBSCRIBE_REQ,
+    SignalRegistry, SubscribeReq, SubscribeRsp, SubscribeRspItem, MSG_SUBSCRIBE_REQ,
+    SUB_OP_SUBSCRIBE, SUB_OP_UNSUBSCRIBE,
 };
 use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};
@@ -121,8 +121,15 @@ impl ReliableBleOutput {
             subscribe_uuid
         );
 
-        server.add_characteristic("Control", control_uuid, &[CharProperty::Notify]);
-        log::info!("  Characteristic: Control (Notify)    -> {}", control_uuid);
+        server.add_characteristic(
+            "Control",
+            control_uuid,
+            &[CharProperty::Notify, CharProperty::WriteWithoutResponse],
+        );
+        log::info!(
+            "  Characteristic: Control (Notify+Write) -> {}",
+            control_uuid
+        );
 
         server.add_characteristic(
             "Unsubscribe",
@@ -446,14 +453,12 @@ impl ReliableBleOutput {
                         {
                             // IDT strict: 13-byte header + binary items
                             Self::handle_subscribe_req(req, &state, &server, &registry).await;
-                        } else if data.get(3).copied() == Some(MSG_SUBSCRIBE_REQ)
-                            && data.len() > 28
+                        } else if data.get(3).copied() == Some(MSG_SUBSCRIBE_REQ) && data.len() > 28
                         {
                             // [DEV-5] MyPredi format: 24-byte header + TLV payload + CRC32C.
                             // TLV payload starts at offset 24; CRC is the last 4 bytes.
                             let tlv_payload = &data[24..data.len().saturating_sub(4)];
-                            if let Some((req_id, signal_ids)) =
-                                parse_tlv_subscribe_req(tlv_payload)
+                            if let Some((req_id, signal_ids)) = parse_tlv_subscribe_req(tlv_payload)
                             {
                                 log::info!(
                                     "Subscribe: MyPredi format — req_id={}, signals={:?}",
@@ -461,11 +466,7 @@ impl ReliableBleOutput {
                                     signal_ids
                                 );
                                 Self::handle_tlv_subscribe(
-                                    req_id,
-                                    signal_ids,
-                                    &state,
-                                    &server,
-                                    &registry,
+                                    req_id, signal_ids, &state, &server, &registry,
                                 )
                                 .await;
                             } else {
@@ -546,6 +547,12 @@ impl ReliableBleOutput {
                         drop(hs);
                         health_notify.notify_one();
                     }
+                }
+
+                // ── Control: health pull request — any write triggers immediate health push ──
+                "Control" => {
+                    log::info!("Health pull request received on Control — sending immediate health payload");
+                    health_notify.notify_one();
                 }
 
                 other => {
@@ -1695,7 +1702,11 @@ mod tests {
             st.subscribe(SignalId::HR.as_u16());
 
             let f1 = st.add_data(SignalId::HR.as_u16(), 70.0, 0).unwrap();
-            assert_eq!(f1.header.flags & FLAG_BACKLOG, 0, "First live frame: FLAG_BACKLOG must be clear");
+            assert_eq!(
+                f1.header.flags & FLAG_BACKLOG,
+                0,
+                "First live frame: FLAG_BACKLOG must be clear"
+            );
 
             // Second frame — tx buffer is non-empty (f1 not yet ACKed) but is_replaying=false
             let f2 = st.add_data(SignalId::HR.as_u16(), 71.0, 1000).unwrap();
@@ -1857,10 +1868,22 @@ mod tests {
     fn test_registry_unknown_signal_normalize_returns_none() {
         use crate::domain::ble_protocol::SignalRegistry;
         let r = SignalRegistry::with_defaults();
-        assert_eq!(r.normalize_id(0x9999), None, "unknown IDT compound ID must be rejected");
-        assert_eq!(r.normalize_id(0x0200), None, "unknown source-2 ID must be rejected");
-        assert_eq!(r.normalize_id(0), None,      "zero must always be rejected");
-        assert_eq!(r.normalize_id(99), None,     "unknown legacy simple ID must be rejected");
+        assert_eq!(
+            r.normalize_id(0x9999),
+            None,
+            "unknown IDT compound ID must be rejected"
+        );
+        assert_eq!(
+            r.normalize_id(0x0200),
+            None,
+            "unknown source-2 ID must be rejected"
+        );
+        assert_eq!(r.normalize_id(0), None, "zero must always be rejected");
+        assert_eq!(
+            r.normalize_id(99),
+            None,
+            "unknown legacy simple ID must be rejected"
+        );
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-024
@@ -1902,8 +1925,14 @@ mod tests {
             let stream_id = st.subscribe_with_stream_id(canonical, 1);
             assert_eq!(stream_id, 1, "preferred_stream_id must be honoured");
             // State must record subscription at canonical IDT ID, not legacy raw ID
-            assert!(st.is_subscribed(0x0101), "must be subscribed at canonical IDT ID 0x0101");
-            assert!(!st.is_subscribed(1),     "legacy raw ID 1 must NOT appear as subscribed");
+            assert!(
+                st.is_subscribed(0x0101),
+                "must be subscribed at canonical IDT ID 0x0101"
+            );
+            assert!(
+                !st.is_subscribed(1),
+                "legacy raw ID 1 must NOT appear as subscribed"
+            );
         }
     }
 
@@ -1937,7 +1966,10 @@ mod tests {
         // History must contain the sample even though no stream is subscribed
         {
             let st = state.read().await;
-            assert!(!st.is_subscribed(SignalId::HR.as_u16()), "pre-condition: not subscribed");
+            assert!(
+                !st.is_subscribed(SignalId::HR.as_u16()),
+                "pre-condition: not subscribed"
+            );
             let hist = st.history.get(&SignalId::HR.as_u16()).unwrap();
             assert_eq!(hist.len(), 1);
             assert_eq!(hist[0], (1_700_000_000_000u64, 75.0f32));
@@ -1955,7 +1987,7 @@ mod tests {
     ///              flag must be cleared so live frames no longer carry FLAG_BACKLOG.
     #[tokio::test]
     async fn test_start_and_finish_replay_flag_lifecycle() {
-        use crate::domain::ble_protocol::{FLAG_BACKLOG, SignalId};
+        use crate::domain::ble_protocol::{SignalId, FLAG_BACKLOG};
         let state = Arc::new(RwLock::new(BleSessionState::new(1)));
 
         {
@@ -1999,6 +2031,141 @@ mod tests {
                 "live frame after finish_replay must NOT carry FLAG_BACKLOG"
             );
         }
+    }
+
+    // ── Control pull-request (health on demand) ───────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-029
+    /// Title: Control write triggers immediate health_notify
+    ///
+    /// Description: Any write on the Control characteristic shall call notify_one()
+    ///              on health_notify within 100 ms, waking the health task.
+    #[tokio::test]
+    async fn test_control_write_triggers_health_notify() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WriteEvent>();
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        let service_uuid = uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap();
+        let server = Arc::new(RwLock::new(GattServer::new(
+            "Test".to_string(),
+            service_uuid,
+        )));
+        let registry = Arc::new(SignalRegistry::with_defaults());
+        let health_state = Arc::new(RwLock::new(GateHealthState::default()));
+        let health_notify = Arc::new(Notify::new());
+        let health_notify_check = health_notify.clone();
+
+        tokio::spawn(async move {
+            ReliableBleOutput::write_handler_loop(
+                rx,
+                state,
+                server,
+                registry,
+                health_state,
+                health_notify,
+            )
+            .await;
+        });
+
+        tx.send(WriteEvent {
+            characteristic_name: "Control".to_string(),
+            data: vec![0x01],
+        })
+        .unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            health_notify_check.notified(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "health_notify must fire within 100 ms of a Control write"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-030
+    /// Title: Control write content is ignored — any payload triggers health push
+    ///
+    /// Description: Writes of [0x00], [0xFF], and [] (empty) on Control must all
+    ///              trigger health_notify, regardless of content.
+    #[tokio::test]
+    async fn test_control_write_any_payload_triggers_notify() {
+        for data in [vec![0x00u8], vec![0xFFu8], vec![]] {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WriteEvent>();
+            let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+            let service_uuid =
+                uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap();
+            let server = Arc::new(RwLock::new(GattServer::new(
+                "Test".to_string(),
+                service_uuid,
+            )));
+            let registry = Arc::new(SignalRegistry::with_defaults());
+            let health_state = Arc::new(RwLock::new(GateHealthState::default()));
+            let health_notify = Arc::new(Notify::new());
+            let health_notify_check = health_notify.clone();
+
+            tokio::spawn(async move {
+                ReliableBleOutput::write_handler_loop(
+                    rx,
+                    state,
+                    server,
+                    registry,
+                    health_state,
+                    health_notify,
+                )
+                .await;
+            });
+
+            tx.send(WriteEvent {
+                characteristic_name: "Control".to_string(),
+                data,
+            })
+            .unwrap();
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                health_notify_check.notified(),
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "health_notify must fire regardless of Control write payload"
+            );
+        }
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-031
+    /// Title: Concurrent health event + pull request coalesce — health_task wakes once
+    ///
+    /// Description: tokio::Notify stores at most one permit. Two consecutive notify_one()
+    ///              calls before notified() is polled behave as one: the second notified()
+    ///              blocks. This verifies the documented coalescing behaviour relied upon
+    ///              by the health task to avoid double pushes on simultaneous triggers.
+    #[tokio::test]
+    async fn test_control_and_event_driven_notify_coalesce() {
+        let health_notify = Arc::new(Notify::new());
+
+        health_notify.notify_one(); // event-driven trigger (e.g. sio_connected changed)
+        health_notify.notify_one(); // pull request arriving simultaneously
+
+        // First notified() must resolve immediately (one permit stored).
+        let r1 = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            health_notify.notified(),
+        )
+        .await;
+        assert!(r1.is_ok(), "first notified() must resolve immediately");
+
+        // Second notified() must time out — notify_one coalesces, only one permit issued.
+        let r2 = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            health_notify.notified(),
+        )
+        .await;
+        assert!(
+            r2.is_err(),
+            "second notified() must time out — notify_one coalesces duplicates"
+        );
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-028
@@ -2052,8 +2219,7 @@ mod tests {
         // mirroring the dedup logic in output().
         {
             let mut st = state.write().await;
-            let mut seen: std::collections::HashSet<(u16, u64)> =
-                std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<(u16, u64)> = std::collections::HashSet::new();
             let mut frames_generated = 0usize;
             let mut history_inserts = 0usize;
 
@@ -2087,7 +2253,11 @@ mod tests {
             );
 
             let hist = st.history.get(&SignalId::HR.as_u16()).unwrap();
-            assert_eq!(hist.len(), 1, "history ring-buffer must contain exactly 1 entry");
+            assert_eq!(
+                hist.len(),
+                1,
+                "history ring-buffer must contain exactly 1 entry"
+            );
             assert_eq!(
                 hist[0],
                 (1_776_672_192_000u64, 51.0f32),
