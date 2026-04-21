@@ -233,51 +233,49 @@ impl GattServer {
                     .WriteRequested(&TypedEventHandler::<
                         GattLocalCharacteristic,
                         GattWriteRequestedEventArgs,
-                    >::new(
-                        move |_sender, args| {
-                            if let Some(args) = args {
-                                let deferral = args.GetDeferral()?;
-                                let request = args.GetRequestAsync()?.get()?;
-                                let value = request.Value()?;
-                                let reader = DataReader::FromBuffer(&value)?;
-                                let len = reader.UnconsumedBufferLength()? as usize;
+                    >::new(move |_sender, args| {
+                        if let Some(args) = args {
+                            let deferral = args.GetDeferral()?;
+                            let request = args.GetRequestAsync()?.get()?;
+                            let value = request.Value()?;
+                            let reader = DataReader::FromBuffer(&value)?;
+                            let len = reader.UnconsumedBufferLength()? as usize;
 
-                                // Minimum-length guard: any valid IDT or ACK frame needs ≥ 2 bytes
-                                // to determine frame type (magic check or length check).
-                                // Discard single-byte or empty writes before touching the channel.
-                                if len < 2 {
-                                    log::warn!(
-                                        "BLE write on '{}': {} byte(s) — too short for any \
+                            // Minimum-length guard: IDT/ACK frames need ≥ 2 bytes to determine frame type.
+                            // Control writes are pull requests — any length (including empty) is valid.
+                            if len < 2 && char_name != "Control" {
+                                log::warn!(
+                                    "BLE write on '{}': {} byte(s) — too short for any \
                                          IDT/ACK frame, discarded",
-                                        char_name, len
-                                    );
-                                    let _ = request.Respond();
-                                    deferral.Complete()?;
-                                    return Ok(());
-                                }
-
-                                let mut data = vec![0u8; len];
-                                reader.ReadBytes(&mut data)?;
-
-                                log::debug!(
-                                    "BLE write received on '{}': {} bytes",
                                     char_name,
-                                    data.len()
+                                    len
                                 );
-
-                                let _ = tx.send(WriteEvent {
-                                    characteristic_name: char_name.clone(),
-                                    data,
-                                });
-
-                                // Respond for WriteWithResponse requests
                                 let _ = request.Respond();
-
                                 deferral.Complete()?;
+                                return Ok(());
                             }
-                            Ok(())
-                        },
-                    ))
+
+                            let mut data = vec![0u8; len];
+                            reader.ReadBytes(&mut data)?;
+
+                            log::debug!(
+                                "BLE write received on '{}': {} bytes",
+                                char_name,
+                                data.len()
+                            );
+
+                            let _ = tx.send(WriteEvent {
+                                characteristic_name: char_name.clone(),
+                                data,
+                            });
+
+                            // Respond for WriteWithResponse requests
+                            let _ = request.Respond();
+
+                            deferral.Complete()?;
+                        }
+                        Ok(())
+                    }))
                     .map_err(|e| {
                         VitalError::Config(format!(
                             "WriteRequested handler failed for '{}': {}",
@@ -323,12 +321,13 @@ impl GattServer {
 
     /// Send a notification on a Notify characteristic.
     pub async fn notify(&self, name: &str, data: &[u8]) -> Result<()> {
-        let local_char = self.local_chars.get(name).ok_or_else(|| {
-            VitalError::Config(format!("Unknown characteristic '{}'", name))
-        })?;
+        let local_char = self
+            .local_chars
+            .get(name)
+            .ok_or_else(|| VitalError::Config(format!("Unknown characteristic '{}'", name)))?;
 
-        let writer = DataWriter::new()
-            .map_err(|e| VitalError::Config(format!("DataWriter::new: {}", e)))?;
+        let writer =
+            DataWriter::new().map_err(|e| VitalError::Config(format!("DataWriter::new: {}", e)))?;
         writer
             .WriteBytes(data)
             .map_err(|e| VitalError::Config(format!("WriteBytes: {}", e)))?;
