@@ -326,6 +326,22 @@ impl GattServer {
             .get(name)
             .ok_or_else(|| VitalError::Config(format!("Unknown characteristic '{}'", name)))?;
 
+        // Warn early if no client has enabled CCCD — NotifyValueAsync silently drops in that case.
+        match local_char.SubscribedClients() {
+            Ok(clients) => {
+                let n = clients.Size().unwrap_or(0);
+                if n == 0 {
+                    log::warn!(
+                        "notify '{}': 0 CCCD subscribers — tablet has not enabled notifications on this characteristic",
+                        name
+                    );
+                } else {
+                    log::debug!("notify '{}': {} CCCD subscriber(s)", name, n);
+                }
+            }
+            Err(e) => log::warn!("notify '{}': SubscribedClients() failed: {}", name, e),
+        }
+
         let writer =
             DataWriter::new().map_err(|e| VitalError::Config(format!("DataWriter::new: {}", e)))?;
         writer

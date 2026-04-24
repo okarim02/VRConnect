@@ -36,6 +36,12 @@ pub struct StreamEntry {
     pub source_id: u8,
     /// Last sent sequence number for this stream (0 = no frame sent yet)
     pub last_seq: u32,
+    /// Timestamp of the last DATA_FRAME emitted on this stream (ms since epoch).
+    /// `None` = no frame sent yet (first sample always passes).
+    /// Used to deduplicate cross-message duplicates: VitalRecorder uses a sliding
+    /// window and may re-send the same timestamp in consecutive Socket.IO messages.
+    /// A new sample is only forwarded if t0_ms > last_t0_ms.
+    pub last_t0_ms: Option<u64>,
     /// Retransmit buffer: bounded VecDeque of sent-but-unacknowledged frames
     pub tx_buffer: VecDeque<DataFrame>,
     /// True while historical replay frames are being sent (BACKLOG_THEN_LIVE / BACKLOG_ONLY).
@@ -240,6 +246,7 @@ impl BleSessionState {
                 signal_id,
                 source_id: 1,
                 last_seq: 0,
+                last_t0_ms: None,
                 tx_buffer: VecDeque::new(),
                 is_replaying: false,
             },
@@ -265,6 +272,7 @@ impl BleSessionState {
                 signal_id,
                 source_id: 1,
                 last_seq: 0,
+                last_t0_ms: None,
                 tx_buffer: VecDeque::new(),
                 is_replaying: false,
             },
@@ -341,6 +349,20 @@ impl BleSessionState {
     pub fn add_data(&mut self, signal_id: u16, value: f32, t0_ms: u64) -> Option<DataFrame> {
         let stream_id = *self.signal_to_stream.get(&signal_id)?;
         let entry = self.streams.get_mut(&stream_id)?;
+
+        // Cross-message deduplication: VitalRecorder uses a sliding window and may
+        // re-send the same timestamp in consecutive Socket.IO messages.
+        // Only forward samples that are strictly newer than the last emitted frame.
+        if let Some(last) = entry.last_t0_ms {
+            if t0_ms <= last {
+                log::debug!(
+                    "Cross-msg dup skipped: signal=0x{:04X} t0_ms={} <= last={}",
+                    signal_id, t0_ms, last
+                );
+                return None;
+            }
+        }
+        entry.last_t0_ms = Some(t0_ms);
 
         entry.last_seq += 1;
         let seq = entry.last_seq;

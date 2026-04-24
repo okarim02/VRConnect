@@ -16,9 +16,9 @@
 // - Unsubscribe (0x90b1): Write  - SUBSCRIBE_REQ with op=UNSUBSCRIBE, or legacy 2b fallback
 
 use crate::domain::ble_protocol::{
-    has_idt_magic, parse_tlv_subscribe_req, AckFrame, Catalog, InboundFrame, SignalId,
-    SignalRegistry, SubscribeReq, SubscribeRsp, SubscribeRspItem, MSG_SUBSCRIBE_REQ,
-    SUB_OP_SUBSCRIBE, SUB_OP_UNSUBSCRIBE,
+    has_idt_magic, parse_idt_wrapped_tlv_subscribe_req, parse_tlv_subscribe_req, AckFrame, Catalog,
+    InboundFrame, SignalId, SignalRegistry, SubscribeReq, SubscribeRsp, SubscribeRspItem,
+    MSG_SUBSCRIBE_REQ, SUB_OP_SUBSCRIBE, SUB_OP_UNSUBSCRIBE,
 };
 use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};
@@ -448,20 +448,17 @@ impl ReliableBleOutput {
                     log::info!("Subscribe raw ({} bytes): {}", data.len(), hex);
 
                     if has_idt_magic(data) {
-                        if let Some(InboundFrame::SubscribeReq(req)) =
-                            InboundFrame::from_ble_bytes(data)
-                        {
-                            // IDT strict: 13-byte header + binary items
-                            Self::handle_subscribe_req(req, &state, &server, &registry).await;
-                        } else if data.get(3).copied() == Some(MSG_SUBSCRIBE_REQ) && data.len() > 28
-                        {
-                            // [DEV-5] MyPredi format: 24-byte header + TLV payload + CRC32C.
-                            // TLV payload starts at offset 24; CRC is the last 4 bytes.
-                            let tlv_payload = &data[24..data.len().saturating_sub(4)];
-                            if let Some((req_id, signal_ids)) = parse_tlv_subscribe_req(tlv_payload)
+                        if data.get(3).copied() == Some(MSG_SUBSCRIBE_REQ) {
+                            if let Some(InboundFrame::SubscribeReq(req)) =
+                                InboundFrame::from_ble_bytes(data)
+                            {
+                                // IDT strict: 13-byte header + binary items
+                                Self::handle_subscribe_req(req, &state, &server, &registry).await;
+                            } else if let Some((req_id, signal_ids)) =
+                                parse_idt_wrapped_tlv_subscribe_req(data)
                             {
                                 log::info!(
-                                    "Subscribe: MyPredi format — req_id={}, signals={:?}",
+                                    "Subscribe: MyPredi format wrapped in IDT envelope — req_id={}, signals={:?}",
                                     req_id,
                                     signal_ids
                                 );
@@ -471,15 +468,13 @@ impl ReliableBleOutput {
                                 .await;
                             } else {
                                 log::warn!(
-                                    "Subscribe: MyPredi header OK but TLV payload invalid \
-                                     ({} bytes) — discarded",
-                                    tlv_payload.len()
+                                    "Subscribe: IDT SUBSCRIBE_REQ header present but payload is not a valid IDT SUBSCRIBE_REQ or embedded MyPredi TLV (msg_type=0x{:02X}) — discarded",
+                                    data.get(3).copied().unwrap_or(0)
                                 );
                             }
                         } else {
                             log::warn!(
-                                "Subscribe: IDT magic present but not a valid SUBSCRIBE_REQ \
-                                 (msg_type=0x{:02X}) — discarded",
+                                "Subscribe: IDT magic present but msg_type=0x{:02X} is not SUBSCRIBE_REQ — discarded",
                                 data.get(3).copied().unwrap_or(0)
                             );
                         }
@@ -773,6 +768,27 @@ impl ReliableBleOutput {
     ///
     /// A 300 ms delay before the RSP notify is required because the Flutter app enables
     /// CCCD *after* writing to the Subscribe characteristic [DEV-4].
+    /// Maps a canonical signal_id to the stream ID hardcoded by Flutter's `_initStreams()`.
+    ///
+    /// Flutter (vr_ble_gatt_callback.dart) pre-populates `activeStreams` with fixed IDs 1-7
+    /// before any SUBSCRIBE_REQ is sent. DATA_FRAMEs must use these exact stream IDs or
+    /// Flutter calls `activeStreams[streamId]` → null and silently drops the frame.
+    ///
+    /// ID SRS: SRS-FN-BLERELIABLE-010
+    /// Version: V1.0
+    fn flutter_stream_id(signal_id: u16) -> u16 {
+        match signal_id {
+            0x0101 => 1, // HR
+            0x0102 => 2, // SpO2
+            0x0103 => 3, // Temperature
+            0x0201 => 4, // SBP
+            0x0202 => 5, // DBP
+            0x0203 => 6, // MBP
+            0x0501 => 7, // AmbPres
+            other => other, // unknown signal — pass-through, will likely be dropped by Flutter
+        }
+    }
+
     async fn handle_tlv_subscribe(
         req_id: u16,
         signal_ids: Vec<u16>,
@@ -803,9 +819,11 @@ impl ReliableBleOutput {
                         canonical_id
                     );
                 }
-                // Flutter expects stream IDs 1/2/3 matching the raw signal ID (legacy).
-                // Use subscribe_with_stream_id so DATA_FRAMEs go to the right stream.
-                let stream_id = st.subscribe_with_stream_id(canonical_id, *raw_id);
+                // Flutter hardcodes activeStreams[1..7] in _initStreams() — signal→stream map is fixed:
+                //   0x0101→1, 0x0102→2, 0x0103→3, 0x0201→4, 0x0202→5, 0x0203→6, 0x0501→7
+                // DATA_FRAMEs must use these exact IDs or Flutter silently drops them.
+                let flutter_sid = Self::flutter_stream_id(canonical_id);
+                let stream_id = st.subscribe_with_stream_id(canonical_id, flutter_sid);
                 let meta = registry.get(canonical_id).unwrap();
                 // RSP stream_id encoded as-is (Flutter ignores SUBSCRIBE_RSP per DEV-4/FLUTTER_COMPAT §4).
                 // Future IDT-compliant clients will read it correctly in LE.
@@ -828,39 +846,27 @@ impl ReliableBleOutput {
             return;
         }
 
-        // [DEV-4] Delay before RSP so Flutter has time to enable CCCD after the Write.
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-
-        let rsp = SubscribeRsp {
-            session_id,
+        // [DEV-5] No RSP sent for TLV subscribe path.
+        // Flutter pre-populates activeStreams[1..7] in _initStreams() with hardcoded signal IDs.
+        // It does NOT use the SUBSCRIBE_RSP to build its stream map — RSP is ignored.
+        // • Data_OUT is wrong: _processBuffer parses all notifications as DATA_FRAMEs → "Bad Magic"
+        // • Control is wrong: Flutter decodes Control as UTF-8 (Health JSON) → FormatException
+        // If Flutter ever needs a RSP, coordinate format with Flutter dev first.
+        log::debug!(
+            "TLV SUBSCRIBE_RSP suppressed (req_id={}, {} stream(s) allocated)",
             req_id,
-            status: 0,
-            results: rsp_items,
-        };
-        let tlv_bytes = rsp.to_flutter_tlv_bytes();
-        let srv = server.read().await;
-        // NOTE: Do NOT notify Data_OUT with SUBSCRIBE_RSP — MyPredi's _processBuffer
-        // reads ALL Data_OUT notifications as DATA_FRAMEs; sending RSP there corrupts
-        // its frame buffer (reads period_ms bytes as payloadLen → "Bad Magic"). [DEV-5]
-        // Flutter/MyPredi Central expects TLV 0x21 format on Control (90b0)
-        if let Err(e) = srv.notify("Control", &tlv_bytes).await {
-            log::debug!(
-                "TLV SUBSCRIBE_RSP on Control: {} (client may not be subscribed)",
-                e
-            );
-        } else {
-            log::info!(
-                "TLV SUBSCRIBE_RSP sent on Control ({} bytes, req_id={})",
-                tlv_bytes.len(),
-                req_id
-            );
-        }
+            rsp_items.len()
+        );
     }
 
     /// Extract (signal_id, f32) pairs from ProcessedData for room_index=0.
     /// Signal name mapping covers all known VitalRecorder export names:
     /// - SpO2:        "SPO2", "PLETH", "PLETH_SPO2"
     /// - Temperature: "TEMP", "TEMPERATURE", "BT", "BT1", "BT1_TEMP"
+    /// - SBP:         "SBP", "NIBP_SBP"
+    /// - DBP:         "DBP", "NIBP_DBP"
+    /// - MBP:         "MBP", "NIBP_MBP"
+    /// - AmbPres:     "AMB_PRES", "AMBIENT_PRESSURE"
     #[cfg(test)]
     fn extract_signal_values(data: &ProcessedData) -> Vec<(u16, f32)> {
         use std::collections::HashMap;
@@ -874,6 +880,14 @@ impl ReliableBleOutput {
             ("BT", SignalId::Temperature.as_u16()),
             ("BT1", SignalId::Temperature.as_u16()),
             ("BT1_TEMP", SignalId::Temperature.as_u16()),
+            ("SBP", SignalId::SBP.as_u16()),
+            ("NIBP_SBP", SignalId::SBP.as_u16()),
+            ("DBP", SignalId::DBP.as_u16()),
+            ("NIBP_DBP", SignalId::DBP.as_u16()),
+            ("MBP", SignalId::MBP.as_u16()),
+            ("NIBP_MBP", SignalId::MBP.as_u16()),
+            ("AMB_PRES", SignalId::AmbPres.as_u16()),
+            ("AMBIENT_PRESSURE", SignalId::AmbPres.as_u16()),
         ]
         .into_iter()
         .collect();
@@ -939,6 +953,10 @@ impl ReliableBleOutput {
                 "TEMP" | "TEMPERATURE" | "BT" | "BT1" | "BT1_TEMP" => {
                     SignalId::Temperature.as_u16()
                 }
+                "SBP" | "NIBP_SBP" => SignalId::SBP.as_u16(),
+                "DBP" | "NIBP_DBP" => SignalId::DBP.as_u16(),
+                "MBP" | "NIBP_MBP" => SignalId::MBP.as_u16(),
+                "AMB_PRES" | "AMBIENT_PRESSURE" => SignalId::AmbPres.as_u16(),
                 _ => continue,
             };
 
@@ -1565,12 +1583,16 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-010
-    /// Title: Test SUBSCRIBE_RSP is built correctly for Data_OUT
+    /// Title: SUBSCRIBE_RSP suppressed on TLV path — stream_id == signal_id
     ///
-    /// Description: SubscribeRsp::to_ble_bytes() shall produce a valid IDT frame
-    ///              with MSG_SUBSCRIBE_RSP (0x02) and correct IDT magic.
+    /// Description: Flutter sets stream_id = signal_id in its SUBSCRIBE_REQ, so it
+    ///              already knows the mapping without a RSP. Sending a RSP causes:
+    ///              • Data_OUT → "Bad Magic" (_processBuffer parses as DATA_FRAME)
+    ///              • Control  → FormatException (Flutter decodes Control as UTF-8)
+    ///              Verify that to_flutter_tlv_bytes() still produces a valid TLV
+    ///              in case a future Flutter version re-introduces RSP parsing. [DEV-5]
     #[test]
-    fn test_subscribe_rsp_sent_on_data_out() {
+    fn test_subscribe_rsp_tlv_format() {
         let rsp = SubscribeRsp {
             session_id: 1,
             req_id: 42,
@@ -1583,18 +1605,9 @@ mod tests {
                 effective_batch_max: 1,
             }],
         };
-        let bytes = rsp.to_ble_bytes();
-        assert_eq!(
-            u16::from_le_bytes([bytes[0], bytes[1]]),
-            IDT_MAGIC,
-            "SUBSCRIBE_RSP must start with IDT_MAGIC"
-        );
-        assert_eq!(
-            bytes[3], MSG_SUBSCRIBE_RSP,
-            "msg_type must be 0x02 (SUBSCRIBE_RSP)"
-        );
-        // Size: header(13) + req_id(2)+status(1)+n(1) + result(10) + crc(4) = 31
-        assert_eq!(bytes.len(), 31);
+        let bytes = rsp.to_flutter_tlv_bytes();
+        assert!(!bytes.is_empty(), "TLV RSP must not be empty");
+        assert_eq!(bytes[0], 0x21, "outer TLV type must be 0x21 (SUBSCRIBE_RSP)");
     }
 
     // ── Signal name alias coverage ────────────────────────────────────────────

@@ -45,6 +45,7 @@ pub const UNIT_BPM: u8 = 1;
 pub const UNIT_PCT: u8 = 2;
 pub const UNIT_MMHG: u8 = 3;
 pub const UNIT_DEGC: u8 = 4;
+pub const UNIT_HPA: u8 = 5;
 
 // subscribe op codes
 pub const SUB_OP_SUBSCRIBE: u8 = 1;
@@ -62,6 +63,10 @@ pub enum SignalId {
     HR = 0x0101,
     SpO2 = 0x0102,
     Temperature = 0x0103,
+    SBP = 0x0201,
+    DBP = 0x0202,
+    MBP = 0x0203,
+    AmbPres = 0x0501,
 }
 
 impl SignalId {
@@ -75,6 +80,10 @@ impl SignalId {
             0x0101 => Some(SignalId::HR),
             0x0102 => Some(SignalId::SpO2),
             0x0103 => Some(SignalId::Temperature),
+            0x0201 => Some(SignalId::SBP),
+            0x0202 => Some(SignalId::DBP),
+            0x0203 => Some(SignalId::MBP),
+            0x0501 => Some(SignalId::AmbPres),
             // Legacy simple IDs (spec "Proposition de protocole BLE.pdf" / older Central implementations)
             1 => Some(SignalId::HR),
             2 => Some(SignalId::SpO2),
@@ -89,6 +98,10 @@ impl SignalId {
             SignalId::HR => "HR",
             SignalId::SpO2 => "PLETH_SPO2",
             SignalId::Temperature => "BT1_TEMP",
+            SignalId::SBP => "SBP",
+            SignalId::DBP => "DBP",
+            SignalId::MBP => "MBP",
+            SignalId::AmbPres => "AMB_PRES",
         }
     }
 
@@ -106,7 +119,26 @@ impl SignalId {
             SignalId::HR => UNIT_BPM,
             SignalId::SpO2 => UNIT_PCT,
             SignalId::Temperature => UNIT_DEGC,
+            SignalId::SBP | SignalId::DBP | SignalId::MBP => UNIT_MMHG,
+            SignalId::AmbPres => UNIT_HPA,
         }
+    }
+
+    /// String unit label sent in the BLE Catalog (matches protocol field `unit: string`).
+    pub fn unit_str(self) -> &'static str {
+        match self {
+            SignalId::HR => "bpm",
+            SignalId::SpO2 => "%",
+            SignalId::Temperature => "\u{00B0}C", // °C
+            SignalId::SBP | SignalId::DBP | SignalId::MBP => "mmHg",
+            SignalId::AmbPres => "hPa",
+        }
+    }
+
+    /// Sample kind per protocol: 0=instantaneous, 1=waveform, 2=calculated, 3=event.
+    /// All current medical signals are instantaneous readings.
+    pub fn sample_kind(self) -> u8 {
+        0 // instantaneous
     }
 
     pub fn nominal_period_ms(self) -> u32 {
@@ -114,6 +146,9 @@ impl SignalId {
             SignalId::HR => 1000,
             SignalId::SpO2 => 1000,
             SignalId::Temperature => 2000,
+            // Discontinuous signals (NIBP cuff / ambient sensor)
+            SignalId::SBP | SignalId::DBP | SignalId::MBP => 300_000,
+            SignalId::AmbPres => 10_000,
         }
     }
 }
@@ -248,7 +283,7 @@ impl DataFrame {
         buf.extend_from_slice(&Self::SAMPLE_PAYLOAD_LEN.to_le_bytes()); // [22,23]  payloadLen = 6
         buf.extend_from_slice(&0u16.to_le_bytes()); // [24,25]   dt_ms = 0
         buf.extend_from_slice(&self.value.to_le_bytes()); // [26..29]  4 bytes
-        // [30..33] CRC32C over the preceding 30 bytes [TODO-1 resolved]
+                                                          // [30..33] CRC32C over the preceding 30 bytes [TODO-1 resolved]
         let crc = crc32c::crc32c(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
         buf
@@ -376,12 +411,12 @@ impl AckFrame {
             return None;
         }
         let session_id = u16::from_le_bytes([b[0], b[1]]);
-        let stream_id  = u16::from_le_bytes([b[2], b[3]]);
-        let ack_upto   = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+        let stream_id = u16::from_le_bytes([b[2], b[3]]);
+        let ack_upto = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
         let bitmap_len = b[8] as usize;
         let mut bitmap = [0u8; 8];
-        let available  = b.len().saturating_sub(9);
-        let copy_len   = bitmap_len.min(8).min(available);
+        let available = b.len().saturating_sub(9);
+        let copy_len = bitmap_len.min(8).min(available);
         if copy_len > 0 {
             bitmap[..copy_len].copy_from_slice(&b[9..9 + copy_len]);
         }
@@ -393,7 +428,12 @@ impl AckFrame {
                 FLUTTER_LEN
             );
         }
-        Some(Self { session_id, stream_id, ack_upto, bitmap })
+        Some(Self {
+            session_id,
+            stream_id,
+            ack_upto,
+            bitmap,
+        })
     }
 
     /// Parse MyPredi ACK format: IDT-like 24-byte header + 17-byte payload + CRC32C = 45 bytes.
@@ -416,9 +456,15 @@ impl AckFrame {
         const CRC_LEN: usize = 4;
         const TOTAL: usize = HEADER_LEN + PAYLOAD_LEN + CRC_LEN; // 45
 
-        if b.len() < TOTAL { return None; }
-        if !has_idt_magic(b) { return None; }
-        if b[3] != MSG_ACK_FRAME { return None; }
+        if b.len() < TOTAL {
+            return None;
+        }
+        if !has_idt_magic(b) {
+            return None;
+        }
+        if b[3] != MSG_ACK_FRAME {
+            return None;
+        }
 
         // Verify CRC32C over everything except the trailing 4-byte CRC
         let crc_offset = b.len() - CRC_LEN;
@@ -431,9 +477,9 @@ impl AckFrame {
 
         // Parse payload at offset 24
         let p = HEADER_LEN;
-        let session_id = u16::from_le_bytes([b[p],     b[p + 1]]);
-        let stream_id  = u16::from_le_bytes([b[p + 2], b[p + 3]]);
-        let ack_upto   = u32::from_le_bytes([b[p + 4], b[p + 5], b[p + 6], b[p + 7]]);
+        let session_id = u16::from_le_bytes([b[p], b[p + 1]]);
+        let stream_id = u16::from_le_bytes([b[p + 2], b[p + 3]]);
+        let ack_upto = u32::from_le_bytes([b[p + 4], b[p + 5], b[p + 6], b[p + 7]]);
         let bitmap_len = b[p + 8] as usize;
         let mut bitmap = [0u8; 8];
         let copy_len = bitmap_len.min(8).min(b.len().saturating_sub(p + 9));
@@ -441,7 +487,12 @@ impl AckFrame {
             bitmap[..copy_len].copy_from_slice(&b[p + 9..p + 9 + copy_len]);
         }
 
-        Some(Self { session_id, stream_id, ack_upto, bitmap })
+        Some(Self {
+            session_id,
+            stream_id,
+            ack_upto,
+            bitmap,
+        })
     }
 
     /// Returns true if `seq` is acknowledged — either cumulatively (seq ≤ ack_upto)
@@ -737,26 +788,28 @@ pub struct SubscribeRsp {
 
 impl SubscribeRsp {
     /// Serialize to bytes for sending via Data_OUT Notify.
-    /// Format: [Header(13b)] [req_id(2b)] [status(1b)] [n(1b)] [results(n×10b)] [CRC32C(4b)]
+    ///
+    /// Uses the **13-byte compact IDT header** — same layout as DATA_FRAME:
+    ///   magic(2) | version(1) | msg_type(1) | flags(1)
+    ///   | session_id(2) | stream_id(2) | seq(4)
+    /// Then: payload | CRC32C(4)
+    ///
+    /// NOTE: if Flutter's `decodeHeader()` is updated to the 16-byte spec header
+    /// (with `header_len` at byte [5]), switch to that format and update the test.
     pub fn to_ble_bytes(&self) -> Vec<u8> {
         let n = self.results.len();
-        let payload_len = 4 + n * SubscribeRspItem::SIZE; // req_id(2)+status(1)+n(1)+results
-        let total = IdtHeader::SIZE + payload_len + 4;
-        let mut buf = Vec::with_capacity(total);
+        let mut buf = Vec::with_capacity(13 + 4 + n * SubscribeRspItem::SIZE + 4);
 
-        // Build header (13 bytes — no payload_len field in IdtHeader)
-        let header = IdtHeader {
-            magic: IDT_MAGIC,
-            version: IDT_VERSION,
-            msg_type: MSG_SUBSCRIBE_RSP,
-            flags: 0,
-            session_id: self.session_id,
-            stream_id: 0,
-            seq: 0,
-        };
-        buf.extend_from_slice(&header.to_bytes());
+        // 13-byte compact header
+        buf.extend_from_slice(&IDT_MAGIC.to_le_bytes());      // [0-1]  magic
+        buf.push(IDT_VERSION);                                 // [2]    version
+        buf.push(MSG_SUBSCRIBE_RSP);                           // [3]    msg_type = 0x02
+        buf.push(0u8);                                         // [4]    flags
+        buf.extend_from_slice(&self.session_id.to_le_bytes()); // [5-6]  session_id
+        buf.extend_from_slice(&0u16.to_le_bytes());            // [7-8]  stream_id = 0
+        buf.extend_from_slice(&0u32.to_le_bytes());            // [9-12] seq = 0
 
-        // Build payload
+        // Payload
         buf.extend_from_slice(&self.req_id.to_le_bytes());
         buf.push(self.status);
         buf.push(n as u8);
@@ -768,7 +821,7 @@ impl SubscribeRsp {
             buf.push(r.effective_batch_max);
         }
 
-        // Append CRC32C
+        // CRC32C on header+payload
         let crc = crc32c::crc32c(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
         buf
@@ -792,7 +845,7 @@ impl SubscribeRsp {
     /// ])
     /// ```
     /// Each TLV field is encoded as `[type(1b), len_lo(1b), len_hi(1b), ...value]`.
-    /// Signal IDs are simple (1, 2, 3) — lower byte of the compound IDT ID (0x0101 → 0x01).
+    /// Signal IDs are the full compound IDT ID (2b LE) — e.g. 0x0101, 0x0201, 0x0501.
     pub fn to_flutter_tlv_bytes(&self) -> Vec<u8> {
         fn tlv(t: u8, value: &[u8]) -> Vec<u8> {
             let len = value.len();
@@ -810,9 +863,9 @@ impl SubscribeRsp {
             let mut sp: Vec<u8> = Vec::new();
             sp.extend(tlv(0x01, &r.stream_id.to_le_bytes()));
             sp.extend(tlv(0x02, &[r.source_id]));
-            // Simple signal ID: lower byte of compound IDT ID (0x0101→1, 0x0102→2, 0x0103→3)
-            let simple_id: u16 = r.signal_id & 0x00FF;
-            sp.extend(tlv(0x03, &simple_id.to_le_bytes()));
+            // Full compound signal_id (2b LE) — mirrors what Flutter sent in SUBSCRIBE_REQ.
+            // 0x01xx signals keep backward compat; 0x02xx/0x05xx need the full ID (lower byte alone conflicts).
+            sp.extend(tlv(0x03, &r.signal_id.to_le_bytes()));
             sp.extend(tlv(0x04, &r.effective_period_ms.to_le_bytes()));
             sp.extend(tlv(0x05, &[r.effective_batch_max]));
             payload.extend(tlv(0x03, &sp));
@@ -826,22 +879,27 @@ impl SubscribeRsp {
 // Catalog — IDT signal catalog (TLV binary format)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// One entry in the Catalog characteristic (TLV format, variable length)
+/// One entry in the Catalog characteristic (binary TLV, variable length).
 ///
-/// Byte layout per entry:
-/// [0]    source_id          u8
-/// [1..3] signal_id          u16 LE
-/// [3]    value_type         u8  (3=float32, 6=uint16)
-/// [4]    unit_code          u8  (1=bpm, 2=%, 3=mmHg, 4=°C)
-/// [5..9] nominal_period_ms  u32 LE
-/// [9]    name_len           u8
-/// [10..] name               UTF-8 bytes
+/// Byte layout per entry (protocol field order):
+/// [0..2]  signal_id         u16 LE
+/// [2]     source_id         u8
+/// [3]     name_len          u8
+/// [4..]   name              UTF-8 bytes (e.g. "PLETH_SPO2")
+/// [+0]    unit_len          u8
+/// [+1..]  unit              UTF-8 bytes (e.g. "%", "mmHg", "°C")
+/// [+0]    value_type        u8  (3=float32, 6=uint16)
+/// [+1]    sample_kind       u8  (0=instantaneous, 1=waveform, 2=calculated, 3=event)
+/// [+2..6] nominal_period_ms u32 LE
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogEntry {
     pub source_id: u8,
     pub signal_id: u16,
     pub value_type: u8,
-    pub unit_code: u8,
+    /// String unit label: "bpm", "%", "°C", "mmHg", "hPa"
+    pub unit: String,
+    /// 0=instantaneous, 1=waveform, 2=calculated, 3=event
+    pub sample_kind: u8,
     pub nominal_period_ms: u32,
     pub name: String,
 }
@@ -854,47 +912,49 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// Default medical catalog: HR, SpO2, Temperature (all float32, source=scope)
-    /// Todo — make this configurable in case we want to add more signals in the future without code changes
+    /// Default medical catalog: HR, SpO2, Temperature, SBP, DBP, MBP, AmbPres (all float32, source=scope)
     pub fn default_medical_catalog() -> Self {
         Self {
-            entries: vec![
-                CatalogEntry {
-                    source_id: SignalId::HR.source_id(),
-                    signal_id: SignalId::HR.as_u16(),
-                    value_type: SignalId::HR.value_type(),
-                    unit_code: SignalId::HR.unit_code(),
-                    nominal_period_ms: SignalId::HR.nominal_period_ms(),
-                    name: SignalId::HR.name().to_string(),
-                },
-                CatalogEntry {
-                    source_id: SignalId::SpO2.source_id(),
-                    signal_id: SignalId::SpO2.as_u16(),
-                    value_type: SignalId::SpO2.value_type(),
-                    unit_code: SignalId::SpO2.unit_code(),
-                    nominal_period_ms: SignalId::SpO2.nominal_period_ms(),
-                    name: SignalId::SpO2.name().to_string(),
-                },
-                CatalogEntry {
-                    source_id: SignalId::Temperature.source_id(),
-                    signal_id: SignalId::Temperature.as_u16(),
-                    value_type: SignalId::Temperature.value_type(),
-                    unit_code: SignalId::Temperature.unit_code(),
-                    nominal_period_ms: SignalId::Temperature.nominal_period_ms(),
-                    name: SignalId::Temperature.name().to_string(),
-                },
-            ],
+            entries: [
+                SignalId::HR,
+                SignalId::SpO2,
+                SignalId::Temperature,
+                SignalId::SBP,
+                SignalId::DBP,
+                SignalId::MBP,
+                SignalId::AmbPres,
+            ]
+            .iter()
+            .map(|&sig| CatalogEntry {
+                source_id: sig.source_id(),
+                signal_id: sig.as_u16(),
+                value_type: sig.value_type(),
+                unit: sig.unit_str().to_string(),
+                sample_kind: sig.sample_kind(),
+                nominal_period_ms: sig.nominal_period_ms(),
+                name: sig.name().to_string(),
+            })
+            .collect(),
         }
     }
 
-    /// Serialize to TLV binary for the Catalog GATT characteristic (Read).
+    /// Serialize to binary for the Catalog GATT characteristic (Read).
+    ///
+    /// Layout per entry (protocol spec v1 p.20):
+    ///   source_id(1) | signal_id(2 LE) | value_type(1) | unit_code(1) | nominal_period_ms(4 LE) | name_len(1) | name(N)
+    ///
+    /// unit_code: 1=bpm, 2=%, 3=mmHg, 4=°C, 5=mV, 6=mm, 255=custom
+    /// value_type: 1=int32, 2=uint32, 3=float32, 4=string, 5=int16, 6=uint16
     pub fn to_ble_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         for e in &self.entries {
+            let unit_code = SignalId::from_u16(e.signal_id)
+                .map(|s| s.unit_code())
+                .unwrap_or(255);
             buf.push(e.source_id);
             buf.extend_from_slice(&e.signal_id.to_le_bytes());
             buf.push(e.value_type);
-            buf.push(e.unit_code);
+            buf.push(unit_code);
             buf.extend_from_slice(&e.nominal_period_ms.to_le_bytes());
             let name_bytes = e.name.as_bytes();
             buf.push(name_bytes.len() as u8);
@@ -971,8 +1031,10 @@ pub struct SignalMeta {
     pub name: String,
     /// Value encoding — VALUE_TYPE_FLOAT32 (3) for all V1 medical signals
     pub value_type: u8,
-    /// Physical unit — UNIT_BPM (1), UNIT_PCT (2), UNIT_DEGC (4), UNIT_MMHG (3)
-    pub unit_code: u8,
+    /// String unit label: "bpm", "%", "°C", "mmHg", "hPa"
+    pub unit: String,
+    /// 0=instantaneous, 1=waveform, 2=calculated, 3=event
+    pub sample_kind: u8,
     pub nominal_period_ms: u32,
 }
 
@@ -997,17 +1059,26 @@ impl SignalRegistry {
         }
     }
 
-    /// Pre-register the three V1 medical signals: HR (0x0101), SpO2 (0x0102),
-    /// Temperature (0x0103).
+    /// Pre-register the seven V1 medical signals: HR (0x0101), SpO2 (0x0102),
+    /// Temperature (0x0103), SBP (0x0201), DBP (0x0202), MBP (0x0203), AmbPres (0x0501).
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
-        for sig in [SignalId::HR, SignalId::SpO2, SignalId::Temperature] {
+        for sig in [
+            SignalId::HR,
+            SignalId::SpO2,
+            SignalId::Temperature,
+            SignalId::SBP,
+            SignalId::DBP,
+            SignalId::MBP,
+            SignalId::AmbPres,
+        ] {
             r.register(SignalMeta {
                 signal_id: sig.as_u16(),
                 source_id: sig.source_id(),
                 name: sig.name().to_string(),
                 value_type: sig.value_type(),
-                unit_code: sig.unit_code(),
+                unit: sig.unit_str().to_string(),
+                sample_kind: sig.sample_kind(),
                 nominal_period_ms: sig.nominal_period_ms(),
             });
         }
@@ -1060,7 +1131,8 @@ impl SignalRegistry {
                 source_id: m.source_id,
                 signal_id: m.signal_id,
                 value_type: m.value_type,
-                unit_code: m.unit_code,
+                unit: m.unit.clone(),
+                sample_kind: m.sample_kind,
                 nominal_period_ms: m.nominal_period_ms,
                 name: m.name.clone(),
             })
@@ -1123,6 +1195,20 @@ pub fn parse_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<u16>)> {
     } else {
         Some((req_id, signal_ids))
     }
+}
+
+/// Parse an IDT-wrapped MyPredi TLV SUBSCRIBE_REQ.
+///
+/// Some legacy Flutter/MyPredi centrals send an IDT-like envelope with
+/// `IDT_MAGIC` and `MSG_SUBSCRIBE_REQ` before the actual TLV payload.
+/// The real TLV section begins at offset 24 and ends 4 bytes before the end.
+/// Returns `Some((req_id, signal_ids))` if the embedded TLV payload is valid.
+pub fn parse_idt_wrapped_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<u16>)> {
+    if data.get(3).copied() != Some(MSG_SUBSCRIBE_REQ) || data.len() <= 28 {
+        return None;
+    }
+    let tlv_payload = &data[24..data.len().saturating_sub(4)];
+    parse_tlv_subscribe_req(tlv_payload)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1231,14 +1317,19 @@ mod tests {
         assert_eq!(SignalId::from_u16(0x0101), Some(SignalId::HR));
         assert_eq!(SignalId::from_u16(0x0102), Some(SignalId::SpO2));
         assert_eq!(SignalId::from_u16(0x0103), Some(SignalId::Temperature));
+        assert_eq!(SignalId::from_u16(0x0201), Some(SignalId::SBP));
+        assert_eq!(SignalId::from_u16(0x0202), Some(SignalId::DBP));
+        assert_eq!(SignalId::from_u16(0x0203), Some(SignalId::MBP));
+        assert_eq!(SignalId::from_u16(0x0501), Some(SignalId::AmbPres));
         // Legacy simple IDs (I.pdf / older Central) — must also be accepted
         assert_eq!(SignalId::from_u16(1), Some(SignalId::HR));
         assert_eq!(SignalId::from_u16(2), Some(SignalId::SpO2));
         assert_eq!(SignalId::from_u16(3), Some(SignalId::Temperature));
-        // Unknown IDs must be rejected (0x0001==1 is now valid as legacy HR, use other values)
+        // Unknown IDs must be rejected
         assert_eq!(SignalId::from_u16(0), None);
         assert_eq!(SignalId::from_u16(4), None);
         assert_eq!(SignalId::from_u16(0x0200), None);
+        assert_eq!(SignalId::from_u16(0x0500), None);
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-003
@@ -1247,11 +1338,21 @@ mod tests {
         assert_eq!(SignalId::HR.name(), "HR");
         assert_eq!(SignalId::SpO2.name(), "PLETH_SPO2");
         assert_eq!(SignalId::Temperature.name(), "BT1_TEMP");
+        assert_eq!(SignalId::SBP.name(), "SBP");
+        assert_eq!(SignalId::DBP.name(), "DBP");
+        assert_eq!(SignalId::MBP.name(), "MBP");
+        assert_eq!(SignalId::AmbPres.name(), "AMB_PRES");
         assert_eq!(SignalId::HR.unit_code(), UNIT_BPM);
         assert_eq!(SignalId::SpO2.unit_code(), UNIT_PCT);
         assert_eq!(SignalId::Temperature.unit_code(), UNIT_DEGC);
+        assert_eq!(SignalId::SBP.unit_code(), UNIT_MMHG);
+        assert_eq!(SignalId::DBP.unit_code(), UNIT_MMHG);
+        assert_eq!(SignalId::MBP.unit_code(), UNIT_MMHG);
+        assert_eq!(SignalId::AmbPres.unit_code(), UNIT_HPA);
         assert_eq!(SignalId::HR.nominal_period_ms(), 1000);
         assert_eq!(SignalId::Temperature.nominal_period_ms(), 2000);
+        assert_eq!(SignalId::SBP.nominal_period_ms(), 300_000);
+        assert_eq!(SignalId::AmbPres.nominal_period_ms(), 10_000);
         assert_eq!(SignalId::HR.source_id(), 1);
         assert_eq!(SignalId::HR.value_type(), VALUE_TYPE_FLOAT32);
     }
@@ -1442,7 +1543,7 @@ mod tests {
             }],
         };
         let bytes = rsp.to_ble_bytes();
-        // Verify magic in header
+        // 13-byte compact header: magic ✓, msg_type=0x02 at [3], session_id at [5-6]
         assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), IDT_MAGIC);
         assert_eq!(bytes[3], MSG_SUBSCRIBE_RSP);
         // Size = header(13) + req_id(2)+status(1)+n(1) + result(10) + crc(4) = 31
@@ -1455,10 +1556,14 @@ mod tests {
     #[test]
     fn test_catalog_default_medical() {
         let catalog = Catalog::default_medical_catalog();
-        assert_eq!(catalog.entries.len(), 3);
+        assert_eq!(catalog.entries.len(), 7);
         assert_eq!(catalog.entries[0].signal_id, 0x0101);
         assert_eq!(catalog.entries[1].signal_id, 0x0102);
         assert_eq!(catalog.entries[2].signal_id, 0x0103);
+        assert_eq!(catalog.entries[3].signal_id, 0x0201);
+        assert_eq!(catalog.entries[4].signal_id, 0x0202);
+        assert_eq!(catalog.entries[5].signal_id, 0x0203);
+        assert_eq!(catalog.entries[6].signal_id, 0x0501);
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-019
@@ -1467,12 +1572,16 @@ mod tests {
         let catalog = Catalog::default_medical_catalog();
         let bytes = catalog.to_ble_bytes();
         assert!(!bytes.is_empty());
-        // First entry: source_id=1 at [0], signal_id=0x0101 at [1..3] LE
-        assert_eq!(bytes[0], 1u8); // source_id
-        assert_eq!(bytes[1], 0x01); // signal_id low byte (0x0101 LE → 0x01, 0x01)
+        // First entry (HR) — spec v1 layout (p.20):
+        // source_id(1) | signal_id(2 LE) | value_type(1) | unit_code(1) | period_ms(4 LE) | name_len(1) | name(N)
+        assert_eq!(bytes[0], 1u8); // source_id = 1 (scope)
+        assert_eq!(bytes[1], 0x01); // signal_id low byte  (0x0101 LE)
         assert_eq!(bytes[2], 0x01); // signal_id high byte
-        assert_eq!(bytes[3], VALUE_TYPE_FLOAT32); // value_type
-        assert_eq!(bytes[4], UNIT_BPM); // unit_code
+        assert_eq!(bytes[3], VALUE_TYPE_FLOAT32); // value_type = 3
+        assert_eq!(bytes[4], UNIT_BPM); // unit_code = 1 (bpm)
+        assert_eq!(u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]), 1000); // period_ms
+        let name_len = bytes[9] as usize;
+        assert_eq!(&bytes[10..10 + name_len], b"HR");
     }
 
     // ── InboundFrame dispatch tests ───────────────────────────────────────────
@@ -1673,7 +1782,8 @@ mod tests {
     /// SubscribeReq::from_ble_bytes returns None when CRC is corrupted (no valid stride found)
     #[test]
     fn test_subscribe_req_bad_crc_returns_none() {
-        let mut buf = make_subscribe_req_bytes(1, 1, SUB_OP_SUBSCRIBE, &[(1, SignalId::HR.as_u16())]);
+        let mut buf =
+            make_subscribe_req_bytes(1, 1, SUB_OP_SUBSCRIBE, &[(1, SignalId::HR.as_u16())]);
         // Corrupt last CRC byte so detect_item_stride finds no valid stride
         let last = buf.len() - 1;
         buf[last] ^= 0xFF;
@@ -1704,7 +1814,7 @@ mod tests {
             ack_upto: 0,
             bitmap,
         };
-        assert!(ack.is_acked(9),  "bit 8 in byte1 → seq 9 must be acked");
+        assert!(ack.is_acked(9), "bit 8 in byte1 → seq 9 must be acked");
         assert!(ack.is_acked(16), "bit 15 in byte1 → seq 16 must be acked");
         assert!(!ack.is_acked(10), "bit 9 clear → seq 10 not acked");
     }
@@ -1720,7 +1830,10 @@ mod tests {
         assert_eq!(bytes.len(), 34);
         let expected = crc32c::crc32c(&bytes[..30]);
         let actual = u32::from_le_bytes([bytes[30], bytes[31], bytes[32], bytes[33]]);
-        assert_eq!(actual, expected, "CRC32C at [30..34] must equal crc32c(bytes[0..30])");
+        assert_eq!(
+            actual, expected,
+            "CRC32C at [30..34] must equal crc32c(bytes[0..30])"
+        );
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-043
@@ -1728,13 +1841,22 @@ mod tests {
     #[test]
     fn test_dataframe_verify_crc_pass_and_fail() {
         let bytes = DataFrame::new(1, 1, 1, 0, 65.0).to_ble_bytes();
-        assert!(DataFrame::verify_crc(&bytes), "valid frame must pass CRC check");
+        assert!(
+            DataFrame::verify_crc(&bytes),
+            "valid frame must pass CRC check"
+        );
         // Corrupt a byte in the header
         let mut corrupted = bytes.clone();
         corrupted[5] ^= 0xFF;
-        assert!(!DataFrame::verify_crc(&corrupted), "corrupted frame must fail CRC check");
+        assert!(
+            !DataFrame::verify_crc(&corrupted),
+            "corrupted frame must fail CRC check"
+        );
         // Too-short buffer must fail
-        assert!(!DataFrame::verify_crc(&bytes[..33]), "short buffer must fail CRC check");
+        assert!(
+            !DataFrame::verify_crc(&bytes[..33]),
+            "short buffer must fail CRC check"
+        );
     }
 
     // ── has_idt_magic tests ────────────────────────────────────────────────────
@@ -1749,7 +1871,7 @@ mod tests {
         // Wrong magic
         assert!(!has_idt_magic(&[0x20, 0x00]));
         assert!(!has_idt_magic(&[0xD1, 0x7A])); // bytes swapped (big-endian) — rejected
-        // Too short
+                                                // Too short
         assert!(!has_idt_magic(&[]));
         assert!(!has_idt_magic(&[0x7A]));
     }
@@ -1764,7 +1886,11 @@ mod tests {
         assert!(r.get(0x0101).is_some(), "HR must be registered");
         assert!(r.get(0x0102).is_some(), "SpO2 must be registered");
         assert!(r.get(0x0103).is_some(), "Temperature must be registered");
-        assert_eq!(r.all_signal_ids().len(), 3);
+        assert!(r.get(0x0201).is_some(), "SBP must be registered");
+        assert!(r.get(0x0202).is_some(), "DBP must be registered");
+        assert!(r.get(0x0203).is_some(), "MBP must be registered");
+        assert!(r.get(0x0501).is_some(), "AmbPres must be registered");
+        assert_eq!(r.all_signal_ids().len(), 7);
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-046
@@ -1773,19 +1899,20 @@ mod tests {
     fn test_signal_registry_register_extra_signal() {
         let mut r = SignalRegistry::with_defaults();
         r.register(SignalMeta {
-            signal_id: 0x0201,
+            signal_id: 0x0204,
             source_id: 2,
             name: "IBP_SBP".to_string(),
             value_type: VALUE_TYPE_FLOAT32,
-            unit_code: UNIT_MMHG,
+            unit: "mmHg".to_string(),
+            sample_kind: 0,
             nominal_period_ms: 1000,
         });
-        assert_eq!(r.all_signal_ids().len(), 4);
-        assert!(r.get(0x0201).is_some());
+        assert_eq!(r.all_signal_ids().len(), 8);
+        assert!(r.get(0x0204).is_some());
         let catalog = r.build_catalog();
-        assert_eq!(catalog.entries.len(), 4);
-        // Sorted by signal_id: 0x0101, 0x0102, 0x0103, 0x0201
-        assert_eq!(catalog.entries[3].signal_id, 0x0201);
+        assert_eq!(catalog.entries.len(), 8);
+        // Sorted by signal_id: 0x0101, 0x0102, 0x0103, 0x0201, 0x0202, 0x0203, 0x0204, 0x0501
+        assert_eq!(catalog.entries[6].signal_id, 0x0204);
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-047
@@ -1796,9 +1923,13 @@ mod tests {
         assert_eq!(r.normalize_id(1), Some(0x0101));
         assert_eq!(r.normalize_id(2), Some(0x0102));
         assert_eq!(r.normalize_id(3), Some(0x0103));
-        assert_eq!(r.normalize_id(0x0101), Some(0x0101)); // canonical — direct hit
-        assert_eq!(r.normalize_id(0x9999), None);          // unknown
-        assert_eq!(r.normalize_id(0), None);               // zero — rejected
+        assert_eq!(r.normalize_id(0x0201), Some(0x0201)); // SBP canonical
+        assert_eq!(r.normalize_id(0x0202), Some(0x0202)); // DBP canonical
+        assert_eq!(r.normalize_id(0x0203), Some(0x0203)); // MBP canonical
+        assert_eq!(r.normalize_id(0x0501), Some(0x0501)); // AmbPres canonical
+        assert_eq!(r.normalize_id(0x0101), Some(0x0101)); // HR canonical — direct hit
+        assert_eq!(r.normalize_id(0x9999), None); // unknown
+        assert_eq!(r.normalize_id(0), None); // zero — rejected
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-048
@@ -1813,7 +1944,7 @@ mod tests {
             assert_eq!(a.signal_id, b.signal_id);
             assert_eq!(a.name, b.name);
             assert_eq!(a.nominal_period_ms, b.nominal_period_ms);
-            assert_eq!(a.unit_code, b.unit_code);
+            assert_eq!(a.unit, b.unit);
         }
     }
 
@@ -1827,14 +1958,27 @@ mod tests {
         assert!(r.contains_normalized(0x0101), "HR canonical must resolve");
         assert!(r.contains_normalized(0x0102), "SpO2 canonical must resolve");
         assert!(r.contains_normalized(0x0103), "Temp canonical must resolve");
-        // Legacy simple IDs — SignalId fallback + filter
+        assert!(r.contains_normalized(0x0201), "SBP canonical must resolve");
+        assert!(r.contains_normalized(0x0202), "DBP canonical must resolve");
+        assert!(r.contains_normalized(0x0203), "MBP canonical must resolve");
+        assert!(
+            r.contains_normalized(0x0501),
+            "AmbPres canonical must resolve"
+        );
+        // Legacy simple IDs — SignalId fallback + filter (0x01xx only)
         assert!(r.contains_normalized(1), "legacy HR id=1 must resolve");
         assert!(r.contains_normalized(2), "legacy SpO2 id=2 must resolve");
         assert!(r.contains_normalized(3), "legacy Temp id=3 must resolve");
         // Unknown IDs must not resolve
-        assert!(!r.contains_normalized(0),      "zero must not resolve");
-        assert!(!r.contains_normalized(0x9999), "unknown IDT ID must not resolve");
-        assert!(!r.contains_normalized(99),     "unknown legacy simple ID must not resolve");
+        assert!(!r.contains_normalized(0), "zero must not resolve");
+        assert!(
+            !r.contains_normalized(0x9999),
+            "unknown IDT ID must not resolve"
+        );
+        assert!(
+            !r.contains_normalized(99),
+            "unknown legacy simple ID must not resolve"
+        );
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-050
@@ -1842,13 +1986,30 @@ mod tests {
     #[test]
     fn test_signal_registry_new_is_empty() {
         let r = SignalRegistry::new();
-        assert!(r.all_signal_ids().is_empty(), "fresh registry must have no signal IDs");
-        assert!(r.get(0x0101).is_none(),        "get on empty registry must be None");
+        assert!(
+            r.all_signal_ids().is_empty(),
+            "fresh registry must have no signal IDs"
+        );
+        assert!(
+            r.get(0x0101).is_none(),
+            "get on empty registry must be None"
+        );
         // normalize_id falls back to SignalId enum, but the .filter() gates on the registry
         // — so even legacy IDs return None when the registry has no entries
-        assert_eq!(r.normalize_id(1), None, "legacy id=1 must not resolve in empty registry");
-        assert!(!r.contains_normalized(1),  "contains_normalized must be false in empty registry");
-        assert_eq!(r.build_catalog().entries.len(), 0, "catalog from empty registry must be empty");
+        assert_eq!(
+            r.normalize_id(1),
+            None,
+            "legacy id=1 must not resolve in empty registry"
+        );
+        assert!(
+            !r.contains_normalized(1),
+            "contains_normalized must be false in empty registry"
+        );
+        assert_eq!(
+            r.build_catalog().entries.len(),
+            0,
+            "catalog from empty registry must be empty"
+        );
     }
 
     // ── parse_tlv_subscribe_req ───────────────────────────────────────────────
@@ -1866,17 +2027,12 @@ mod tests {
             0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, // nested TLV: period_ms=0
             0x05, 0x01, 0x00, 0x01, // nested TLV: batch_max=1
             0x03, 0x18, 0x00, // item 2 tag+len
-            0x01, 0x01, 0x00, 0x01,
-            0x02, 0x02, 0x00, 0x02, 0x00, // signal_id=2 (SpO2)
-            0x03, 0x01, 0x00, 0x00,
-            0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x05, 0x01, 0x00, 0x01,
-            0x03, 0x18, 0x00, // item 3 tag+len
-            0x01, 0x01, 0x00, 0x01,
-            0x02, 0x02, 0x00, 0x03, 0x00, // signal_id=3 (Temperature)
-            0x03, 0x01, 0x00, 0x00,
-            0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x05, 0x01, 0x00, 0x01,
+            0x01, 0x01, 0x00, 0x01, 0x02, 0x02, 0x00, 0x02, 0x00, // signal_id=2 (SpO2)
+            0x03, 0x01, 0x00, 0x00, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x00,
+            0x01, 0x03, 0x18, 0x00, // item 3 tag+len
+            0x01, 0x01, 0x00, 0x01, 0x02, 0x02, 0x00, 0x03, 0x00, // signal_id=3 (Temperature)
+            0x03, 0x01, 0x00, 0x00, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x00,
+            0x01,
         ];
         assert_eq!(bytes.len(), 89);
         let (req_id, signal_ids) = parse_tlv_subscribe_req(&bytes).unwrap();
@@ -1893,6 +2049,31 @@ mod tests {
         assert!(parse_tlv_subscribe_req(&bytes).is_none());
     }
 
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-023
+    /// parse_idt_wrapped_tlv_subscribe_req accepts a MyPredi TLV SUBSCRIBE_REQ wrapped in an IDT envelope.
+    #[test]
+    fn test_parse_idt_wrapped_tlv_subscribe_req() {
+        let mut bytes = vec![0u8; 24];
+        bytes[0..2].copy_from_slice(&IDT_MAGIC.to_le_bytes());
+        bytes[2] = IDT_VERSION;
+        bytes[3] = MSG_SUBSCRIBE_REQ;
+        bytes.extend_from_slice(&[
+            0x20, 0x56, 0x00, 0x01, 0x02, 0x00, 0x2A, 0x00, // tlv header
+            0x03, 0x18, 0x00, 0x01, 0x01, 0x00, 0x01, 0x02, 0x02, 0x00, 0x01, 0x00, 0x03, 0x01,
+            0x00, 0x00, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x00, 0x01, 0x03,
+            0x18, 0x00, 0x01, 0x01, 0x00, 0x01, 0x02, 0x02, 0x00, 0x02, 0x00, 0x03, 0x01, 0x00,
+            0x00, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x00, 0x01, 0x03, 0x18,
+            0x00, 0x01, 0x01, 0x00, 0x01, 0x02, 0x02, 0x00, 0x03, 0x00, 0x03, 0x01, 0x00, 0x00,
+            0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x00, 0x01,
+        ]);
+        bytes.extend_from_slice(&[0u8; 4]);
+
+        assert_eq!(
+            parse_idt_wrapped_tlv_subscribe_req(&bytes),
+            Some((0x002A, vec![1u16, 2u16, 3u16]))
+        );
+    }
+
     /// ID SRS: SRS-TEST-BLEPROTOCOL-022
     /// parse_tlv_subscribe_req returns None for a buffer that is too short
     #[test]
@@ -1900,5 +2081,4 @@ mod tests {
         let bytes = vec![0x20u8; 30]; // 8 + 22 < 8 + 27
         assert!(parse_tlv_subscribe_req(&bytes).is_none());
     }
-
 }
