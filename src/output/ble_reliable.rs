@@ -819,9 +819,10 @@ impl ReliableBleOutput {
                         canonical_id
                     );
                 }
-                // Flutter hardcodes activeStreams[1..7] in _initStreams() — signal→stream map is fixed:
+                        // Flutter v2 reads stream_id from SUBSCRIBE_RSP to build activeStreams.
+                // We use a fixed 1-7 mapping so stream IDs are stable and predictable:
                 //   0x0101→1, 0x0102→2, 0x0103→3, 0x0201→4, 0x0202→5, 0x0203→6, 0x0501→7
-                // DATA_FRAMEs must use these exact IDs or Flutter silently drops them.
+                // RSP and DATA_FRAMEs both use this mapping — they must be consistent.
                 let flutter_sid = Self::flutter_stream_id(canonical_id);
                 let stream_id = st.subscribe_with_stream_id(canonical_id, flutter_sid);
                 let meta = registry.get(canonical_id).unwrap();
@@ -846,17 +847,37 @@ impl ReliableBleOutput {
             return;
         }
 
-        // [DEV-5] No RSP sent for TLV subscribe path.
-        // Flutter pre-populates activeStreams[1..7] in _initStreams() with hardcoded signal IDs.
-        // It does NOT use the SUBSCRIBE_RSP to build its stream map — RSP is ignored.
-        // • Data_OUT is wrong: _processBuffer parses all notifications as DATA_FRAMEs → "Bad Magic"
-        // • Control is wrong: Flutter decodes Control as UTF-8 (Health JSON) → FormatException
-        // If Flutter ever needs a RSP, coordinate format with Flutter dev first.
-        log::debug!(
-            "TLV SUBSCRIBE_RSP suppressed (req_id={}, {} stream(s) allocated)",
+        // [DEV-6] Send SUBSCRIBE_RSP on Data_OUT as a full 24-byte IDT frame.
+        // Flutter v2 _processBuffer() dispatches msgType=0x02 → _handleSubscribeResponse(),
+        // which builds activeStreams from the TLV payload. _initStreams() is now commented
+        // out — activeStreams is empty until RSP arrives. Without RSP, all DATA_FRAMEs
+        // are silently dropped (stream == null guard).
+        let rsp = SubscribeRsp {
+            session_id,
             req_id,
-            rsp_items.len()
-        );
+            status: 0,
+            results: rsp_items,
+        };
+        let rsp_bytes = rsp.to_mypredi_ble_bytes();
+
+        // Small delay: BLE stack ordering safety margin.
+        // CCCD is pre-enabled by Flutter before the SUBSCRIBE write, so no long wait needed.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let srv = server.read().await;
+        if let Err(e) = srv.notify("Data_OUT", &rsp_bytes).await {
+            log::warn!(
+                "SUBSCRIBE_RSP notify on Data_OUT failed (req_id={}): {}",
+                req_id, e
+            );
+        } else {
+            log::info!(
+                "SUBSCRIBE_RSP sent on Data_OUT (req_id={}, {} stream(s), {} bytes)",
+                req_id,
+                rsp.results.len(),
+                rsp_bytes.len()
+            );
+        }
     }
 
     /// Extract (signal_id, f32) pairs from ProcessedData for room_index=0.
@@ -1583,16 +1604,15 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-010
-    /// Title: SUBSCRIBE_RSP suppressed on TLV path — stream_id == signal_id
+    /// Title: SUBSCRIBE_RSP sent on Data_OUT as full 24-byte IDT frame [DEV-6]
     ///
-    /// Description: Flutter sets stream_id = signal_id in its SUBSCRIBE_REQ, so it
-    ///              already knows the mapping without a RSP. Sending a RSP causes:
-    ///              • Data_OUT → "Bad Magic" (_processBuffer parses as DATA_FRAME)
-    ///              • Control  → FormatException (Flutter decodes Control as UTF-8)
-    ///              Verify that to_flutter_tlv_bytes() still produces a valid TLV
-    ///              in case a future Flutter version re-introduces RSP parsing. [DEV-5]
+    /// Description: Flutter v2 routes msgType=0x02 on Data_OUT to _handleSubscribeResponse(),
+    ///              which builds activeStreams from the TLV payload. _initStreams() is now
+    ///              commented out — activeStreams is empty until RSP is received.
+    ///              Verify that to_mypredi_ble_bytes() produces a valid IDT frame:
+    ///              magic at [0-1], msgType=0x02 at [3], payloadLen at [22-23], CRC32C valid.
     #[test]
-    fn test_subscribe_rsp_tlv_format() {
+    fn test_subscribe_rsp_mypredi_format() {
         let rsp = SubscribeRsp {
             session_id: 1,
             req_id: 42,
@@ -1605,9 +1625,36 @@ mod tests {
                 effective_batch_max: 1,
             }],
         };
-        let bytes = rsp.to_flutter_tlv_bytes();
-        assert!(!bytes.is_empty(), "TLV RSP must not be empty");
-        assert_eq!(bytes[0], 0x21, "outer TLV type must be 0x21 (SUBSCRIBE_RSP)");
+        let bytes = rsp.to_mypredi_ble_bytes();
+        // Minimum: 24-byte header + some TLV payload + 4-byte CRC
+        assert!(bytes.len() > 28, "RSP frame must be > 28 bytes");
+        // IDT magic at [0-1]
+        assert_eq!(
+            u16::from_le_bytes([bytes[0], bytes[1]]),
+            IDT_MAGIC,
+            "magic must be 0xD17A"
+        );
+        // msgType=0x02 at [3]
+        assert_eq!(bytes[3], MSG_SUBSCRIBE_RSP, "msgType must be 0x02");
+        // payloadLen at [22-23] must match actual payload size
+        let payload_len = u16::from_le_bytes([bytes[22], bytes[23]]) as usize;
+        assert_eq!(
+            bytes.len(),
+            24 + payload_len + 4,
+            "frame size must be 24 + payloadLen + 4"
+        );
+        // CRC32C valid
+        let expected_crc = crc32c::crc32c(&bytes[..bytes.len() - 4]);
+        let actual_crc = u32::from_le_bytes([
+            bytes[bytes.len() - 4],
+            bytes[bytes.len() - 3],
+            bytes[bytes.len() - 2],
+            bytes[bytes.len() - 1],
+        ]);
+        assert_eq!(actual_crc, expected_crc, "CRC32C must be valid");
+        // Legacy to_flutter_tlv_bytes() still produces 0x21 outer TLV (IDT subscribe path)
+        let tlv_bytes = rsp.to_flutter_tlv_bytes();
+        assert_eq!(tlv_bytes[0], 0x21, "legacy TLV outer type must be 0x21");
     }
 
     // ── Signal name alias coverage ────────────────────────────────────────────

@@ -827,6 +827,73 @@ impl SubscribeRsp {
         buf
     }
 
+    /// Serialize to the full 24-byte IDT frame format expected by MyPredi/Flutter Central v2.
+    ///
+    /// Flutter v2 `_processBuffer()` routes `msgType=0x02` to `_handleSubscribeResponse(payload)`,
+    /// which parses the TLV payload (bytes [24..24+payloadLen]) to populate `activeStreams`.
+    /// `_initStreams()` is now commented out — `activeStreams` is empty until RSP is received.
+    ///
+    /// Frame layout (mirrors Flutter's `buildFrame()` used for DATA_FRAMEs):
+    /// ```
+    /// [0-1]   magic=0xD17A
+    /// [2]     ver=0x01
+    /// [3]     msgType=0x02 (SUBSCRIBE_RSP)
+    /// [4]     flags=0
+    /// [5-6]   session_id (LE)
+    /// [7-8]   stream_id=0 (LE)
+    /// [9-12]  seq=0 (LE)
+    /// [13-20] t0ms=0 (LE)
+    /// [21]    count=0
+    /// [22-23] payloadLen (LE)
+    /// [24..N] TLV payload: tlv(0x01,reqId) + tlv(0x02,status) + tlv(0x03,stream)×n
+    /// [N..N+4] CRC32C of [0..N]
+    /// ```
+    /// Each stream TLV(0x03) contains: tlv(0x01,streamId) + tlv(0x02,sourceId) +
+    ///   tlv(0x03,signalId) + tlv(0x04,periodMs) + tlv(0x05,batchMax).
+    pub fn to_mypredi_ble_bytes(&self) -> Vec<u8> {
+        fn tlv(t: u8, value: &[u8]) -> Vec<u8> {
+            let len = value.len();
+            let mut out = vec![t, (len & 0xFF) as u8, ((len >> 8) & 0xFF) as u8];
+            out.extend_from_slice(value);
+            out
+        }
+
+        // Build TLV payload (no outer 0x21 wrapper — Flutter reads directly from frame payload)
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend(tlv(0x01, &self.req_id.to_le_bytes()));
+        payload.extend(tlv(0x02, &[self.status]));
+        for r in &self.results {
+            let mut sp: Vec<u8> = Vec::new();
+            sp.extend(tlv(0x01, &r.stream_id.to_le_bytes()));
+            sp.extend(tlv(0x02, &[r.source_id]));
+            sp.extend(tlv(0x03, &r.signal_id.to_le_bytes()));
+            sp.extend(tlv(0x04, &r.effective_period_ms.to_le_bytes()));
+            sp.extend(tlv(0x05, &[r.effective_batch_max]));
+            payload.extend(tlv(0x03, &sp));
+        }
+
+        let payload_len = payload.len() as u16;
+
+        // 24-byte IDT header (identical layout to DATA_FRAME header)
+        let mut buf: Vec<u8> = Vec::with_capacity(24 + payload.len() + 4);
+        buf.extend_from_slice(&IDT_MAGIC.to_le_bytes());          // [0-1]
+        buf.push(IDT_VERSION);                                     // [2]
+        buf.push(MSG_SUBSCRIBE_RSP);                               // [3] = 0x02
+        buf.push(0u8);                                             // [4]  flags
+        buf.extend_from_slice(&self.session_id.to_le_bytes());     // [5-6]
+        buf.extend_from_slice(&0u16.to_le_bytes());                // [7-8]  stream_id=0
+        buf.extend_from_slice(&0u32.to_le_bytes());                // [9-12] seq=0
+        buf.extend_from_slice(&0u64.to_le_bytes());                // [13-20] t0ms=0
+        buf.push(0u8);                                             // [21] count=0
+        buf.extend_from_slice(&payload_len.to_le_bytes());         // [22-23]
+        buf.extend_from_slice(&payload);                           // [24..24+payloadLen]
+
+        // CRC32C of entire header+payload
+        let crc = crc32c::crc32c(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
     /// Serialize to the TLV format expected by the Flutter/MyPredi Central app.
     ///
     /// Wire format (mirrors `buildSubscribeRsp()` in the Flutter peripheral simulator):
