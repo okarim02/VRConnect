@@ -297,6 +297,21 @@ impl BleSessionState {
         }
     }
 
+    /// ID SRS: SRS-FN-BLESESSION-018
+    /// Title: unsubscribe_all
+    ///
+    /// Description: VRConnect shall remove all active streams and signal→stream mappings,
+    ///              effectively resetting subscription state to empty.
+    ///              Called before processing a new SUBSCRIBE_REQ so the incoming list
+    ///              replaces (rather than augments) the current subscriptions.
+    ///
+    /// Version: V1.0
+    pub fn unsubscribe_all(&mut self) {
+        self.signal_to_stream.clear();
+        self.streams.clear();
+        log::info!("All streams cleared (unsubscribe_all)");
+    }
+
     /// ID SRS: SRS-FN-BLESESSION-005
     /// Title: is_subscribed
     ///
@@ -606,6 +621,29 @@ impl BleSessionState {
             entry.tx_buffer.clear();
             entry.last_seq = 0;
         }
+    }
+
+    /// ID SRS: SRS-FN-BLESESSION-019
+    /// Title: on_disconnect
+    ///
+    /// Description: VRConnect shall fully reset all BLE session state when the Central
+    ///              disconnects: all active streams, signal→stream mappings, and the
+    ///              stream_id allocator are cleared, and current_session_id is
+    ///              auto-incremented (wrapping) so the reconnecting Central starts a
+    ///              fresh session with unambiguous frame numbering.
+    ///              History ring-buffers are intentionally preserved to support
+    ///              BACKLOG_THEN_LIVE replay on the next connection.
+    ///
+    /// Version: V1.0
+    pub fn on_disconnect(&mut self) {
+        self.signal_to_stream.clear();
+        self.streams.clear();
+        self.next_stream_id = 1;
+        self.current_session_id = self.current_session_id.wrapping_add(1);
+        log::info!(
+            "BLE session reset on disconnect (new session_id={})",
+            self.current_session_id
+        );
     }
 
     /// ID SRS: SRS-FN-BLESESSION-011
@@ -1235,6 +1273,143 @@ mod tests {
     fn test_get_pending_count_unsubscribed_returns_zero() {
         let session = BleSessionState::new(1);
         assert_eq!(session.get_pending_count(SignalId::Temperature.as_u16()), 0);
+    }
+
+    // ── unsubscribe_all ───────────────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLESESSION-031
+    /// Title: unsubscribe_all clears all maps
+    ///
+    /// Description: After subscribing HR+SpO2 and calling unsubscribe_all(), both
+    ///              signal_to_stream and streams must be empty.
+    #[test]
+    fn test_unsubscribe_all_clears_maps() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe(SignalId::HR.as_u16());
+        session.subscribe(SignalId::SpO2.as_u16());
+        assert_eq!(session.streams.len(), 2);
+        assert_eq!(session.signal_to_stream.len(), 2);
+
+        session.unsubscribe_all();
+
+        assert!(
+            session.signal_to_stream.is_empty(),
+            "signal_to_stream must be empty after unsubscribe_all"
+        );
+        assert!(
+            session.streams.is_empty(),
+            "streams must be empty after unsubscribe_all"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-032
+    /// Title: unsubscribe_all then re-subscribe leaves only the new signal
+    ///
+    /// Description: Subscribe HR+SpO2, call unsubscribe_all(), then subscribe only HR.
+    ///              Exactly one stream (HR) must be active; SpO2 must be gone.
+    #[test]
+    fn test_unsubscribe_all_then_resubscribe_only_hr() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe(SignalId::HR.as_u16());
+        session.subscribe(SignalId::SpO2.as_u16());
+
+        session.unsubscribe_all();
+        session.subscribe(SignalId::HR.as_u16());
+
+        assert!(
+            session.is_subscribed(SignalId::HR.as_u16()),
+            "HR must be subscribed after re-subscribe"
+        );
+        assert!(
+            !session.is_subscribed(SignalId::SpO2.as_u16()),
+            "SpO2 must NOT be subscribed after unsubscribe_all + HR-only re-subscribe"
+        );
+        assert_eq!(session.streams.len(), 1);
+        assert_eq!(session.signal_to_stream.len(), 1);
+    }
+
+    // ── on_disconnect ─────────────────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLESESSION-033
+    /// Title: on_disconnect clears all streams and signal mappings
+    ///
+    /// Description: After subscribing HR+SpO2 and calling on_disconnect(),
+    ///              signal_to_stream and streams must be empty.
+    #[test]
+    fn test_on_disconnect_clears_streams() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe(SignalId::HR.as_u16());
+        session.subscribe(SignalId::SpO2.as_u16());
+        session.add_data(SignalId::HR.as_u16(), 70.0, 0);
+
+        session.on_disconnect();
+
+        assert!(
+            session.signal_to_stream.is_empty(),
+            "signal_to_stream must be empty after on_disconnect"
+        );
+        assert!(
+            session.streams.is_empty(),
+            "streams must be empty after on_disconnect"
+        );
+        assert_eq!(session.total_pending(), 0);
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-034
+    /// Title: on_disconnect increments session_id by 1 (wrapping)
+    ///
+    /// Description: session_id shall be wrapping_add(1) after on_disconnect.
+    #[test]
+    fn test_on_disconnect_increments_session_id() {
+        let mut session = BleSessionState::new(5);
+        session.on_disconnect();
+        assert_eq!(session.current_session_id, 6);
+
+        // Wrap-around: u16::MAX wraps to 0
+        let mut session2 = BleSessionState::new(u16::MAX);
+        session2.on_disconnect();
+        assert_eq!(session2.current_session_id, 0);
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-035
+    /// Title: on_disconnect resets next_stream_id to 1
+    ///
+    /// Description: After on_disconnect, the stream_id allocator resets so the
+    ///              next subscribe call gets stream_id=1 again.
+    #[test]
+    fn test_on_disconnect_resets_next_stream_id() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe(SignalId::HR.as_u16());
+        session.subscribe(SignalId::SpO2.as_u16());
+        assert_eq!(session.next_stream_id, 3);
+
+        session.on_disconnect();
+
+        assert_eq!(session.next_stream_id, 1);
+        // Re-subscribing after disconnect starts from stream_id=1
+        let new_stream = session.subscribe(SignalId::HR.as_u16());
+        assert_eq!(new_stream, 1);
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-036
+    /// Title: Double on_disconnect is safe (no panic, increments session_id twice)
+    ///
+    /// Description: Calling on_disconnect twice consecutively must not panic.
+    ///              session_id is incremented each time.
+    #[test]
+    fn test_double_on_disconnect_no_panic() {
+        let mut session = BleSessionState::new(10);
+        session.subscribe(SignalId::HR.as_u16());
+
+        session.on_disconnect();
+        assert_eq!(session.current_session_id, 11);
+        assert!(session.streams.is_empty());
+
+        // Second call on already-reset state must be a no-op except session_id increment
+        session.on_disconnect();
+        assert_eq!(session.current_session_id, 12);
+        assert!(session.streams.is_empty());
+        assert_eq!(session.next_stream_id, 1);
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-030

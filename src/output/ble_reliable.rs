@@ -244,7 +244,26 @@ impl ReliableBleOutput {
             log::info!("ACK watchdog task started (interval=5s, warn≥50, error≥900 frames)");
         }
 
-        // 4. Spawn health task
+        // 4. Spawn disconnect handler task
+        {
+            let disconnect_rx = {
+                let mut server = self.server.write().await;
+                server.take_disconnect_receiver()
+            };
+            if let Some(rx) = disconnect_rx {
+                let state = self.state.clone();
+                let health_state = self.health_state.clone();
+                let health_notify = self.health_notify.clone();
+                tokio::spawn(async move {
+                    Self::disconnect_handler_loop(rx, state, health_state, health_notify).await;
+                });
+                log::info!("Disconnect handler task started (Data_OUT SubscribedClientsChanged)");
+            } else {
+                log::warn!("Disconnect receiver already taken — disconnect detection won't work");
+            }
+        }
+
+        // 5. Spawn health task (was step 4 before disconnect handler was added)
         {
             let health_state = self.health_state.clone();
             let server = self.server.clone();
@@ -261,7 +280,7 @@ impl ReliableBleOutput {
             );
         }
 
-        // 5. Start GATT server
+        // 6. Start GATT server
         {
             let mut server = self.server.write().await;
             server.start().await?;
@@ -597,6 +616,38 @@ impl ReliableBleOutput {
         }
     }
 
+    /// ID SRS: SRS-FN-BLERELIABLE-012
+    /// Title: disconnect_handler_loop
+    ///
+    /// Description: VRConnect shall reset all BLE session state whenever the Central
+    ///              disconnects, as signalled by a `()` on the GATT server's disconnect
+    ///              channel (Data_OUT SubscribedClientsChanged count → 0).
+    ///              Clears all active streams and tx_buffers via on_disconnect(), which
+    ///              also auto-increments the session_id to prevent stale-frame confusion
+    ///              on reconnect.  Resets the ble_subscriber health flag and fires an
+    ///              immediate health push so the Control characteristic reflects the new state.
+    ///
+    /// Version: V1.0
+    async fn disconnect_handler_loop(
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+        state: Arc<RwLock<BleSessionState>>,
+        health_state: Arc<RwLock<GateHealthState>>,
+        health_notify: Arc<Notify>,
+    ) {
+        log::info!("[BLE] Disconnect handler loop running");
+        while rx.recv().await.is_some() {
+            state.write().await.on_disconnect();
+            log::info!("[BLE] Session state cleared after Central disconnect");
+            let mut hs = health_state.write().await;
+            if hs.ble_subscriber {
+                hs.ble_subscriber = false;
+                drop(hs);
+                health_notify.notify_one();
+            }
+        }
+        log::info!("[BLE] Disconnect handler loop ended");
+    }
+
     /// Handle a SUBSCRIBE_REQ IDT frame:
     ///   - op=1 (SUBSCRIBE):   allocate stream → send SUBSCRIBE_RSP on Data_OUT
     ///   - op=2 (UNSUBSCRIBE): remove stream, no RSP sent
@@ -615,6 +666,9 @@ impl ReliableBleOutput {
 
         {
             let mut st = state.write().await;
+            if req.op == SUB_OP_SUBSCRIBE {
+                st.unsubscribe_all();
+            }
             for item in &req.items {
                 match req.op {
                     SUB_OP_SUBSCRIBE => {
@@ -801,6 +855,7 @@ impl ReliableBleOutput {
 
         {
             let mut st = state.write().await;
+            st.unsubscribe_all();
             for raw_id in &signal_ids {
                 let canonical_id = match registry.normalize_id(*raw_id) {
                     Some(id) => id,
@@ -2324,5 +2379,129 @@ mod tests {
                 "stored history entry must match the single expected sample"
             );
         }
+    }
+
+    // ── unsubscribe_all integration ───────────────────────────────────────────
+    // These tests validate the unsubscribe_all behaviour used in handle_subscribe_req
+    // and handle_tlv_subscribe without requiring BLE hardware, by exercising the same
+    // BleSessionState operations the async handlers perform internally.
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-032
+    /// Title: SUB_OP_SUBSCRIBE path: unsubscribe_all then subscribe replaces prior set
+    ///
+    /// Description: Mirrors handle_subscribe_req (op=SUBSCRIBE): pre-subscribed HR+SpO2,
+    ///              then unsubscribe_all() + subscribe(HR) → only HR active.
+    #[tokio::test]
+    async fn test_subscribe_op_replaces_prior_subscriptions_via_unsubscribe_all() {
+        use crate::domain::ble_protocol::{SignalId, SignalRegistry};
+
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        let registry = Arc::new(SignalRegistry::with_defaults());
+
+        {
+            let mut st = state.write().await;
+            st.subscribe(SignalId::HR.as_u16());
+            st.subscribe(SignalId::SpO2.as_u16());
+        }
+        assert_eq!(state.read().await.streams.len(), 2);
+
+        // Simulate handle_subscribe_req(op=SUBSCRIBE, items=[HR])
+        {
+            let mut st = state.write().await;
+            st.unsubscribe_all(); // <-- the new call
+            let canonical = registry.normalize_id(SignalId::HR.as_u16()).unwrap();
+            st.subscribe(canonical);
+        }
+
+        let st = state.read().await;
+        assert!(
+            st.is_subscribed(SignalId::HR.as_u16()),
+            "HR must be subscribed after simulate-SUBSCRIBE"
+        );
+        assert!(
+            !st.is_subscribed(SignalId::SpO2.as_u16()),
+            "SpO2 must be gone after unsubscribe_all"
+        );
+        assert_eq!(st.streams.len(), 1);
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-033
+    /// Title: SUB_OP_UNSUBSCRIBE path: no unsubscribe_all, only individual removal
+    ///
+    /// Description: Mirrors handle_subscribe_req (op=UNSUBSCRIBE): pre-subscribed HR+SpO2,
+    ///              UNSUBSCRIBE path calls unsubscribe(SpO2) only — HR must remain.
+    #[tokio::test]
+    async fn test_unsubscribe_op_removes_only_targeted_signal() {
+        use crate::domain::ble_protocol::{SignalId, SignalRegistry};
+
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        let registry = Arc::new(SignalRegistry::with_defaults());
+
+        {
+            let mut st = state.write().await;
+            st.subscribe(SignalId::HR.as_u16());
+            st.subscribe(SignalId::SpO2.as_u16());
+        }
+
+        // Simulate handle_subscribe_req(op=UNSUBSCRIBE, items=[SpO2])
+        // — unsubscribe_all must NOT be called here
+        {
+            let mut st = state.write().await;
+            let canonical = registry
+                .normalize_id(SignalId::SpO2.as_u16())
+                .unwrap_or(SignalId::SpO2.as_u16());
+            st.unsubscribe(canonical);
+        }
+
+        let st = state.read().await;
+        assert!(
+            st.is_subscribed(SignalId::HR.as_u16()),
+            "HR must survive UNSUBSCRIBE(SpO2)"
+        );
+        assert!(
+            !st.is_subscribed(SignalId::SpO2.as_u16()),
+            "SpO2 must be removed by individual unsubscribe"
+        );
+        assert_eq!(st.streams.len(), 1);
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-034
+    /// Title: TLV-subscribe path: unsubscribe_all + subscribe_with_stream_id replaces prior set
+    ///
+    /// Description: Mirrors handle_tlv_subscribe: pre-subscribed HR+SpO2, then
+    ///              unsubscribe_all() + subscribe_with_stream_id(HR, flutter_sid) → only HR.
+    #[tokio::test]
+    async fn test_tlv_subscribe_replaces_prior_subscriptions_via_unsubscribe_all() {
+        use crate::domain::ble_protocol::{SignalId, SignalRegistry};
+
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        let registry = Arc::new(SignalRegistry::with_defaults());
+
+        {
+            let mut st = state.write().await;
+            st.subscribe(SignalId::HR.as_u16());
+            st.subscribe(SignalId::SpO2.as_u16());
+        }
+        assert_eq!(state.read().await.streams.len(), 2);
+
+        // Simulate handle_tlv_subscribe(signal_ids=[HR])
+        {
+            let mut st = state.write().await;
+            st.unsubscribe_all(); // <-- the new call
+            let canonical = registry.normalize_id(SignalId::HR.as_u16()).unwrap();
+            let flutter_sid = ReliableBleOutput::flutter_stream_id(canonical);
+            st.subscribe_with_stream_id(canonical, flutter_sid);
+        }
+
+        let st = state.read().await;
+        assert!(
+            st.is_subscribed(SignalId::HR.as_u16()),
+            "HR must be subscribed after simulate-TLV-SUBSCRIBE"
+        );
+        assert!(
+            !st.is_subscribed(SignalId::SpO2.as_u16()),
+            "SpO2 must be cleared by unsubscribe_all in TLV-subscribe path"
+        );
+        assert_eq!(st.streams.len(), 1);
     }
 }

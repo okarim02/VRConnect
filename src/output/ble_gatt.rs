@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use windows::{
-    core::GUID,
+    core::{IInspectable, GUID},
     Devices::Bluetooth::{
         BluetoothError,
         GenericAttributeProfile::{
@@ -86,6 +86,9 @@ pub struct GattServer {
     chars: Vec<CharConfig>,
     write_tx: mpsc::UnboundedSender<WriteEvent>,
     write_rx: Option<mpsc::UnboundedReceiver<WriteEvent>>,
+    /// Fires `()` when the Central's CCCD subscription on Data_OUT drops to 0 (disconnect).
+    disconnect_tx: mpsc::UnboundedSender<()>,
+    disconnect_rx: Option<mpsc::UnboundedReceiver<()>>,
     /// Runtime: GATT local characteristics (populated after `start()`)
     local_chars: HashMap<String, GattLocalCharacteristic>,
     /// Runtime: GATT service provider (populated after `start()`)
@@ -97,12 +100,15 @@ impl GattServer {
     /// Create a new GATT server (does not start it).
     pub fn new(device_name: String, service_uuid: uuid::Uuid) -> Self {
         let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel();
         Self {
             device_name,
             service_uuid,
             chars: Vec::new(),
             write_tx,
             write_rx: Some(write_rx),
+            disconnect_tx,
+            disconnect_rx: Some(disconnect_rx),
             local_chars: HashMap::new(),
             provider: None,
             running: false,
@@ -136,6 +142,12 @@ impl GattServer {
     /// Take the write-event receiver. Must be called exactly once before `start()`.
     pub fn take_write_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<WriteEvent>> {
         self.write_rx.take()
+    }
+
+    /// Take the disconnect receiver. Fires `()` when Data_OUT CCCD subscriber count drops to 0.
+    /// Must be called exactly once before `start()`.
+    pub fn take_disconnect_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<()>> {
+        self.disconnect_rx.take()
     }
 
     /// Start the GATT server: create the Windows BLE service, register characteristic
@@ -279,6 +291,37 @@ impl GattServer {
                     .map_err(|e| {
                         VitalError::Config(format!(
                             "WriteRequested handler failed for '{}': {}",
+                            cfg.name, e
+                        ))
+                    })?;
+            }
+
+            // Register SubscribedClientsChanged on Data_OUT to detect Central disconnection.
+            // Fires when the CCCD subscriber count changes; we act only when it drops to 0.
+            if cfg.name == "Data_OUT" {
+                let disc_tx = self.disconnect_tx.clone();
+                local_char
+                    .SubscribedClientsChanged(&TypedEventHandler::<
+                        GattLocalCharacteristic,
+                        IInspectable,
+                    >::new(move |sender, _args| {
+                        if let Some(char_ref) = sender {
+                            let n = char_ref
+                                .SubscribedClients()
+                                .and_then(|c| c.Size())
+                                .unwrap_or(1);
+                            if n == 0 {
+                                log::info!(
+                                    "[BLE] Data_OUT: CCCD subscriber count → 0 (Central disconnected)"
+                                );
+                                let _ = disc_tx.send(());
+                            }
+                        }
+                        Ok(())
+                    }))
+                    .map_err(|e| {
+                        VitalError::Config(format!(
+                            "SubscribedClientsChanged handler failed for '{}': {}",
                             cfg.name, e
                         ))
                     })?;
