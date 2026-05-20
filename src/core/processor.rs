@@ -99,6 +99,7 @@ impl VitalProcessor {
                     self.config.output_ble_update_interval_ms,
                     None, // use default signal registry (HR, SpO2, Temperature)
                     self.config.health_check_interval_sec,
+                    self.config.health_ble_flow_timeout_sec,
                     self.config.health_file.clone(),
                 )
                 .await?,
@@ -864,5 +865,31 @@ mod tests {
             &processor.debug_file,
         )
         .await;
+    }
+
+    /// ID SRS: SRS-TEST-PROC-022
+    /// Title: Test flow_timeout_sec uses health_ble_flow_timeout_sec, not health_check_interval_sec
+    ///
+    /// Description: VRConnect shall initialise GateHealthState.flow_timeout_sec from
+    /// health_ble_flow_timeout_sec (60 s), not from health_check_interval_sec (30 s).
+    /// Regression test for bug I-1: the two values are intentionally set to different
+    /// numbers so a mix-up is detected at compile-test time.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_flow_timeout_uses_ble_flow_timeout_sec() {
+        let mut config = create_test_config();
+        config.output_ble_enabled = true;
+        config.health_check_interval_sec = 30;
+        config.health_ble_flow_timeout_sec = 120; // deliberately different from check interval
+
+        let processor = VitalProcessor::new(config);
+        let ble = processor.create_ble_output().await.unwrap().unwrap();
+
+        let flow_timeout = ble.health_state.read().await.flow_timeout_sec;
+        assert_eq!(
+            flow_timeout, 120,
+            "flow_timeout_sec should equal health_ble_flow_timeout_sec (120), not health_check_interval_sec (30)"
+        );
     }
 }

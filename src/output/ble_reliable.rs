@@ -78,6 +78,7 @@ impl ReliableBleOutput {
         _update_interval_ms: u64,
         registry: Option<SignalRegistry>,
         health_check_interval_sec: u64,
+        health_ble_flow_timeout_sec: u64,
         health_file: String,
     ) -> Result<Self> {
         let service_uuid = uuid::Uuid::parse_str(&service_uuid_str)
@@ -146,7 +147,7 @@ impl ReliableBleOutput {
         let state = BleSessionState::new(1);
 
         let health_state = Arc::new(RwLock::new(GateHealthState {
-            flow_timeout_sec: health_check_interval_sec,
+            flow_timeout_sec: health_ble_flow_timeout_sec,
             ..Default::default()
         }));
 
