@@ -2096,11 +2096,12 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-027
-    /// Title: start_replay returns FLAG_BACKLOG frames and finish_replay clears the flag
+    /// Title: start_replay returns FLAG_BACKLOG frames; live frames never carry FLAG_BACKLOG
     ///
     /// Description: After subscribing and seeding history, start_replay() must return
-    ///              DataFrames with FLAG_BACKLOG set. After finish_replay() the is_replaying
-    ///              flag must be cleared so live frames no longer carry FLAG_BACKLOG.
+    ///              DataFrames with FLAG_BACKLOG set. Live frames produced by add_data()
+    ///              must NOT carry FLAG_BACKLOG regardless of is_replaying state — the flag
+    ///              is the exclusive property of get_replay_frames().
     #[tokio::test]
     async fn test_start_and_finish_replay_flag_lifecycle() {
         use crate::domain::ble_protocol::{SignalId, FLAG_BACKLOG};
@@ -2127,12 +2128,12 @@ mod tests {
                 );
             }
 
-            // While replaying, live frames must also carry FLAG_BACKLOG
+            // While replaying, live frames must NOT carry FLAG_BACKLOG (BLE_REVIEW_FINDINGS F1)
             let live_during = st.add_data(SignalId::HR.as_u16(), 73.0, 4000).unwrap();
-            assert_ne!(
+            assert_eq!(
                 live_during.header.flags & FLAG_BACKLOG,
                 0,
-                "live frame during replay must carry FLAG_BACKLOG"
+                "live frame during replay must NOT carry FLAG_BACKLOG"
             );
 
             // Finish replay — clear is_replaying

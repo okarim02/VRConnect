@@ -45,7 +45,8 @@ pub struct StreamEntry {
     /// Retransmit buffer: bounded VecDeque of sent-but-unacknowledged frames
     pub tx_buffer: VecDeque<DataFrame>,
     /// True while historical replay frames are being sent (BACKLOG_THEN_LIVE / BACKLOG_ONLY).
-    /// FLAG_BACKLOG is set on DATA_FRAMEs only when this flag is true (historical replay).
+    /// Used by finish_replay() to clear the replaying state; FLAG_BACKLOG is set exclusively
+    /// by get_replay_frames(), not by add_data().
     pub is_replaying: bool,
 }
 
@@ -384,12 +385,6 @@ impl BleSessionState {
 
         let mut frame = DataFrame::new(self.current_session_id, stream_id, seq, t0_ms, value);
 
-        // FLAG_BACKLOG is set only when this stream is actively replaying historical data
-        // (BACKLOG_THEN_LIVE / BACKLOG_ONLY mode).
-        if entry.is_replaying {
-            frame.header.flags |= FLAG_BACKLOG;
-        }
-
         // Buffer for retransmission (oldest frame evicted when limit reached).
         // [OBS-1] If the ACK channel is frozen, the buffer fills to max_buffer_size
         //         and oldest frames are silently lost.
@@ -529,7 +524,8 @@ impl BleSessionState {
     ///
     /// Description: VRConnect shall clear the is_replaying flag for a stream, signalling
     ///              that the historical burst has been fully delivered.
-    ///              Subsequent live DATA_FRAMEs will no longer carry FLAG_BACKLOG.
+    ///              Subsequent live DATA_FRAMEs were never carrying FLAG_BACKLOG (that flag
+    ///              is set exclusively by get_replay_frames(), not by add_data()).
     ///
     /// Version: V1.0
     ///
