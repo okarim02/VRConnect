@@ -383,7 +383,7 @@ impl BleSessionState {
         entry.last_seq += 1;
         let seq = entry.last_seq;
 
-        let mut frame = DataFrame::new(self.current_session_id, stream_id, seq, t0_ms, value);
+        let frame = DataFrame::new(self.current_session_id, stream_id, seq, t0_ms, value);
 
         // Buffer for retransmission (oldest frame evicted when limit reached).
         // [OBS-1] If the ACK channel is frozen, the buffer fills to max_buffer_size

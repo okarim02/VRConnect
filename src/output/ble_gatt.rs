@@ -309,7 +309,7 @@ impl GattServer {
                             let n = char_ref
                                 .SubscribedClients()
                                 .and_then(|c| c.Size())
-                                .unwrap_or(1);
+                                .unwrap_or(0); // conservative: WinRT error during teardown → treat as 0 subscribers
                             if n == 0 {
                                 log::info!(
                                     "[BLE] Data_OUT: CCCD subscriber count → 0 (Central disconnected)"
