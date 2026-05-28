@@ -413,8 +413,10 @@ impl BleSessionState {
     ///              the oldest sample is evicted when the limit is reached.
     ///              This is called unconditionally from output(), regardless of subscription
     ///              state, so that history is available even before a client subscribes.
+    ///              Duplicate timestamps (t0_ms ≤ last recorded) are silently skipped to
+    ///              prevent redundant history entries from repeated calls or flush paths.
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     ///
     /// # Arguments
     /// * `signal_id` - IDT signal identifier
@@ -422,10 +424,65 @@ impl BleSessionState {
     /// * `t0_ms`     - Sample timestamp, milliseconds since Unix epoch
     pub fn record_history(&mut self, signal_id: u16, value: f32, t0_ms: u64) {
         let buf = self.history.entry(signal_id).or_insert_with(VecDeque::new);
+        if let Some(&(last_ts, _)) = buf.back() {
+            if t0_ms <= last_ts {
+                return;
+            }
+        }
         buf.push_back((t0_ms, value));
         if buf.len() > self.max_history_size {
             buf.pop_front();
         }
+    }
+
+    /// ID SRS: SRS-FN-BLESESSION-020
+    /// Title: flush_tx_to_history
+    ///
+    /// Description: VRConnect shall flush all frames currently in the retransmit buffers
+    ///              into the per-signal history ring-buffers before the session is cleared.
+    ///              This is a defensive safety net: since record_history() is called before
+    ///              add_data() in the normal output() path, the history should already contain
+    ///              these frames.  flush_tx_to_history() guards against any code path that
+    ///              bypasses record_history(), and makes the invariant explicit.
+    ///              record_history()'s dedup guard prevents duplicate entries.
+    ///
+    /// Version: V1.0
+    ///
+    /// # Returns
+    /// Number of frames flushed (0 if history was already up to date)
+    pub fn flush_tx_to_history(&mut self) -> usize {
+        // Collect (signal_id, t0_ms, value) triples first to avoid simultaneous
+        // borrow of self.streams (immutable) and self.history (mutable via record_history).
+        let pending: Vec<(u16, u64, f32)> = self
+            .streams
+            .values()
+            .flat_map(|entry| {
+                entry
+                    .tx_buffer
+                    .iter()
+                    .map(|frame| (entry.signal_id, frame.t0_ms, frame.value))
+            })
+            .collect();
+
+        let mut flushed = 0usize;
+        for (signal_id, t0_ms, value) in pending {
+            let prev_len = self
+                .history
+                .get(&signal_id)
+                .map(|b| b.len())
+                .unwrap_or(0);
+            self.record_history(signal_id, value, t0_ms);
+            if self
+                .history
+                .get(&signal_id)
+                .map(|b| b.len())
+                .unwrap_or(0)
+                > prev_len
+            {
+                flushed += 1;
+            }
+        }
+        flushed
     }
 
     /// ID SRS: SRS-FN-BLESESSION-014
@@ -629,9 +686,19 @@ impl BleSessionState {
     ///              fresh session with unambiguous frame numbering.
     ///              History ring-buffers are intentionally preserved to support
     ///              BACKLOG_THEN_LIVE replay on the next connection.
+    ///              Before clearing, flush_tx_to_history() rescues any unACK'd frames
+    ///              not yet in history (defensive: normally record_history is called
+    ///              before add_data in the output() path).
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     pub fn on_disconnect(&mut self) {
+        let flushed = self.flush_tx_to_history();
+        if flushed > 0 {
+            log::info!(
+                "[BLE] flush_tx_to_history: {} frame(s) rescued into history before session reset",
+                flushed
+            );
+        }
         self.signal_to_stream.clear();
         self.streams.clear();
         self.next_stream_id = 1;
@@ -1423,5 +1490,118 @@ mod tests {
             "unknown stream bitmap-ACK must return empty Vec"
         );
         assert_eq!(session.total_pending(), 1, "buffer must be unchanged");
+    }
+
+    // ── record_history dedup + flush_tx_to_history ───────────────────────────
+
+    /// ID SRS: SRS-TEST-BLESESSION-037
+    /// Title: record_history dedup guard skips samples with t0_ms ≤ last recorded
+    ///
+    /// Description: Calling record_history twice with the same t0_ms (or an older one)
+    ///              must not create a duplicate entry in the history buffer.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_record_history_dedup_skips_duplicate_timestamp() {
+        let mut session = BleSessionState::new(1);
+
+        session.record_history(0x0101, 72.0, 1000);
+        session.record_history(0x0101, 73.0, 1000); // same t0_ms — must be skipped
+        session.record_history(0x0101, 71.0, 500);  // older t0_ms — must be skipped
+        session.record_history(0x0101, 74.0, 2000); // newer — must be recorded
+
+        let buf = session.history.get(&0x0101).unwrap();
+        assert_eq!(buf.len(), 2, "only 2 unique timestamps should be recorded");
+        assert_eq!(buf[0], (1000, 72.0));
+        assert_eq!(buf[1], (2000, 74.0));
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-038
+    /// Title: flush_tx_to_history rescues frames not yet in history
+    ///
+    /// Description: When add_data is called without a prior record_history call,
+    ///              the frame is in the tx_buffer but not in history. on_disconnect()
+    ///              must flush it into history via flush_tx_to_history() so that the
+    ///              data survives the session reset and is available for BACKLOG replay.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_flush_tx_to_history_rescues_unrecorded_frames() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe(SignalId::HR.as_u16());
+
+        // add_data directly, without record_history — simulates a code path that
+        // bypasses the normal output() ordering.
+        session.add_data(SignalId::HR.as_u16(), 75.0, 5000);
+        session.add_data(SignalId::HR.as_u16(), 76.0, 6000);
+
+        assert!(
+            session.history.get(&SignalId::HR.as_u16()).is_none()
+                || session.history[&SignalId::HR.as_u16()].is_empty(),
+            "history must be empty before flush"
+        );
+
+        let flushed = session.flush_tx_to_history();
+        assert_eq!(flushed, 2, "both frames must be flushed into history");
+
+        let buf = session.history.get(&SignalId::HR.as_u16()).unwrap();
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0], (5000, 75.0));
+        assert_eq!(buf[1], (6000, 76.0));
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-039
+    /// Title: flush_tx_to_history is idempotent when history already up to date
+    ///
+    /// Description: When record_history has been called before add_data (normal path),
+    ///              flush_tx_to_history must return 0 (no new entries added) because
+    ///              the dedup guard in record_history prevents duplicates.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_flush_tx_to_history_idempotent_when_already_recorded() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe(SignalId::HR.as_u16());
+
+        // Normal output() order: record_history first, then add_data
+        session.record_history(SignalId::HR.as_u16(), 75.0, 5000);
+        session.add_data(SignalId::HR.as_u16(), 75.0, 5000);
+
+        let flushed = session.flush_tx_to_history();
+        assert_eq!(flushed, 0, "no new entries expected when history already current");
+
+        let buf = session.history.get(&SignalId::HR.as_u16()).unwrap();
+        assert_eq!(buf.len(), 1, "history must not have duplicates");
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-040
+    /// Title: on_disconnect calls flush_tx_to_history before clearing streams
+    ///
+    /// Description: When on_disconnect() is called, any unrecorded frames in the
+    ///              tx_buffer must be present in history after the reset, even though
+    ///              the streams themselves are cleared.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_on_disconnect_flushes_tx_before_clearing() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe(SignalId::HR.as_u16());
+
+        // Skip record_history to simulate a frame not yet in history
+        session.add_data(SignalId::HR.as_u16(), 80.0, 9000);
+        assert!(
+            session.history.get(&SignalId::HR.as_u16()).is_none()
+                || session.history[&SignalId::HR.as_u16()].is_empty(),
+            "history must be empty before on_disconnect"
+        );
+
+        session.on_disconnect();
+
+        // Streams are cleared
+        assert!(session.streams.is_empty());
+        // But the data is now in history
+        let buf = session.history.get(&SignalId::HR.as_u16()).unwrap();
+        assert_eq!(buf.len(), 1, "flushed frame must survive session reset");
+        assert_eq!(buf[0], (9000, 80.0));
     }
 }
