@@ -108,6 +108,12 @@ pub struct Config {
     #[arg(long, default_value = "logs/health.json")]
     pub health_file: String,
 
+    /// BLE grace period in seconds before session reset on Central disconnect.
+    /// If Flutter reconnects within this window, session state is preserved (no re-SUBSCRIBE needed).
+    /// Set to 0 for immediate reset on disconnect (legacy behaviour).
+    #[arg(long, default_value = "10")]
+    pub ble_grace_period_sec: u64,
+
     // Debug Configuration
     /// Enable debug mode
     #[arg(long, default_value = "false")]
@@ -321,6 +327,13 @@ impl Config {
                 config.health_file = val;
             }
         }
+        if !has_arg("--ble-grace-period-sec") {
+            if let Ok(val) = std::env::var("BLE_GRACE_PERIOD_SEC") {
+                if let Ok(secs) = val.parse() {
+                    config.ble_grace_period_sec = secs;
+                }
+            }
+        }
 
         // Debug
         if !has_arg("--debug-enabled") {
@@ -488,6 +501,7 @@ mod tests {
             health_check_interval_sec: 30,
             health_ble_flow_timeout_sec: 60,
             health_file: "logs/health.json".to_string(),
+            ble_grace_period_sec: 10,
             debug_enabled: false,
             debug_output_path: "./debug.log".to_string(),
             log_level: "INFO".to_string(),
@@ -939,6 +953,40 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("health_ble_flow_timeout_sec"));
+    }
+
+    #[test]
+    fn test_grace_period_default() {
+        let config = Config::parse_from(vec!["vrconnect"]);
+        assert_eq!(config.ble_grace_period_sec, 10);
+    }
+
+    #[test]
+    fn test_grace_period_parse_args() {
+        let config = Config::parse_from(vec!["vrconnect", "--ble-grace-period-sec", "30"]);
+        assert_eq!(config.ble_grace_period_sec, 30);
+    }
+
+    #[test]
+    fn test_grace_period_zero_allowed() {
+        // grace=0 must be accepted (immediate reset, legacy behaviour)
+        let config = Config::parse_from(vec!["vrconnect", "--ble-grace-period-sec", "0"]);
+        assert_eq!(config.ble_grace_period_sec, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_grace_period_env_override() {
+        std::env::remove_var("BLE_GRACE_PERIOD_SEC");
+        std::env::set_var("BLE_GRACE_PERIOD_SEC", "20");
+
+        let args = vec!["vrconnect".to_string()];
+        let base = Config::parse_from(&args);
+        let config = Config::apply_env_overrides(base, &args);
+
+        assert_eq!(config.ble_grace_period_sec, 20);
+
+        std::env::remove_var("BLE_GRACE_PERIOD_SEC");
     }
 
     #[test]

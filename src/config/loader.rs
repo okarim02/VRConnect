@@ -86,6 +86,10 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Config, String> {
             .unwrap_or(60),
         health_file: std::env::var("HEALTH_FILE")
             .unwrap_or_else(|_| "logs/health.json".to_string()),
+        ble_grace_period_sec: std::env::var("BLE_GRACE_PERIOD_SEC")
+            .unwrap_or_else(|_| "10".to_string())
+            .parse()
+            .unwrap_or(10),
         debug_enabled: std::env::var("DEBUG_ENABLED")
             .unwrap_or_else(|_| "false".to_string())
             .parse()
@@ -125,6 +129,7 @@ mod tests {
             "OUTPUT_FILE_MAX_SIZE_MB",
             "OUTPUT_FILE_ARCHIVE_THRESHOLD_GB",
             "OUTPUT_FILE_CRITICAL_DISK_PERCENT",
+            "BLE_GRACE_PERIOD_SEC",
             "DEBUG_ENABLED",
             "DEBUG_OUTPUT_PATH",
             "LOG_LEVEL",

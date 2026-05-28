@@ -22,7 +22,7 @@ use crate::domain::ble_protocol::{
 };
 use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};
-use crate::output::ble_gatt::{CharProperty, GattServer, WriteEvent};
+use crate::output::ble_gatt::{BleConnectionEvent, CharProperty, GattServer, WriteEvent};
 use crate::output::ble_session::BleSessionState;
 use crate::output::health::{build_payload, read_os_snapshot, GateHealthState};
 use crate::utils::chaos;
@@ -54,6 +54,10 @@ pub struct ReliableBleOutput {
     health_check_interval_sec: u64,
     /// Path to health.json written by HealthWriter.ps1.
     health_file: String,
+    /// Grace period in seconds before session reset on Central disconnect.
+    /// If Flutter reconnects within this window, session state is preserved.
+    /// 0 = immediate reset (legacy behaviour).
+    ble_grace_period_sec: u64,
 }
 
 /// Characteristic UUID suffixes (PDF spec)
@@ -80,6 +84,7 @@ impl ReliableBleOutput {
         health_check_interval_sec: u64,
         health_ble_flow_timeout_sec: u64,
         health_file: String,
+        ble_grace_period_sec: u64,
     ) -> Result<Self> {
         let service_uuid = uuid::Uuid::parse_str(&service_uuid_str)
             .map_err(|e| VitalError::Config(format!("Invalid BLE service UUID: {}", e)))?;
@@ -160,6 +165,7 @@ impl ReliableBleOutput {
             health_notify: Arc::new(Notify::new()),
             health_check_interval_sec,
             health_file,
+            ble_grace_period_sec,
         })
     }
 
@@ -245,7 +251,7 @@ impl ReliableBleOutput {
             log::info!("ACK watchdog task started (interval=5s, warn≥50, error≥900 frames)");
         }
 
-        // 4. Spawn disconnect handler task
+        // 4. Spawn disconnect handler task (grace period = ble_grace_period_sec)
         {
             let disconnect_rx = {
                 let mut server = self.server.write().await;
@@ -255,10 +261,21 @@ impl ReliableBleOutput {
                 let state = self.state.clone();
                 let health_state = self.health_state.clone();
                 let health_notify = self.health_notify.clone();
+                let grace_period_sec = self.ble_grace_period_sec;
                 tokio::spawn(async move {
-                    Self::disconnect_handler_loop(rx, state, health_state, health_notify).await;
+                    Self::disconnect_handler_loop(
+                        rx,
+                        state,
+                        health_state,
+                        health_notify,
+                        grace_period_sec,
+                    )
+                    .await;
                 });
-                log::info!("Disconnect handler task started (Data_OUT SubscribedClientsChanged)");
+                log::info!(
+                    "Disconnect handler task started (grace={}s, Data_OUT SubscribedClientsChanged)",
+                    self.ble_grace_period_sec
+                );
             } else {
                 log::warn!("Disconnect receiver already taken — disconnect detection won't work");
             }
@@ -620,33 +637,112 @@ impl ReliableBleOutput {
     /// ID SRS: SRS-FN-BLERELIABLE-012
     /// Title: disconnect_handler_loop
     ///
-    /// Description: VRConnect shall reset all BLE session state whenever the Central
-    ///              disconnects, as signalled by a `()` on the GATT server's disconnect
-    ///              channel (Data_OUT SubscribedClientsChanged count → 0).
-    ///              Clears all active streams and tx_buffers via on_disconnect(), which
-    ///              also auto-increments the session_id to prevent stale-frame confusion
-    ///              on reconnect.  Resets the ble_subscriber health flag and fires an
-    ///              immediate health push so the Control characteristic reflects the new state.
+    /// Description: VRConnect shall implement a configurable grace period before resetting
+    ///              BLE session state on Central disconnect (Data_OUT SubscribedClientsChanged
+    ///              count → 0). When a Disconnected event arrives, the handler waits up to
+    ///              grace_period_sec seconds for a Connected event. If Flutter reconnects
+    ///              within the grace window, session state is preserved and ble_subscriber
+    ///              remains true — no re-SUBSCRIBE is needed. If the timer expires without
+    ///              reconnect, on_disconnect() fires and ble_subscriber is reset to false.
+    ///              grace_period_sec=0 bypasses the timer entirely (immediate reset).
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     async fn disconnect_handler_loop(
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<BleConnectionEvent>,
         state: Arc<RwLock<BleSessionState>>,
         health_state: Arc<RwLock<GateHealthState>>,
         health_notify: Arc<Notify>,
+        grace_period_sec: u64,
     ) {
-        log::info!("[BLE] Disconnect handler loop running");
-        while rx.recv().await.is_some() {
-            state.write().await.on_disconnect();
-            log::info!("[BLE] Session state cleared after Central disconnect");
-            let mut hs = health_state.write().await;
-            if hs.ble_subscriber {
-                hs.ble_subscriber = false;
-                drop(hs);
-                health_notify.notify_one();
+        log::info!(
+            "[BLE] Disconnect handler loop running (grace={}s)",
+            grace_period_sec
+        );
+        loop {
+            match rx.recv().await {
+                None => break,
+                Some(BleConnectionEvent::Connected) => {
+                    // Fresh connection (no grace timer pending at this point).
+                    let mut hs = health_state.write().await;
+                    if !hs.ble_subscriber {
+                        hs.ble_subscriber = true;
+                        drop(hs);
+                        health_notify.notify_one();
+                    }
+                    log::info!("[BLE] Central connected — session active");
+                }
+                Some(BleConnectionEvent::Disconnected) => {
+                    log::info!(
+                        "[BLE] Central disconnected — starting grace period ({}s)",
+                        grace_period_sec
+                    );
+
+                    if grace_period_sec == 0 {
+                        Self::do_session_reset(&state, &health_state, &health_notify).await;
+                        continue;
+                    }
+
+                    // Wait for reconnect or grace timer expiry.
+                    let grace = tokio::time::sleep(Duration::from_secs(grace_period_sec));
+                    tokio::pin!(grace);
+
+                    loop {
+                        tokio::select! {
+                            _ = &mut grace => {
+                                log::warn!("[BLE] Grace period expired — resetting session");
+                                Self::do_session_reset(&state, &health_state, &health_notify).await;
+                                break;
+                            }
+                            maybe = rx.recv() => match maybe {
+                                None => {
+                                    // Channel closed during grace — force reset and exit.
+                                    Self::do_session_reset(&state, &health_state, &health_notify).await;
+                                    return;
+                                }
+                                Some(BleConnectionEvent::Connected) => {
+                                    log::info!(
+                                        "[BLE] Reconnected within grace period — session preserved"
+                                    );
+                                    let mut hs = health_state.write().await;
+                                    if !hs.ble_subscriber {
+                                        hs.ble_subscriber = true;
+                                        drop(hs);
+                                        health_notify.notify_one();
+                                    }
+                                    break;
+                                }
+                                Some(BleConnectionEvent::Disconnected) => {
+                                    // Re-disconnect during grace: restart the timer.
+                                    log::info!("[BLE] Re-disconnect during grace — timer reset");
+                                    grace.as_mut().reset(
+                                        tokio::time::Instant::now()
+                                            + Duration::from_secs(grace_period_sec),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         log::info!("[BLE] Disconnect handler loop ended");
+    }
+
+    /// Performs the full BLE session reset: calls on_disconnect() on the session state
+    /// and updates the health subscriber flag.
+    async fn do_session_reset(
+        state: &Arc<RwLock<BleSessionState>>,
+        health_state: &Arc<RwLock<GateHealthState>>,
+        health_notify: &Arc<Notify>,
+    ) {
+        state.write().await.on_disconnect();
+        log::info!("[BLE] Session state cleared after Central disconnect");
+        let mut hs = health_state.write().await;
+        if hs.ble_subscriber {
+            hs.ble_subscriber = false;
+            drop(hs);
+            health_notify.notify_one();
+        }
     }
 
     /// Handle a SUBSCRIBE_REQ IDT frame:
@@ -2505,5 +2601,214 @@ mod tests {
             "SpO2 must be cleared by unsubscribe_all in TLV-subscribe path"
         );
         assert_eq!(st.streams.len(), 1);
+    }
+
+    // ── disconnect_handler_loop grace period ─────────────────────────────────
+
+    /// Helper: build a minimal Arc<RwLock<GateHealthState>> with ble_subscriber=true
+    fn make_health(subscriber: bool) -> Arc<RwLock<GateHealthState>> {
+        Arc::new(RwLock::new(GateHealthState {
+            ble_subscriber: subscriber,
+            ..Default::default()
+        }))
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-035
+    /// Title: grace_period=0 triggers on_disconnect() immediately on Disconnected event
+    ///
+    /// Description: When ble_grace_period_sec=0, a Disconnected event must cause
+    ///              on_disconnect() to fire without any delay. signal_to_stream must be
+    ///              empty and ble_subscriber must be false immediately after yielding.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_grace_zero_resets_immediately() {
+        tokio::time::pause();
+
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        state
+            .write()
+            .await
+            .subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+        let health_state = make_health(true);
+        let health_notify = Arc::new(Notify::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BleConnectionEvent>();
+
+        tokio::spawn(ReliableBleOutput::disconnect_handler_loop(
+            rx,
+            state.clone(),
+            health_state.clone(),
+            health_notify.clone(),
+            0,
+        ));
+
+        tx.send(BleConnectionEvent::Disconnected).unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(
+            state.read().await.signal_to_stream.is_empty(),
+            "streams must be cleared immediately with grace=0"
+        );
+        assert!(
+            !health_state.read().await.ble_subscriber,
+            "ble_subscriber must be false after immediate reset"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-036
+    /// Title: Reconnect within grace period preserves session and ble_subscriber
+    ///
+    /// Description: When Flutter reconnects (Connected event) within the grace window,
+    ///              on_disconnect() must NOT be called: signal_to_stream remains intact,
+    ///              current_session_id is unchanged, and ble_subscriber stays true.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_grace_reconnect_preserves_session() {
+        tokio::time::pause();
+
+        let initial_session_id = 1u16;
+        let state = Arc::new(RwLock::new(BleSessionState::new(initial_session_id)));
+        state
+            .write()
+            .await
+            .subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+        let health_state = make_health(true);
+        let health_notify = Arc::new(Notify::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BleConnectionEvent>();
+
+        tokio::spawn(ReliableBleOutput::disconnect_handler_loop(
+            rx,
+            state.clone(),
+            health_state.clone(),
+            health_notify.clone(),
+            10,
+        ));
+
+        // Disconnect then reconnect within the 10 s window (only 5 s elapse)
+        tx.send(BleConnectionEvent::Disconnected).unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        tx.send(BleConnectionEvent::Connected).unwrap();
+        tokio::task::yield_now().await;
+
+        let st = state.read().await;
+        assert!(
+            !st.signal_to_stream.is_empty(),
+            "subscriptions must be preserved after grace reconnect"
+        );
+        assert_eq!(
+            st.current_session_id, initial_session_id,
+            "session_id must not change after grace reconnect"
+        );
+        assert!(
+            health_state.read().await.ble_subscriber,
+            "ble_subscriber must remain true after grace reconnect"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-037
+    /// Title: Grace period expiry triggers on_disconnect() and resets session
+    ///
+    /// Description: When no reconnect occurs within ble_grace_period_sec, on_disconnect()
+    ///              fires: signal_to_stream is cleared, current_session_id increments,
+    ///              and ble_subscriber becomes false.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_grace_expiry_resets_session() {
+        tokio::time::pause();
+
+        let initial_session_id = 1u16;
+        let state = Arc::new(RwLock::new(BleSessionState::new(initial_session_id)));
+        state
+            .write()
+            .await
+            .subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+        let health_state = make_health(true);
+        let health_notify = Arc::new(Notify::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BleConnectionEvent>();
+
+        tokio::spawn(ReliableBleOutput::disconnect_handler_loop(
+            rx,
+            state.clone(),
+            health_state.clone(),
+            health_notify.clone(),
+            10,
+        ));
+
+        tx.send(BleConnectionEvent::Disconnected).unwrap();
+        tokio::task::yield_now().await;
+
+        // Advance past the full grace period (11 s > 10 s window)
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+
+        let st = state.read().await;
+        assert!(
+            st.signal_to_stream.is_empty(),
+            "streams must be cleared after grace expiry"
+        );
+        assert_eq!(
+            st.current_session_id,
+            initial_session_id.wrapping_add(1),
+            "session_id must increment after grace expiry"
+        );
+        assert!(
+            !health_state.read().await.ble_subscriber,
+            "ble_subscriber must be false after grace expiry"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-038
+    /// Title: Re-disconnect during grace period resets the grace timer
+    ///
+    /// Description: A second Disconnected event arriving while the grace timer is running
+    ///              must restart the 10 s window. A Connected event arriving after the
+    ///              second disconnect but within the new window must preserve the session.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_redisconnect_resets_grace_timer() {
+        tokio::time::pause();
+
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        state
+            .write()
+            .await
+            .subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+        let health_state = make_health(true);
+        let health_notify = Arc::new(Notify::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BleConnectionEvent>();
+
+        tokio::spawn(ReliableBleOutput::disconnect_handler_loop(
+            rx,
+            state.clone(),
+            health_state.clone(),
+            health_notify.clone(),
+            10,
+        ));
+
+        // First disconnect — starts 10 s timer
+        tx.send(BleConnectionEvent::Disconnected).unwrap();
+        tokio::task::yield_now().await;
+
+        // 8 s pass, then a second disconnect — must reset timer to a new 10 s window
+        tokio::time::advance(Duration::from_secs(8)).await;
+        tokio::task::yield_now().await;
+        tx.send(BleConnectionEvent::Disconnected).unwrap();
+        tokio::task::yield_now().await;
+
+        // 5 s after the second disconnect (total 13 s, but timer was reset) — reconnect
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        tx.send(BleConnectionEvent::Connected).unwrap();
+        tokio::task::yield_now().await;
+
+        assert!(
+            !state.read().await.signal_to_stream.is_empty(),
+            "session must be preserved when reconnecting within the reset grace window"
+        );
     }
 }

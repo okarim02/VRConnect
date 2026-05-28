@@ -54,6 +54,15 @@ pub enum CharProperty {
     Notify,
 }
 
+/// CCCD connection-state event emitted by the GATT server on Data_OUT subscriber changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BleConnectionEvent {
+    /// CCCD subscriber count rose from 0 → ≥ 1 (Central connected / reconnected).
+    Connected,
+    /// CCCD subscriber count dropped to 0 (Central disconnected).
+    Disconnected,
+}
+
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
@@ -86,9 +95,9 @@ pub struct GattServer {
     chars: Vec<CharConfig>,
     write_tx: mpsc::UnboundedSender<WriteEvent>,
     write_rx: Option<mpsc::UnboundedReceiver<WriteEvent>>,
-    /// Fires `()` when the Central's CCCD subscription on Data_OUT drops to 0 (disconnect).
-    disconnect_tx: mpsc::UnboundedSender<()>,
-    disconnect_rx: Option<mpsc::UnboundedReceiver<()>>,
+    /// Fires a `BleConnectionEvent` when the Central's CCCD subscription on Data_OUT changes.
+    disconnect_tx: mpsc::UnboundedSender<BleConnectionEvent>,
+    disconnect_rx: Option<mpsc::UnboundedReceiver<BleConnectionEvent>>,
     /// Runtime: GATT local characteristics (populated after `start()`)
     local_chars: HashMap<String, GattLocalCharacteristic>,
     /// Runtime: GATT service provider (populated after `start()`)
@@ -100,7 +109,7 @@ impl GattServer {
     /// Create a new GATT server (does not start it).
     pub fn new(device_name: String, service_uuid: uuid::Uuid) -> Self {
         let (write_tx, write_rx) = mpsc::unbounded_channel();
-        let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel();
+        let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel::<BleConnectionEvent>();
         Self {
             device_name,
             service_uuid,
@@ -144,9 +153,12 @@ impl GattServer {
         self.write_rx.take()
     }
 
-    /// Take the disconnect receiver. Fires `()` when Data_OUT CCCD subscriber count drops to 0.
+    /// Take the disconnect receiver. Fires `BleConnectionEvent` when the Data_OUT CCCD
+    /// subscriber count changes (Connected when count → ≥ 1, Disconnected when count → 0).
     /// Must be called exactly once before `start()`.
-    pub fn take_disconnect_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<()>> {
+    pub fn take_disconnect_receiver(
+        &mut self,
+    ) -> Option<mpsc::UnboundedReceiver<BleConnectionEvent>> {
         self.disconnect_rx.take()
     }
 
@@ -314,7 +326,13 @@ impl GattServer {
                                 log::info!(
                                     "[BLE] Data_OUT: CCCD subscriber count → 0 (Central disconnected)"
                                 );
-                                let _ = disc_tx.send(());
+                                let _ = disc_tx.send(BleConnectionEvent::Disconnected);
+                            } else {
+                                log::info!(
+                                    "[BLE] Data_OUT: CCCD subscriber count → {} (Central connected)",
+                                    n
+                                );
+                                let _ = disc_tx.send(BleConnectionEvent::Connected);
                             }
                         }
                         Ok(())

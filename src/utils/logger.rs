@@ -202,6 +202,7 @@ mod tests {
             health_check_interval_sec: 30,
             health_ble_flow_timeout_sec: 60,
             health_file: "logs/health.json".to_string(),
+            ble_grace_period_sec: 10,
             debug_enabled: false,
             debug_output_path: "./debug.log".to_string(),
             log_level: "INFO".to_string(),
