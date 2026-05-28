@@ -743,6 +743,97 @@ impl BleSessionState {
     pub fn total_pending(&self) -> usize {
         self.streams.values().map(|e| e.tx_buffer.len()).sum()
     }
+
+    /// ID SRS: SRS-FN-BLESESSION-021
+    /// Title: serialize_history_to_bytes
+    ///
+    /// Description: VRConnect shall serialize the history ring buffer to a compact binary
+    ///              checkpoint format. Layout: magic(4) + version(4) + timestamp_sec(8) +
+    ///              n_signals(4); then per signal: signal_id(2) + n_samples(4); then per
+    ///              sample: t0_ms(8) + value_f32(4). All integers are little-endian.
+    ///
+    /// Version: V1.0
+    ///
+    /// # Returns
+    /// Serialized bytes ready for atomic write to disk
+    pub fn serialize_history_to_bytes(&self) -> Vec<u8> {
+        const MAGIC: u32 = 0x424C_4548; // "BLEH"
+        let timestamp_sec = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let n_signals = self.history.len() as u32;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&timestamp_sec.to_le_bytes());
+        buf.extend_from_slice(&n_signals.to_le_bytes());
+
+        for (&signal_id, samples) in &self.history {
+            buf.extend_from_slice(&signal_id.to_le_bytes());
+            buf.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+            for &(t0_ms, value) in samples {
+                buf.extend_from_slice(&t0_ms.to_le_bytes());
+                buf.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        buf
+    }
+
+    /// ID SRS: SRS-FN-BLESESSION-022
+    /// Title: load_history_from_bytes
+    ///
+    /// Description: VRConnect shall deserialize a history checkpoint binary and merge
+    ///              the loaded samples into the current history ring buffer via
+    ///              record_history (dedup guard prevents duplicate insertion).
+    ///              Returns the total number of samples processed, or Err if the
+    ///              binary is malformed or uses an unsupported version.
+    ///
+    /// Version: V1.0
+    ///
+    /// # Arguments
+    /// * `bytes` - Raw checkpoint bytes produced by serialize_history_to_bytes
+    ///
+    /// # Returns
+    /// Ok(n) — number of samples processed; Err(description) on format error
+    pub fn load_history_from_bytes(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        const MAGIC: u32 = 0x424C_4548;
+        if bytes.len() < 20 {
+            return Err(format!("checkpoint too short ({} bytes)", bytes.len()));
+        }
+        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        if magic != MAGIC {
+            return Err(format!("invalid magic 0x{:08X}", magic));
+        }
+        let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        if version != 1 {
+            return Err(format!("unsupported checkpoint version {}", version));
+        }
+        let n_signals = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let mut pos = 20usize;
+        let mut total = 0usize;
+
+        for _ in 0..n_signals {
+            if pos + 6 > bytes.len() {
+                return Err("truncated signal header".into());
+            }
+            let signal_id = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+            let n_samples = u32::from_le_bytes(bytes[pos + 2..pos + 6].try_into().unwrap()) as usize;
+            pos += 6;
+            for _ in 0..n_samples {
+                if pos + 12 > bytes.len() {
+                    return Err("truncated sample".into());
+                }
+                let t0_ms = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+                let value = f32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap());
+                pos += 12;
+                self.record_history(signal_id, value, t0_ms);
+                total += 1;
+            }
+        }
+        Ok(total)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1603,5 +1694,72 @@ mod tests {
         let buf = session.history.get(&SignalId::HR.as_u16()).unwrap();
         assert_eq!(buf.len(), 1, "flushed frame must survive session reset");
         assert_eq!(buf[0], (9000, 80.0));
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-041
+    /// Title: serialize/load history checkpoint roundtrip
+    ///
+    /// Description: Serializing a populated history ring buffer and loading the
+    ///              resulting bytes into a fresh session must reproduce all samples
+    ///              exactly (same signal_ids, timestamps, values).
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_checkpoint_roundtrip() {
+        let mut src = BleSessionState::new(1);
+        src.record_history(SignalId::HR.as_u16(), 72.0, 1000);
+        src.record_history(SignalId::HR.as_u16(), 73.0, 2000);
+        src.record_history(0x0102, 98.0, 1500);
+
+        let bytes = src.serialize_history_to_bytes();
+        assert!(bytes.len() > 20, "serialized bytes must exceed header size");
+
+        let mut dst = BleSessionState::new(1);
+        let n = dst.load_history_from_bytes(&bytes).unwrap();
+        assert_eq!(n, 3, "must load all 3 samples");
+
+        let hr = dst.history.get(&SignalId::HR.as_u16()).unwrap();
+        assert_eq!(hr.len(), 2);
+        assert_eq!(hr[0], (1000, 72.0));
+        assert_eq!(hr[1], (2000, 73.0));
+
+        let spo2 = dst.history.get(&0x0102u16).unwrap();
+        assert_eq!(spo2.len(), 1);
+        assert_eq!(spo2[0], (1500, 98.0));
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-042
+    /// Title: load_history_from_bytes rejects malformed input
+    ///
+    /// Description: load_history_from_bytes must return Err on truncated data,
+    ///              wrong magic, and unsupported version without panicking.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_checkpoint_load_errors() {
+        let mut session = BleSessionState::new(1);
+
+        // Too short
+        assert!(session.load_history_from_bytes(&[0u8; 5]).is_err());
+
+        // Wrong magic
+        let mut bad_magic = vec![0u8; 20];
+        bad_magic[0] = 0xDE;
+        bad_magic[1] = 0xAD;
+        assert!(session.load_history_from_bytes(&bad_magic).is_err());
+
+        // Wrong version
+        let mut bad_ver = vec![0u8; 20];
+        bad_ver[0..4].copy_from_slice(&0x424C_4548u32.to_le_bytes());
+        bad_ver[4..8].copy_from_slice(&99u32.to_le_bytes());
+        assert!(session.load_history_from_bytes(&bad_ver).is_err());
+
+        // Truncated signal data
+        let mut src = BleSessionState::new(1);
+        src.record_history(SignalId::HR.as_u16(), 72.0, 1000);
+        let full = src.serialize_history_to_bytes();
+        // Cut off mid-sample
+        let truncated = &full[..full.len() - 4];
+        assert!(session.load_history_from_bytes(truncated).is_err());
     }
 }

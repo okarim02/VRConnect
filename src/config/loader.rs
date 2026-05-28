@@ -90,6 +90,16 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Config, String> {
             .unwrap_or_else(|_| "10".to_string())
             .parse()
             .unwrap_or(10),
+        history_checkpoint_interval_sec: std::env::var("HISTORY_CHECKPOINT_INTERVAL_SEC")
+            .unwrap_or_else(|_| "30".to_string())
+            .parse()
+            .unwrap_or(30),
+        history_checkpoint_max_age_sec: std::env::var("HISTORY_CHECKPOINT_MAX_AGE_SEC")
+            .unwrap_or_else(|_| "300".to_string())
+            .parse()
+            .unwrap_or(300),
+        history_checkpoint_path: std::env::var("HISTORY_CHECKPOINT_PATH")
+            .unwrap_or_else(|_| "logs/history_checkpoint.bin".to_string()),
         debug_enabled: std::env::var("DEBUG_ENABLED")
             .unwrap_or_else(|_| "false".to_string())
             .parse()
@@ -130,6 +140,9 @@ mod tests {
             "OUTPUT_FILE_ARCHIVE_THRESHOLD_GB",
             "OUTPUT_FILE_CRITICAL_DISK_PERCENT",
             "BLE_GRACE_PERIOD_SEC",
+            "HISTORY_CHECKPOINT_INTERVAL_SEC",
+            "HISTORY_CHECKPOINT_MAX_AGE_SEC",
+            "HISTORY_CHECKPOINT_PATH",
             "DEBUG_ENABLED",
             "DEBUG_OUTPUT_PATH",
             "LOG_LEVEL",

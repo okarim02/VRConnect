@@ -58,6 +58,12 @@ pub struct ReliableBleOutput {
     /// If Flutter reconnects within this window, session state is preserved.
     /// 0 = immediate reset (legacy behaviour).
     ble_grace_period_sec: u64,
+    /// Interval in seconds between periodic history checkpoints. 0 = disabled.
+    history_checkpoint_interval_sec: u64,
+    /// Maximum age in seconds of a checkpoint file to be loaded at startup.
+    history_checkpoint_max_age_sec: u64,
+    /// Path to the binary history checkpoint file.
+    history_checkpoint_path: String,
 }
 
 /// Characteristic UUID suffixes (PDF spec)
@@ -85,6 +91,9 @@ impl ReliableBleOutput {
         health_ble_flow_timeout_sec: u64,
         health_file: String,
         ble_grace_period_sec: u64,
+        history_checkpoint_interval_sec: u64,
+        history_checkpoint_max_age_sec: u64,
+        history_checkpoint_path: String,
     ) -> Result<Self> {
         let service_uuid = uuid::Uuid::parse_str(&service_uuid_str)
             .map_err(|e| VitalError::Config(format!("Invalid BLE service UUID: {}", e)))?;
@@ -166,6 +175,9 @@ impl ReliableBleOutput {
             health_check_interval_sec,
             health_file,
             ble_grace_period_sec,
+            history_checkpoint_interval_sec,
+            history_checkpoint_max_age_sec,
+            history_checkpoint_path,
         })
     }
 
@@ -202,9 +214,13 @@ impl ReliableBleOutput {
     ///   1. Set Catalog read value (IDT TLV binary via Catalog::to_ble_bytes)
     ///   2. Spawn the write-handler task (Data_IN / Subscribe / Unsubscribe)
     ///   3. Spawn the ACK watchdog task (buffer depth monitor, 5 s interval)
-    ///   4. Start the GATT server (creates Windows GATT service + advertises)
+    ///   4. Spawn the disconnect handler task (grace period)
+    ///   5. Spawn the health task (heartbeat + BLE flow watchdog)
+    ///   6. Load history checkpoint if present and fresh enough
+    ///   7. Spawn the checkpoint task (periodic history persistence)
+    ///   8. Start the GATT server (creates Windows GATT service + advertises)
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     pub async fn start(&self) -> Result<()> {
         log::info!("Starting Reliable BLE GATT server (IDT protocol)...");
 
@@ -298,7 +314,32 @@ impl ReliableBleOutput {
             );
         }
 
-        // 6. Start GATT server
+        // 6. Load history checkpoint if fresh enough
+        Self::try_load_checkpoint(
+            &self.state,
+            &self.history_checkpoint_path,
+            self.history_checkpoint_max_age_sec,
+        )
+        .await;
+
+        // 7. Spawn checkpoint task (skip if interval=0)
+        if self.history_checkpoint_interval_sec > 0 {
+            let state = self.state.clone();
+            let interval = self.history_checkpoint_interval_sec;
+            let path = self.history_checkpoint_path.clone();
+            tokio::spawn(async move {
+                Self::checkpoint_task(state, interval, path).await;
+            });
+            log::info!(
+                "History checkpoint task started (interval={}s, path={})",
+                self.history_checkpoint_interval_sec,
+                self.history_checkpoint_path
+            );
+        } else {
+            log::info!("History checkpoint disabled (interval=0)");
+        }
+
+        // 8. Start GATT server
         {
             let mut server = self.server.write().await;
             server.start().await?;
@@ -726,6 +767,81 @@ impl ReliableBleOutput {
             }
         }
         log::info!("[BLE] Disconnect handler loop ended");
+    }
+
+    /// ID SRS: SRS-FN-BLERELIABLE-013
+    /// Title: checkpoint_task
+    ///
+    /// Description: VRConnect shall periodically serialize the history ring buffer to a
+    ///              binary checkpoint file using an atomic write (tmp + rename). Runs as a
+    ///              background task; skips the write if history is empty.
+    ///
+    /// Version: V1.0
+    async fn checkpoint_task(
+        state: Arc<RwLock<BleSessionState>>,
+        interval_sec: u64,
+        path: String,
+    ) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(interval_sec)).await;
+            let bytes = state.read().await.serialize_history_to_bytes();
+            // Header only = 20 bytes — means no signals; skip write
+            if bytes.len() <= 20 {
+                continue;
+            }
+            let tmp_path = format!("{}.tmp", path);
+            match std::fs::write(&tmp_path, &bytes) {
+                Ok(_) => match std::fs::rename(&tmp_path, &path) {
+                    Ok(_) => {
+                        log::debug!("[CKPT] History checkpoint written ({} bytes)", bytes.len())
+                    }
+                    Err(e) => log::warn!("[CKPT] Failed to rename checkpoint: {}", e),
+                },
+                Err(e) => log::warn!("[CKPT] Failed to write checkpoint: {}", e),
+            }
+        }
+    }
+
+    /// Loads a history checkpoint from disk if it exists and is within max_age_sec.
+    async fn try_load_checkpoint(
+        state: &Arc<RwLock<BleSessionState>>,
+        path: &str,
+        max_age_sec: u64,
+    ) {
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let age_sec = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(u64::MAX);
+        if age_sec > max_age_sec {
+            log::info!(
+                "[CKPT] Checkpoint too old ({}s > {}s), skipping",
+                age_sec,
+                max_age_sec
+            );
+            return;
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("[CKPT] Failed to read checkpoint: {}", e);
+                return;
+            }
+        };
+        match state.write().await.load_history_from_bytes(&bytes) {
+            Ok(n) => log::info!(
+                "[CKPT] Loaded {} samples from checkpoint (age={}s, path={})",
+                n,
+                age_sec,
+                path
+            ),
+            Err(e) => log::warn!("[CKPT] Invalid checkpoint: {}", e),
+        }
     }
 
     /// Performs the full BLE session reset: calls on_disconnect() on the session state
@@ -1487,6 +1603,7 @@ mod tests {
     };
     use crate::domain::{ProcessedRoom, ProcessedTrack, TrackType};
     use chrono::Utc;
+    use tempfile;
 
     /// Helper: create a test ProcessedTrack
     fn create_test_track(
@@ -2759,6 +2876,48 @@ mod tests {
             !health_state.read().await.ble_subscriber,
             "ble_subscriber must be false after grace expiry"
         );
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-039
+    /// Title: checkpoint_task writes atomic checkpoint after interval
+    ///
+    /// Description: After one interval tick, checkpoint_task must produce a valid
+    ///              binary file at the given path. The file must be loadable by
+    ///              load_history_from_bytes and reproduce all recorded samples.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_checkpoint_task_writes_file() {
+        tokio::time::pause();
+
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        {
+            let mut st = state.write().await;
+            st.record_history(SignalId::HR.as_u16(), 75.0, 1000);
+            st.record_history(SignalId::HR.as_u16(), 76.0, 2000);
+        }
+
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("ckpt.bin").to_str().unwrap().to_string();
+
+        tokio::spawn(ReliableBleOutput::checkpoint_task(
+            state.clone(),
+            5,
+            path.clone(),
+        ));
+
+        // Yield so the task can register its sleep, then advance past the interval.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        // Multiple yields: one for the lock acquisition, one for the file I/O.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        let bytes = std::fs::read(&path).expect("checkpoint file must exist after interval");
+        let mut dst = BleSessionState::new(1);
+        let n = dst.load_history_from_bytes(&bytes).unwrap();
+        assert_eq!(n, 2, "checkpoint must contain the 2 recorded samples");
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-038

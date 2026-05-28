@@ -114,6 +114,22 @@ pub struct Config {
     #[arg(long, default_value = "10")]
     pub ble_grace_period_sec: u64,
 
+    // History Checkpoint Configuration
+    /// Interval in seconds between periodic history ring-buffer checkpoints (0 = disabled).
+    /// ID SRS: SRS-CFG-CHECKPOINT-001
+    #[arg(long, default_value = "30")]
+    pub history_checkpoint_interval_sec: u64,
+
+    /// Maximum age in seconds of a checkpoint file to be loaded at startup.
+    /// ID SRS: SRS-CFG-CHECKPOINT-002
+    #[arg(long, default_value = "300")]
+    pub history_checkpoint_max_age_sec: u64,
+
+    /// Path to the binary history checkpoint file written periodically.
+    /// ID SRS: SRS-CFG-CHECKPOINT-003
+    #[arg(long, default_value = "logs/history_checkpoint.bin")]
+    pub history_checkpoint_path: String,
+
     // Debug Configuration
     /// Enable debug mode
     #[arg(long, default_value = "false")]
@@ -334,6 +350,25 @@ impl Config {
                 }
             }
         }
+        if !has_arg("--history-checkpoint-interval-sec") {
+            if let Ok(val) = std::env::var("HISTORY_CHECKPOINT_INTERVAL_SEC") {
+                if let Ok(secs) = val.parse() {
+                    config.history_checkpoint_interval_sec = secs;
+                }
+            }
+        }
+        if !has_arg("--history-checkpoint-max-age-sec") {
+            if let Ok(val) = std::env::var("HISTORY_CHECKPOINT_MAX_AGE_SEC") {
+                if let Ok(secs) = val.parse() {
+                    config.history_checkpoint_max_age_sec = secs;
+                }
+            }
+        }
+        if !has_arg("--history-checkpoint-path") {
+            if let Ok(val) = std::env::var("HISTORY_CHECKPOINT_PATH") {
+                config.history_checkpoint_path = val;
+            }
+        }
 
         // Debug
         if !has_arg("--debug-enabled") {
@@ -502,6 +537,9 @@ mod tests {
             health_ble_flow_timeout_sec: 60,
             health_file: "logs/health.json".to_string(),
             ble_grace_period_sec: 10,
+            history_checkpoint_interval_sec: 30,
+            history_checkpoint_max_age_sec: 300,
+            history_checkpoint_path: "logs/history_checkpoint.bin".to_string(),
             debug_enabled: false,
             debug_output_path: "./debug.log".to_string(),
             log_level: "INFO".to_string(),
@@ -1011,5 +1049,60 @@ mod tests {
         std::env::remove_var("HEALTH_CHECK_INTERVAL_SEC");
         std::env::remove_var("HEALTH_BLE_FLOW_TIMEOUT_SEC");
         std::env::remove_var("HEALTH_FILE");
+    }
+
+    #[test]
+    fn test_checkpoint_defaults() {
+        let config = Config::parse_from(vec!["vrconnect"]);
+        assert_eq!(config.history_checkpoint_interval_sec, 30);
+        assert_eq!(config.history_checkpoint_max_age_sec, 300);
+        assert_eq!(config.history_checkpoint_path, "logs/history_checkpoint.bin");
+    }
+
+    #[test]
+    fn test_checkpoint_parse_args() {
+        let config = Config::parse_from(vec![
+            "vrconnect",
+            "--history-checkpoint-interval-sec", "60",
+            "--history-checkpoint-max-age-sec", "600",
+            "--history-checkpoint-path", "/tmp/ckpt.bin",
+        ]);
+        assert_eq!(config.history_checkpoint_interval_sec, 60);
+        assert_eq!(config.history_checkpoint_max_age_sec, 600);
+        assert_eq!(config.history_checkpoint_path, "/tmp/ckpt.bin");
+    }
+
+    #[test]
+    fn test_checkpoint_zero_interval_allowed() {
+        // interval=0 means checkpoint disabled — must be accepted by parse
+        let config = Config::parse_from(vec![
+            "vrconnect",
+            "--history-checkpoint-interval-sec", "0",
+        ]);
+        assert_eq!(config.history_checkpoint_interval_sec, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_checkpoint_env_override() {
+        std::env::remove_var("HISTORY_CHECKPOINT_INTERVAL_SEC");
+        std::env::remove_var("HISTORY_CHECKPOINT_MAX_AGE_SEC");
+        std::env::remove_var("HISTORY_CHECKPOINT_PATH");
+
+        std::env::set_var("HISTORY_CHECKPOINT_INTERVAL_SEC", "120");
+        std::env::set_var("HISTORY_CHECKPOINT_MAX_AGE_SEC", "900");
+        std::env::set_var("HISTORY_CHECKPOINT_PATH", "logs/custom.bin");
+
+        let args = vec!["vrconnect".to_string()];
+        let base = Config::parse_from(&args);
+        let config = Config::apply_env_overrides(base, &args);
+
+        assert_eq!(config.history_checkpoint_interval_sec, 120);
+        assert_eq!(config.history_checkpoint_max_age_sec, 900);
+        assert_eq!(config.history_checkpoint_path, "logs/custom.bin");
+
+        std::env::remove_var("HISTORY_CHECKPOINT_INTERVAL_SEC");
+        std::env::remove_var("HISTORY_CHECKPOINT_MAX_AGE_SEC");
+        std::env::remove_var("HISTORY_CHECKPOINT_PATH");
     }
 }
