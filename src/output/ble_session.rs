@@ -98,9 +98,9 @@ impl BleSessionState {
             streams: HashMap::new(),
             signal_to_stream: HashMap::new(),
             next_stream_id: 1,
-            max_buffer_size: 1000,    // Medical: prevent unbounded memory growth
+            max_buffer_size: 1000, // Medical: prevent unbounded memory growth
             history: HashMap::new(),
-            max_history_size: 3600,   // ~1 hour at 1 Hz per signal
+            max_history_size: 3600, // ~1 hour at 1 Hz per signal
         }
     }
 
@@ -373,7 +373,9 @@ impl BleSessionState {
             if t0_ms <= last {
                 log::debug!(
                     "Cross-msg dup skipped: signal=0x{:04X} t0_ms={} <= last={}",
-                    signal_id, t0_ms, last
+                    signal_id,
+                    t0_ms,
+                    last
                 );
                 return None;
             }
@@ -466,19 +468,9 @@ impl BleSessionState {
 
         let mut flushed = 0usize;
         for (signal_id, t0_ms, value) in pending {
-            let prev_len = self
-                .history
-                .get(&signal_id)
-                .map(|b| b.len())
-                .unwrap_or(0);
+            let prev_len = self.history.get(&signal_id).map(|b| b.len()).unwrap_or(0);
             self.record_history(signal_id, value, t0_ms);
-            if self
-                .history
-                .get(&signal_id)
-                .map(|b| b.len())
-                .unwrap_or(0)
-                > prev_len
-            {
+            if self.history.get(&signal_id).map(|b| b.len()).unwrap_or(0) > prev_len {
                 flushed += 1;
             }
         }
@@ -534,11 +526,13 @@ impl BleSessionState {
     /// Title: start_replay
     ///
     /// Description: VRConnect shall mark a stream as replaying and return its historical
-    ///              DataFrames with FLAG_BACKLOG set.  The stream's last_seq is advanced
-    ///              by the number of replay frames so that subsequent live frames have
-    ///              non-overlapping sequence numbers.
+    ///              DataFrames with FLAG_BACKLOG set.  All replay frames are pushed into
+    ///              tx_buffer so they are NACK-recoverable during the burst.
+    ///              last_seq is NOT advanced here — it is committed lazily per frame
+    ///              actually sent via commit_replay_progress(), so an interrupted
+    ///              replay never burns sequence numbers for frames that were not delivered.
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     ///
     /// # Arguments
     /// * `signal_id`     - IDT signal identifier
@@ -566,11 +560,28 @@ impl BleSessionState {
         // Use a separate lookup after releasing the mutable borrow.
         drop(entry);
 
-        let frames = self.get_replay_frames(signal_id, start_time_ms, session_id, stream_id, seq_start);
+        let frames =
+            self.get_replay_frames(signal_id, start_time_ms, session_id, stream_id, seq_start);
 
-        // Advance last_seq past all replay frames so live frames get unique seq numbers
+        // Push replay frames into tx_buffer so they are NACK-recoverable during replay.
+        // Bounded at max_buffer_size; oldest frame evicted with WARN if overflow.
+        // last_seq is NOT advanced here commit_replay_progress() does it lazily
+        //      after the send loop, advancing only for frames actually notified.
         if let Some(entry) = self.streams.get_mut(&stream_id) {
-            entry.last_seq = entry.last_seq.wrapping_add(frames.len() as u32);
+            for frame in &frames {
+                entry.tx_buffer.push_back(frame.clone());
+                while entry.tx_buffer.len() > self.max_buffer_size {
+                    if let Some(evicted) = entry.tx_buffer.pop_front() {
+                        log::warn!(
+                            "[BLE] Replay buffer overflow stream {}: evicted seq {} \
+                             (backlog > max_buffer_size={}).",
+                            stream_id,
+                            evicted.header.seq,
+                            self.max_buffer_size
+                        );
+                    }
+                }
+            }
         }
 
         frames
@@ -591,6 +602,40 @@ impl BleSessionState {
     pub fn finish_replay(&mut self, stream_id: u16) {
         if let Some(entry) = self.streams.get_mut(&stream_id) {
             entry.is_replaying = false;
+        }
+    }
+
+    /// ID SRS: SRS-FN-BLESESSION-023
+    /// Title: commit_replay_progress
+    ///
+    /// Description: VRConnect shall advance the per-stream sequence counter by the number
+    ///              of replay frames actually notified successfully, and evict from tx_buffer
+    ///              any replay frames (FLAG_BACKLOG set) whose seq exceeds the new last_seq.
+    ///
+    ///              This implements two invariants together:
+    ///              - (F5) Lazy seq advance: sequence numbers are only consumed for frames
+    ///                that left the GATT server, so an interrupted replay does not create an
+    ///                irrecoverable gap in the stream's sequence space.
+    ///              - (F4 cleanup) Unsent replay frames are evicted from tx_buffer to prevent
+    ///                seq collisions with subsequent live frames (which reuse the same numbers).
+    ///
+    ///              Called from ble_reliable.rs after the replay send-loop, before finish_replay.
+    ///
+    /// Version: V1.0
+    ///
+    /// # Arguments
+    /// * `stream_id`   - IDT stream to update
+    /// * `sent_count`  - Number of replay frames for which notify() succeeded
+    pub fn commit_replay_progress(&mut self, stream_id: u16, sent_count: usize) {
+        if let Some(entry) = self.streams.get_mut(&stream_id) {
+            let new_last_seq = entry.last_seq.wrapping_add(sent_count as u32);
+            // Evict unsent replay frames to prevent seq collisions with live frames.
+            // Only FLAG_BACKLOG frames beyond new_last_seq are pruned; live frames
+            // (FLAG_BACKLOG == 0) and already-ACK'd replay frames are unaffected.
+            entry
+                .tx_buffer
+                .retain(|f| !(f.header.flags & FLAG_BACKLOG != 0 && f.header.seq > new_last_seq));
+            entry.last_seq = new_last_seq;
         }
     }
 
@@ -819,7 +864,8 @@ impl BleSessionState {
                 return Err("truncated signal header".into());
             }
             let signal_id = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
-            let n_samples = u32::from_le_bytes(bytes[pos + 2..pos + 6].try_into().unwrap()) as usize;
+            let n_samples =
+                u32::from_le_bytes(bytes[pos + 2..pos + 6].try_into().unwrap()) as usize;
             pos += 6;
             for _ in 0..n_samples {
                 if pos + 12 > bytes.len() {
@@ -1598,7 +1644,7 @@ mod tests {
 
         session.record_history(0x0101, 72.0, 1000);
         session.record_history(0x0101, 73.0, 1000); // same t0_ms — must be skipped
-        session.record_history(0x0101, 71.0, 500);  // older t0_ms — must be skipped
+        session.record_history(0x0101, 71.0, 500); // older t0_ms — must be skipped
         session.record_history(0x0101, 74.0, 2000); // newer — must be recorded
 
         let buf = session.history.get(&0x0101).unwrap();
@@ -1659,7 +1705,10 @@ mod tests {
         session.add_data(SignalId::HR.as_u16(), 75.0, 5000);
 
         let flushed = session.flush_tx_to_history();
-        assert_eq!(flushed, 0, "no new entries expected when history already current");
+        assert_eq!(
+            flushed, 0,
+            "no new entries expected when history already current"
+        );
 
         let buf = session.history.get(&SignalId::HR.as_u16()).unwrap();
         assert_eq!(buf.len(), 1, "history must not have duplicates");
@@ -1761,5 +1810,116 @@ mod tests {
         // Cut off mid-sample
         let truncated = &full[..full.len() - 4];
         assert!(session.load_history_from_bytes(truncated).is_err());
+    }
+
+    // lazy last_seq / F4: replay in tx_buffer
+
+    /// ID SRS: SRS-TEST-BLESESSION-043
+    /// Title: Test start_replay does NOT advance last_seq eagerly
+    ///
+    /// Description: start_replay must not pre-consume sequence numbers for frames that
+    ///              may never be sent.  last_seq must stay at its pre-replay value until
+    ///              commit_replay_progress is called.  A partial commit (K < N frames sent)
+    ///              must set last_seq to K, evict unsent replay frames from tx_buffer to
+    ///              prevent seq collisions, and leave the next live frame with seq K+1.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_start_replay_lazy_seq() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe(SignalId::HR.as_u16());
+        let stream_id = session.get_stream_id(SignalId::HR.as_u16()).unwrap();
+
+        session.record_history(SignalId::HR.as_u16(), 70.0, 1000);
+        session.record_history(SignalId::HR.as_u16(), 71.0, 2000);
+        session.record_history(SignalId::HR.as_u16(), 72.0, 3000);
+
+        let frames = session.start_replay(SignalId::HR.as_u16(), 0);
+        assert_eq!(frames.len(), 3);
+
+        // last_seq must NOT be advanced before commit_replay_progress
+        let entry = session.streams.get(&stream_id).unwrap();
+        assert_eq!(
+            entry.last_seq, 0,
+            "last_seq must remain 0 until commit_replay_progress is called"
+        );
+
+        // only 2 of 3 frames sent (notify failed on the 3rd)
+        session.commit_replay_progress(stream_id, 2);
+
+        let entry = session.streams.get(&stream_id).unwrap();
+        assert_eq!(
+            entry.last_seq, 2,
+            "last_seq must equal number of frames actually sent"
+        );
+
+        // Unsent frame (seq=3, FLAG_BACKLOG) must be evicted to prevent seq collision
+        assert_eq!(
+            session.get_pending_count(SignalId::HR.as_u16()),
+            2,
+            "unsent replay frame (seq=3) must be evicted from tx_buffer after partial commit"
+        );
+
+        // Next live frame must immediately follow the last sent replay frame — no gap
+        let live = session.add_data(SignalId::HR.as_u16(), 73.0, 4000).unwrap();
+        assert_eq!(
+            live.header.seq, 3,
+            "live frame must use seq = sent_count + 1, no gap in sequence space"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-044
+    /// Title: Test start_replay populates tx_buffer for NACK recovery (F4)
+    ///
+    /// Description: All frames returned by start_replay must be present in tx_buffer so
+    ///              that handle_nack can retransmit them if the Central reports a loss
+    ///              during the backlog burst.  After a full commit (all frames sent),
+    ///              all replay frames remain in tx_buffer and FLAG_RETRANSMIT is set
+    ///              on the NACK response.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_start_replay_frames_in_tx_buffer() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe(SignalId::HR.as_u16());
+        let stream_id = session.get_stream_id(SignalId::HR.as_u16()).unwrap();
+
+        session.record_history(SignalId::HR.as_u16(), 70.0, 1000);
+        session.record_history(SignalId::HR.as_u16(), 71.0, 2000);
+        session.record_history(SignalId::HR.as_u16(), 72.0, 3000);
+
+        let frames = session.start_replay(SignalId::HR.as_u16(), 0);
+        assert_eq!(frames.len(), 3);
+
+        // F4: all replay frames must be in the retransmit buffer immediately after start_replay
+        assert_eq!(
+            session.get_pending_count(SignalId::HR.as_u16()),
+            3,
+            "tx_buffer must hold all replay frames for NACK recovery"
+        );
+
+        // Full commit: all 3 frames sent successfully
+        session.commit_replay_progress(stream_id, 3);
+
+        // All 3 stay in tx_buffer (seq <= new_last_seq=3, not evicted)
+        assert_eq!(
+            session.get_pending_count(SignalId::HR.as_u16()),
+            3,
+            "fully-sent replay frames must remain in tx_buffer for NACK recovery"
+        );
+
+        // NACK for seq=2 must be retransmittable
+        let retransmits = session.handle_nack(stream_id, &[2]);
+        assert_eq!(
+            retransmits.len(),
+            1,
+            "handle_nack must find seq=2 in tx_buffer"
+        );
+        assert_eq!(retransmits[0].header.seq, 2);
+        assert_ne!(
+            retransmits[0].header.flags & FLAG_RETRANSMIT,
+            0,
+            "FLAG_RETRANSMIT must be set on retransmitted replay frame"
+        );
     }
 }

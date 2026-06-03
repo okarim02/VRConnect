@@ -777,11 +777,7 @@ impl ReliableBleOutput {
     ///              background task; skips the write if history is empty.
     ///
     /// Version: V1.0
-    async fn checkpoint_task(
-        state: Arc<RwLock<BleSessionState>>,
-        interval_sec: u64,
-        path: String,
-    ) {
+    async fn checkpoint_task(state: Arc<RwLock<BleSessionState>>, interval_sec: u64, path: String) {
         loop {
             tokio::time::sleep(Duration::from_secs(interval_sec)).await;
             let bytes = state.read().await.serialize_history_to_bytes();
@@ -980,6 +976,10 @@ impl ReliableBleOutput {
                 let mut st = state.write().await;
                 st.start_replay(canonical_id, start_time_ms)
             };
+            // Count frames actually notified. start_replay() no longer pre-advances
+            // last_seq; commit_replay_progress() below is the authoritative advance so that
+            // an interrupted replay (break on notify failure) never burns unused seq numbers.
+            let mut sent_count = 0usize;
             if replay_frames.is_empty() {
                 log::info!(
                     "Replay requested for signal 0x{:04X} (stream {}) but history is empty",
@@ -1007,6 +1007,7 @@ impl ReliableBleOutput {
                         // Stop replay on first notify failure (device likely disconnected)
                         break;
                     }
+                    sent_count += 1;
                     // Rate-limit replay to ~50 frames/s (20 ms inter-frame gap).
                     // Without this, a full 3600-frame backlog floods the BLE stack
                     // (~367 KB burst) causing Android to drop the connection. [DEV-6]
@@ -1015,6 +1016,10 @@ impl ReliableBleOutput {
             }
             {
                 let mut st = state.write().await;
+                // Lazy seq advance: only consume seq numbers for frames actually sent.
+                // Also evicts unsent replay frames from tx_buffer to prevent seq
+                //      collisions with subsequent live frames.
+                st.commit_replay_progress(stream_id, sent_count);
                 st.finish_replay(stream_id);
                 if mode == 2 {
                     st.unsubscribe(canonical_id);
@@ -1045,13 +1050,13 @@ impl ReliableBleOutput {
     /// Version: V1.0
     fn flutter_stream_id(signal_id: u16) -> u16 {
         match signal_id {
-            0x0101 => 1, // HR
-            0x0102 => 2, // SpO2
-            0x0103 => 3, // Temperature
-            0x0201 => 4, // SBP
-            0x0202 => 5, // DBP
-            0x0203 => 6, // MBP
-            0x0501 => 7, // AmbPres
+            0x0101 => 1,    // HR
+            0x0102 => 2,    // SpO2
+            0x0103 => 3,    // Temperature
+            0x0201 => 4,    // SBP
+            0x0202 => 5,    // DBP
+            0x0203 => 6,    // MBP
+            0x0501 => 7,    // AmbPres
             other => other, // unknown signal — pass-through, will likely be dropped by Flutter
         }
     }
@@ -1087,7 +1092,7 @@ impl ReliableBleOutput {
                         canonical_id
                     );
                 }
-                        // Flutter v2 reads stream_id from SUBSCRIBE_RSP to build activeStreams.
+                // Flutter v2 reads stream_id from SUBSCRIBE_RSP to build activeStreams.
                 // We use a fixed 1-7 mapping so stream IDs are stable and predictable:
                 //   0x0101→1, 0x0102→2, 0x0103→3, 0x0201→4, 0x0202→5, 0x0203→6, 0x0501→7
                 // RSP and DATA_FRAMEs both use this mapping — they must be consistent.
@@ -1136,7 +1141,8 @@ impl ReliableBleOutput {
         if let Err(e) = srv.notify("Data_OUT", &rsp_bytes).await {
             log::warn!(
                 "SUBSCRIBE_RSP notify on Data_OUT failed (req_id={}): {}",
-                req_id, e
+                req_id,
+                e
             );
         } else {
             log::info!(
@@ -2898,7 +2904,12 @@ mod tests {
         }
 
         let tmp_dir = tempfile::TempDir::new().unwrap();
-        let path = tmp_dir.path().join("ckpt.bin").to_str().unwrap().to_string();
+        let path = tmp_dir
+            .path()
+            .join("ckpt.bin")
+            .to_str()
+            .unwrap()
+            .to_string();
 
         tokio::spawn(ReliableBleOutput::checkpoint_task(
             state.clone(),
