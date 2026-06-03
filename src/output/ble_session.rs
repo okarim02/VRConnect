@@ -77,8 +77,15 @@ pub struct BleSessionState {
     /// Fed continuously from add_data(); bounded at max_history_size per signal.
     /// Used by get_replay_frames() to serve BACKLOG_THEN_LIVE / BACKLOG_ONLY subscriptions.
     pub history: HashMap<u16, VecDeque<(u64, f32)>>,
-    /// Maximum historical samples kept per signal (default: 3600 ≈ 1 h at 1 Hz).
+    /// Maximum historical samples kept per signal (hard count cap).
+    /// Set via with_history_retention(); default matches HISTORY_RETENTION_SEC at 1 Hz.
     pub max_history_size: usize,
+    /// Maximum age in milliseconds of a sample in the history ring buffer.
+    /// Samples older than (current_t0_ms - max_history_age_ms) are evicted on insert.
+    /// Prevents sparse signals (e.g. PNI every 5 min) from accumulating entries
+    /// spanning multiple days within the size cap.
+    /// Set via with_history_retention(). 0 = age eviction disabled.
+    pub max_history_age_ms: u64,
 }
 
 impl BleSessionState {
@@ -98,9 +105,10 @@ impl BleSessionState {
             streams: HashMap::new(),
             signal_to_stream: HashMap::new(),
             next_stream_id: 1,
-            max_buffer_size: 1000, // Medical: prevent unbounded memory growth
+            max_buffer_size: 1000,            // Medical: prevent unbounded memory growth
             history: HashMap::new(),
-            max_history_size: 3600, // ~1 hour at 1 Hz per signal
+            max_history_size: 21600,          // 6 h at 1 Hz — matches default HISTORY_RETENTION_SEC
+            max_history_age_ms: 21600 * 1000, // 6 h age eviction threshold
         }
     }
 
@@ -216,6 +224,26 @@ impl BleSessionState {
     /// Version: V1.0
     pub fn with_history_size(mut self, size: usize) -> Self {
         self.max_history_size = size;
+        self
+    }
+
+    /// ID SRS: SRS-FN-BLESESSION-024
+    /// Title: with_history_retention
+    ///
+    /// Description: Configure the history ring buffer by retention window in seconds.
+    ///              Sets max_history_size = retention_sec (sized for 1 Hz continuous signals)
+    ///              and max_history_age_ms = retention_sec × 1000 (per-sample age eviction).
+    ///              Age eviction prevents sparse signals (e.g. PNI every 5 min) from
+    ///              accumulating entries spanning multiple days within the size cap.
+    ///              Called from ble_reliable.rs::new() with HISTORY_RETENTION_SEC config value.
+    ///
+    /// Version: V1.0
+    ///
+    /// # Arguments
+    /// * `retention_sec` - Retention window in seconds (default: 21600 = 6 h)
+    pub fn with_history_retention(mut self, retention_sec: u64) -> Self {
+        self.max_history_size = retention_sec as usize;
+        self.max_history_age_ms = retention_sec.saturating_mul(1000);
         self
     }
 
@@ -432,7 +460,17 @@ impl BleSessionState {
             }
         }
         buf.push_back((t0_ms, value));
-        if buf.len() > self.max_history_size {
+        // Age eviction: remove samples older than max_history_age_ms.
+        // Runs before the count cap so sparse signals (e.g. PNI every 5 min)
+        // don't accumulate entries spanning multiple days within the size limit.
+        if self.max_history_age_ms > 0 {
+            let cutoff = t0_ms.saturating_sub(self.max_history_age_ms);
+            while buf.front().map_or(false, |&(ts, _)| ts < cutoff) {
+                buf.pop_front();
+            }
+        }
+        // Hard count cap (safety net after age eviction).
+        while buf.len() > self.max_history_size {
             buf.pop_front();
         }
     }
@@ -1810,6 +1848,48 @@ mod tests {
         // Cut off mid-sample
         let truncated = &full[..full.len() - 4];
         assert!(session.load_history_from_bytes(truncated).is_err());
+    }
+
+    // History retention — age eviction & with_history_retention
+
+    /// ID SRS: SRS-TEST-BLESESSION-045
+    /// Title: Test record_history evicts samples older than max_history_age_ms
+    ///
+    /// Description: When a new sample arrives, record_history must evict any existing
+    ///              sample whose t0_ms < (new_t0_ms - max_history_age_ms). This prevents
+    ///              sparse signals from accumulating multi-day history within the count cap.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_record_history_age_eviction() {
+        // 3 s retention window
+        let mut session = BleSessionState::new(1).with_history_retention(3);
+
+        session.record_history(0x0101, 70.0, 0);       // t = 0 ms
+        session.record_history(0x0101, 71.0, 1_000);   // t = 1 000 ms
+
+        // t = 4 000 ms: cutoff = 4000 - 3000 = 1000. Samples with ts < 1000 evicted.
+        // t=0 (ts=0 < 1000) → evicted; t=1000 (NOT < 1000) → kept
+        session.record_history(0x0101, 74.0, 4_000);
+
+        let buf = session.history.get(&0x0101).unwrap();
+        assert_eq!(buf.len(), 2, "t=0 ms must be evicted; t=1000 ms and t=4000 ms remain");
+        assert_eq!(buf[0].0, 1_000, "oldest remaining must be t=1000 ms");
+        assert_eq!(buf[1].0, 4_000, "newest must be t=4000 ms");
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-046
+    /// Title: Test with_history_retention sets both max_history_size and max_history_age_ms
+    ///
+    /// Description: with_history_retention(N) must set max_history_size = N and
+    ///              max_history_age_ms = N * 1000.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_with_history_retention_sets_both_fields() {
+        let session = BleSessionState::new(1).with_history_retention(7200);
+        assert_eq!(session.max_history_size, 7200);
+        assert_eq!(session.max_history_age_ms, 7_200_000);
     }
 
     // lazy last_seq / F4: replay in tx_buffer

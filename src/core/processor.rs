@@ -105,6 +105,7 @@ impl VitalProcessor {
                     self.config.history_checkpoint_interval_sec,
                     self.config.history_checkpoint_max_age_sec,
                     self.config.history_checkpoint_path.clone(),
+                    self.config.history_retention_sec,
                 )
                 .await?,
             )))
@@ -413,8 +414,9 @@ mod tests {
             health_file: "logs/health.json".to_string(),
             ble_grace_period_sec: 10,
             history_checkpoint_interval_sec: 30,
-            history_checkpoint_max_age_sec: 300,
+            history_checkpoint_max_age_sec: 21600,
             history_checkpoint_path: "logs/history_checkpoint.bin".to_string(),
+            history_retention_sec: 21600,
             debug_enabled: false,
             debug_output_path: "./debug.log".to_string(),
             log_level: "INFO".to_string(),

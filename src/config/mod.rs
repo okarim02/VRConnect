@@ -121,14 +121,28 @@ pub struct Config {
     pub history_checkpoint_interval_sec: u64,
 
     /// Maximum age in seconds of a checkpoint file to be loaded at startup.
+    /// Must be at least as large as history_retention_sec to avoid discarding
+    /// a valid checkpoint after a long outage or restart.
+    /// Default: 21600 (6 h) — aligned with history_retention_sec.
     /// ID SRS: SRS-CFG-CHECKPOINT-002
-    #[arg(long, default_value = "300")]
+    #[arg(long, default_value = "21600")]
     pub history_checkpoint_max_age_sec: u64,
 
     /// Path to the binary history checkpoint file written periodically.
     /// ID SRS: SRS-CFG-CHECKPOINT-003
     #[arg(long, default_value = "logs/history_checkpoint.bin")]
     pub history_checkpoint_path: String,
+
+    /// History retention window in seconds.
+    /// Controls both the per-signal ring-buffer size (max samples = retention_sec,
+    /// sized for 1 Hz continuous signals) and the per-sample age eviction threshold
+    /// (samples older than retention_sec are pruned on insert).
+    /// Prevents sparse signals (e.g. PNI every 5 min) from accumulating multi-day
+    /// history within the count cap (E11 fix).
+    /// Default: 21600 (6 h) — headroom above the 5 h BLE outage target.
+    /// ID SRS: SRS-CFG-HISTORY-001
+    #[arg(long, default_value = "21600")]
+    pub history_retention_sec: u64,
 
     // Debug Configuration
     /// Enable debug mode
@@ -369,6 +383,13 @@ impl Config {
                 config.history_checkpoint_path = val;
             }
         }
+        if !has_arg("--history-retention-sec") {
+            if let Ok(val) = std::env::var("HISTORY_RETENTION_SEC") {
+                if let Ok(secs) = val.parse() {
+                    config.history_retention_sec = secs;
+                }
+            }
+        }
 
         // Debug
         if !has_arg("--debug-enabled") {
@@ -538,8 +559,9 @@ mod tests {
             health_file: "logs/health.json".to_string(),
             ble_grace_period_sec: 10,
             history_checkpoint_interval_sec: 30,
-            history_checkpoint_max_age_sec: 300,
+            history_checkpoint_max_age_sec: 21600,
             history_checkpoint_path: "logs/history_checkpoint.bin".to_string(),
+            history_retention_sec: 21600,
             debug_enabled: false,
             debug_output_path: "./debug.log".to_string(),
             log_level: "INFO".to_string(),
@@ -1055,8 +1077,9 @@ mod tests {
     fn test_checkpoint_defaults() {
         let config = Config::parse_from(vec!["vrconnect"]);
         assert_eq!(config.history_checkpoint_interval_sec, 30);
-        assert_eq!(config.history_checkpoint_max_age_sec, 300);
+        assert_eq!(config.history_checkpoint_max_age_sec, 21600); // aligned with history_retention_sec
         assert_eq!(config.history_checkpoint_path, "logs/history_checkpoint.bin");
+        assert_eq!(config.history_retention_sec, 21600);
     }
 
     #[test]

@@ -95,11 +95,15 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Config, String> {
             .parse()
             .unwrap_or(30),
         history_checkpoint_max_age_sec: std::env::var("HISTORY_CHECKPOINT_MAX_AGE_SEC")
-            .unwrap_or_else(|_| "300".to_string())
+            .unwrap_or_else(|_| "21600".to_string())
             .parse()
-            .unwrap_or(300),
+            .unwrap_or(21600),
         history_checkpoint_path: std::env::var("HISTORY_CHECKPOINT_PATH")
             .unwrap_or_else(|_| "logs/history_checkpoint.bin".to_string()),
+        history_retention_sec: std::env::var("HISTORY_RETENTION_SEC")
+            .unwrap_or_else(|_| "21600".to_string())
+            .parse()
+            .unwrap_or(21600),
         debug_enabled: std::env::var("DEBUG_ENABLED")
             .unwrap_or_else(|_| "false".to_string())
             .parse()
@@ -143,6 +147,7 @@ mod tests {
             "HISTORY_CHECKPOINT_INTERVAL_SEC",
             "HISTORY_CHECKPOINT_MAX_AGE_SEC",
             "HISTORY_CHECKPOINT_PATH",
+            "HISTORY_RETENTION_SEC",
             "DEBUG_ENABLED",
             "DEBUG_OUTPUT_PATH",
             "LOG_LEVEL",

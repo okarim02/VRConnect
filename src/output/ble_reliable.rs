@@ -64,6 +64,9 @@ pub struct ReliableBleOutput {
     history_checkpoint_max_age_sec: u64,
     /// Path to the binary history checkpoint file.
     history_checkpoint_path: String,
+    /// History retention window in seconds — drives ring-buffer size and age eviction.
+    /// Passed to BleSessionState::with_history_retention() at construction.
+    history_retention_sec: u64,
 }
 
 /// Characteristic UUID suffixes (PDF spec)
@@ -94,6 +97,7 @@ impl ReliableBleOutput {
         history_checkpoint_interval_sec: u64,
         history_checkpoint_max_age_sec: u64,
         history_checkpoint_path: String,
+        history_retention_sec: u64,
     ) -> Result<Self> {
         let service_uuid = uuid::Uuid::parse_str(&service_uuid_str)
             .map_err(|e| VitalError::Config(format!("Invalid BLE service UUID: {}", e)))?;
@@ -158,7 +162,7 @@ impl ReliableBleOutput {
 
         let registry = Arc::new(registry.unwrap_or_else(SignalRegistry::with_defaults));
         let catalog = registry.build_catalog();
-        let state = BleSessionState::new(1);
+        let state = BleSessionState::new(1).with_history_retention(history_retention_sec);
 
         let health_state = Arc::new(RwLock::new(GateHealthState {
             flow_timeout_sec: health_ble_flow_timeout_sec,
@@ -178,6 +182,7 @@ impl ReliableBleOutput {
             history_checkpoint_interval_sec,
             history_checkpoint_max_age_sec,
             history_checkpoint_path,
+            history_retention_sec,
         })
     }
 
@@ -314,11 +319,16 @@ impl ReliableBleOutput {
             );
         }
 
-        // 6. Load history checkpoint if fresh enough
+        // 6. Load history checkpoint if fresh enough.
+        // max_age threshold = max(history_checkpoint_max_age_sec, history_retention_sec)
+        // so the checkpoint is never rejected for being older than the retention window.
+        let ckpt_max_age = self
+            .history_checkpoint_max_age_sec
+            .max(self.history_retention_sec);
         Self::try_load_checkpoint(
             &self.state,
             &self.history_checkpoint_path,
-            self.history_checkpoint_max_age_sec,
+            ckpt_max_age,
         )
         .await;
 
