@@ -986,10 +986,9 @@ impl ReliableBleOutput {
                 let mut st = state.write().await;
                 st.start_replay(canonical_id, start_time_ms)
             };
-            // Count frames actually notified. start_replay() no longer pre-advances
-            // last_seq; commit_replay_progress() below is the authoritative advance so that
-            // an interrupted replay (break on notify failure) never burns unused seq numbers.
-            let mut sent_count = 0usize;
+            // start_replay() reserves the seq block eagerly (frames already carry their final
+            // seq) and keeps them in tx_buffer (F4). If this loop breaks early on a notify
+            // failure, the un-sent frames remain NACK-recoverable — no commit step needed.
             if replay_frames.is_empty() {
                 log::info!(
                     "Replay requested for signal 0x{:04X} (stream {}) but history is empty",
@@ -1017,7 +1016,6 @@ impl ReliableBleOutput {
                         // Stop replay on first notify failure (device likely disconnected)
                         break;
                     }
-                    sent_count += 1;
                     // Rate-limit replay to ~50 frames/s (20 ms inter-frame gap).
                     // Without this, a full 3600-frame backlog floods the BLE stack
                     // (~367 KB burst) causing Android to drop the connection. [DEV-6]
@@ -1026,10 +1024,6 @@ impl ReliableBleOutput {
             }
             {
                 let mut st = state.write().await;
-                // Lazy seq advance: only consume seq numbers for frames actually sent.
-                // Also evicts unsent replay frames from tx_buffer to prevent seq
-                //      collisions with subsequent live frames.
-                st.commit_replay_progress(stream_id, sent_count);
                 st.finish_replay(stream_id);
                 if mode == 2 {
                     st.unsubscribe(canonical_id);
