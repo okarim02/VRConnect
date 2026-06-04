@@ -1531,105 +1531,127 @@ impl ReliableBleOutput {
         // flow state changes slowly (only meaningful after flow_timeout_sec elapses).
         self.health_state.write().await.last_processed_data = Some(Instant::now());
 
-        let mut state = self.state.write().await;
-        let server = self.server.read().await;
+        // Phase 1 — hold state.write() only for in-memory work (history, tx_buffer, WAL).
+        // Serialise each outbound frame into bytes here so Phase 2 needs no state access.
+        // The lock is intentionally dropped before any BLE notify call: notify() is an
+        // async Windows BLE stack call that can stall for tens of ms under congestion,
+        // and holding the write lock during it would block ACK processing in
+        // write_handler_loop(), preventing tx_buffer from draining.
+        let mut frames_to_send: Vec<(Vec<u8>, u16, u16, u32)> = Vec::new(); // (bytes, signal_id, stream_id, seq)
+        {
+            let mut state = self.state.write().await;
+            let mut seen: std::collections::HashSet<(u16, u64)> =
+                std::collections::HashSet::new();
 
-        let mut seen: std::collections::HashSet<(u16, u64)> = std::collections::HashSet::new();
-
-        for track in &data.all_tracks {
-            // Only BED_01 (room_index = 0)
-            if track.room_index != 0 {
-                continue;
-            }
-
-            // log track info for diagnosis
-            // log::info!(
-            //     "Track: name='{}', raw={:?}, display='{}', timestamp={}",
-            //     track.name,
-            //     track.raw_value,
-            //     track.display_value,
-            //     track.timestamp
-            // );
-
-            // Map VitalRecorder signal name → IDT signal_id.
-            // VitalRecorder exports SpO2 as "PLETH_SPO2" (or "PLETH" / "SpO2" in older versions)
-            // and temperature as "BT1_TEMP" (or "BT1" / "TEMPERATURE" in older versions).
-            let signal_id = match track.name.trim().to_uppercase().as_str() {
-                "HR" => SignalId::HR.as_u16(),
-                "SPO2" | "PLETH" | "PLETH_SPO2" => SignalId::SpO2.as_u16(),
-                "TEMP" | "TEMPERATURE" | "BT" | "BT1" | "BT1_TEMP" => {
-                    SignalId::Temperature.as_u16()
+            for track in &data.all_tracks {
+                // Only BED_01 (room_index = 0)
+                if track.room_index != 0 {
+                    continue;
                 }
-                "SBP" | "NIBP_SBP" => SignalId::SBP.as_u16(),
-                "DBP" | "NIBP_DBP" => SignalId::DBP.as_u16(),
-                "MBP" | "NIBP_MBP" => SignalId::MBP.as_u16(),
-                "AMB_PRES" | "AMBIENT_PRESSURE" => SignalId::AmbPres.as_u16(),
-                _ => continue,
-            };
 
-            let val_f32 = if let Some(raw) = track.raw_value {
-                raw as f32
-            } else if let Ok(parsed) = track.display_value.parse::<f32>() {
-                parsed
-            } else {
-                continue;
-            };
+                // log track info for diagnosis
+                // log::info!(
+                //     "Track: name='{}', raw={:?}, display='{}', timestamp={}",
+                //     track.name,
+                //     track.raw_value,
+                //     track.display_value,
+                //     track.timestamp
+                // );
 
-            // Sample timestamp (milliseconds since Unix epoch)
-            let t0_ms = track.timestamp.timestamp_millis() as u64;
+                // Map VitalRecorder signal name → IDT signal_id.
+                // VitalRecorder exports SpO2 as "PLETH_SPO2" (or "PLETH" / "SpO2" in older versions)
+                // and temperature as "BT1_TEMP" (or "BT1" / "TEMPERATURE" in older versions).
+                let signal_id = match track.name.trim().to_uppercase().as_str() {
+                    "HR" => SignalId::HR.as_u16(),
+                    "SPO2" | "PLETH" | "PLETH_SPO2" => SignalId::SpO2.as_u16(),
+                    "TEMP" | "TEMPERATURE" | "BT" | "BT1" | "BT1_TEMP" => {
+                        SignalId::Temperature.as_u16()
+                    }
+                    "SBP" | "NIBP_SBP" => SignalId::SBP.as_u16(),
+                    "DBP" | "NIBP_DBP" => SignalId::DBP.as_u16(),
+                    "MBP" | "NIBP_MBP" => SignalId::MBP.as_u16(),
+                    "AMB_PRES" | "AMBIENT_PRESSURE" => SignalId::AmbPres.as_u16(),
+                    _ => continue,
+                };
 
-            // VitalRecorder emits 2–3 duplicate records per signal in one Socket.IO message.
-            // Skip duplicates to avoid storing the same point in history and notifying MyPredi twice.
-            if !seen.insert((signal_id, t0_ms)) {
-                log::debug!(
-                    "Duplicate (signal=0x{:04X}, t0_ms={}) skipped",
-                    signal_id,
-                    t0_ms
-                );
-                continue;
-            }
+                let val_f32 = if let Some(raw) = track.raw_value {
+                    raw as f32
+                } else if let Ok(parsed) = track.display_value.parse::<f32>() {
+                    parsed
+                } else {
+                    continue;
+                };
 
-            // Always record to history buffer so replay is available
-            // regardless of whether any client is currently subscribed.
-            state.record_history(signal_id, val_f32, t0_ms);
+                // Sample timestamp (milliseconds since Unix epoch)
+                let t0_ms = track.timestamp.timestamp_millis() as u64;
 
-            // Forward to WAL journal (non-blocking channel send; task fsyncs on its own timer).
-            if let Some(tx) = &self.wal_tx {
-                let _ = tx.send(WalEntry {
-                    signal_id,
-                    t0_ms,
-                    value: val_f32,
-                });
-            }
-
-            // add_data returns Some(frame) only if signal is subscribed
-            if let Some(frame) = state.add_data(signal_id, val_f32, t0_ms) {
-                // DataFrame::to_ble_bytes() produces 34 bytes (IDT header + payload + CRC32C).
-                // Signal name aliases are VitalRecorder-specific; registry governs BLE catalog.
-
-                // --- CHAOS MONKEY: packet-drop + network-jitter (env-driven) ---
-                // Controlled by ENABLE_CHAOS_MONKEY / CHAOS_RATIO / CHAOS_NETWORK_JITTER.
-                // Never active when APP_ENV=production. See src/chaos/mod.rs.
-                if chaos::maybe_drop_frame("ble_reliable.rs") {
-                    continue; // Skip the BLE notify — simulates a lossy link.
+                // VitalRecorder emits 2–3 duplicate records per signal in one Socket.IO message.
+                // Skip duplicates to avoid storing the same point in history and notifying MyPredi twice.
+                if !seen.insert((signal_id, t0_ms)) {
+                    log::debug!(
+                        "Duplicate (signal=0x{:04X}, t0_ms={}) skipped",
+                        signal_id,
+                        t0_ms
+                    );
+                    continue;
                 }
+
+                // Always record to history buffer so replay is available
+                // regardless of whether any client is currently subscribed.
+                state.record_history(signal_id, val_f32, t0_ms);
+
+                // Forward to WAL journal (non-blocking channel send; task fsyncs on its own timer).
+                if let Some(tx) = &self.wal_tx {
+                    let _ = tx.send(WalEntry {
+                        signal_id,
+                        t0_ms,
+                        value: val_f32,
+                    });
+                }
+
+                // add_data returns Some(frame) only if signal is subscribed
+                if let Some(frame) = state.add_data(signal_id, val_f32, t0_ms) {
+                    // --- CHAOS MONKEY: packet-drop (env-driven, no .await — safe under lock) ---
+                    // Controlled by ENABLE_CHAOS_MONKEY / CHAOS_RATIO.
+                    // Never active when APP_ENV=production. See src/chaos/mod.rs.
+                    if chaos::maybe_drop_frame("ble_reliable.rs") {
+                        continue; // Skip the BLE notify — simulates a lossy link.
+                    }
+                    // -------------------------------------------------------------------------
+
+                    frames_to_send.push((
+                        frame.to_ble_bytes(),
+                        signal_id,
+                        frame.header.stream_id,
+                        frame.header.seq,
+                    ));
+                }
+            }
+        } // ← state.write() released here, before any BLE I/O
+
+        // Phase 2 — send notifies without holding the state lock.
+        // maybe_network_jitter has an .await so it must run outside the lock.
+        if !frames_to_send.is_empty() {
+            let server = self.server.read().await;
+            for (bytes, signal_id, stream_id, seq) in frames_to_send {
+                // --- CHAOS MONKEY: network-jitter (env-driven, has .await) ---
                 chaos::maybe_network_jitter("ble_reliable.rs").await;
                 // -------------------------------------------------------------
 
-                let bytes = frame.to_ble_bytes();
                 if let Err(e) = server.notify("Data_OUT", &bytes).await {
                     log::warn!("BLE notify failed for signal 0x{:04X}: {}", signal_id, e);
                 } else {
                     log::debug!(
                         "Data_OUT: signal=0x{:04X}, stream={}, seq={}, {} bytes",
                         signal_id,
-                        frame.header.stream_id,
-                        frame.header.seq,
+                        stream_id,
+                        seq,
                         bytes.len()
                     );
                 }
             }
         }
+
         Ok(())
     }
 
