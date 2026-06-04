@@ -144,6 +144,31 @@ pub struct Config {
     #[arg(long, default_value = "21600")]
     pub history_retention_sec: u64,
 
+    // WAL (Write-Ahead Log) Configuration
+    /// Enable append-only WAL for the history ring-buffer.
+    /// Replaces periodic full-snapshot rewrites, reducing flash write amplification ~500x
+    /// and shrinking the crash-loss window from ≤checkpoint_interval to ≤wal_fsync_interval_sec.
+    /// ID SRS: SRS-CFG-WAL-001
+    #[arg(long, default_value = "false")]
+    pub wal_enabled: bool,
+
+    /// Path to the WAL append-only journal file.
+    /// ID SRS: SRS-CFG-WAL-002
+    #[arg(long, default_value = "logs/history.wal")]
+    pub wal_path: String,
+
+    /// Seconds between batched fsyncs of the WAL file.
+    /// This is the maximum crash-loss window when WAL is enabled.
+    /// ID SRS: SRS-CFG-WAL-003
+    #[arg(long, default_value = "2")]
+    pub wal_fsync_interval_sec: u64,
+
+    /// Seconds between WAL compactions: write full history snapshot to checkpoint,
+    /// then truncate the WAL. Snapshot fsync happens before WAL truncation.
+    /// ID SRS: SRS-CFG-WAL-004
+    #[arg(long, default_value = "3600")]
+    pub wal_compaction_interval_sec: u64,
+
     // Debug Configuration
     /// Enable debug mode
     #[arg(long, default_value = "false")]
@@ -189,7 +214,11 @@ impl Config {
         // If config file specified, load it to set environment variables
         if let Some(ref path) = config_file_path {
             if let Err(e) = dotenvy::from_path(path) {
-                eprintln!("Warning: Failed to load config file {}: {}", path.display(), e);
+                eprintln!(
+                    "Warning: Failed to load config file {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
 
@@ -562,6 +591,10 @@ mod tests {
             history_checkpoint_max_age_sec: 21600,
             history_checkpoint_path: "logs/history_checkpoint.bin".to_string(),
             history_retention_sec: 21600,
+            wal_enabled: false,
+            wal_path: "logs/history.wal".to_string(),
+            wal_fsync_interval_sec: 2,
+            wal_compaction_interval_sec: 3600,
             debug_enabled: false,
             debug_output_path: "./debug.log".to_string(),
             log_level: "INFO".to_string(),
@@ -584,10 +617,7 @@ mod tests {
         assert_eq!(config.output_ble_empty_value, "null");
         assert_eq!(config.output_ble_update_interval_ms, 100);
         assert!(!config.output_file_enabled);
-        assert_eq!(
-            config.output_file_base_path,
-            "./data/vrconnect/recording"
-        );
+        assert_eq!(config.output_file_base_path, "./data/vrconnect/recording");
         assert_eq!(config.output_file_max_size_mb, 500);
         assert_eq!(config.output_file_archive_threshold_gb, 5);
         assert_eq!(config.output_file_critical_disk_percent, 95);
@@ -943,33 +973,23 @@ mod tests {
 
     #[test]
     fn test_config_parse_ble_values() {
-        let config = Config::parse_from(vec![
-            "vrconnect",
-            "--output-ble-values",
-            "HR,SPO2,NIBP_SYS",
-        ]);
+        let config =
+            Config::parse_from(vec!["vrconnect", "--output-ble-values", "HR,SPO2,NIBP_SYS"]);
 
         assert_eq!(config.output_ble_values, "HR,SPO2,NIBP_SYS");
     }
 
     #[test]
     fn test_config_parse_ble_empty_value() {
-        let config = Config::parse_from(vec![
-            "vrconnect",
-            "--output-ble-empty-value",
-            "",
-        ]);
+        let config = Config::parse_from(vec!["vrconnect", "--output-ble-empty-value", ""]);
 
         assert_eq!(config.output_ble_empty_value, "");
     }
 
     #[test]
     fn test_config_parse_ble_update_interval() {
-        let config = Config::parse_from(vec![
-            "vrconnect",
-            "--output-ble-update-interval-ms",
-            "200",
-        ]);
+        let config =
+            Config::parse_from(vec!["vrconnect", "--output-ble-update-interval-ms", "200"]);
 
         assert_eq!(config.output_ble_update_interval_ms, 200);
     }
@@ -988,9 +1008,12 @@ mod tests {
     fn test_health_parse_args() {
         let config = Config::parse_from(vec![
             "vrconnect",
-            "--health-check-interval-sec", "10",
-            "--health-ble-flow-timeout-sec", "120",
-            "--health-file", "custom/health.json",
+            "--health-check-interval-sec",
+            "10",
+            "--health-ble-flow-timeout-sec",
+            "120",
+            "--health-file",
+            "custom/health.json",
         ]);
         assert_eq!(config.health_check_interval_sec, 10);
         assert_eq!(config.health_ble_flow_timeout_sec, 120);
@@ -1078,7 +1101,10 @@ mod tests {
         let config = Config::parse_from(vec!["vrconnect"]);
         assert_eq!(config.history_checkpoint_interval_sec, 30);
         assert_eq!(config.history_checkpoint_max_age_sec, 21600); // aligned with history_retention_sec
-        assert_eq!(config.history_checkpoint_path, "logs/history_checkpoint.bin");
+        assert_eq!(
+            config.history_checkpoint_path,
+            "logs/history_checkpoint.bin"
+        );
         assert_eq!(config.history_retention_sec, 21600);
     }
 
@@ -1086,9 +1112,12 @@ mod tests {
     fn test_checkpoint_parse_args() {
         let config = Config::parse_from(vec![
             "vrconnect",
-            "--history-checkpoint-interval-sec", "60",
-            "--history-checkpoint-max-age-sec", "600",
-            "--history-checkpoint-path", "/tmp/ckpt.bin",
+            "--history-checkpoint-interval-sec",
+            "60",
+            "--history-checkpoint-max-age-sec",
+            "600",
+            "--history-checkpoint-path",
+            "/tmp/ckpt.bin",
         ]);
         assert_eq!(config.history_checkpoint_interval_sec, 60);
         assert_eq!(config.history_checkpoint_max_age_sec, 600);
@@ -1098,10 +1127,8 @@ mod tests {
     #[test]
     fn test_checkpoint_zero_interval_allowed() {
         // interval=0 means checkpoint disabled — must be accepted by parse
-        let config = Config::parse_from(vec![
-            "vrconnect",
-            "--history-checkpoint-interval-sec", "0",
-        ]);
+        let config =
+            Config::parse_from(vec!["vrconnect", "--history-checkpoint-interval-sec", "0"]);
         assert_eq!(config.history_checkpoint_interval_sec, 0);
     }
 

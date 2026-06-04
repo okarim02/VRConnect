@@ -106,6 +106,10 @@ impl VitalProcessor {
                     self.config.history_checkpoint_max_age_sec,
                     self.config.history_checkpoint_path.clone(),
                     self.config.history_retention_sec,
+                    self.config.wal_enabled,
+                    self.config.wal_path.clone(),
+                    self.config.wal_fsync_interval_sec,
+                    self.config.wal_compaction_interval_sec,
                 )
                 .await?,
             )))
@@ -417,6 +421,10 @@ mod tests {
             history_checkpoint_max_age_sec: 21600,
             history_checkpoint_path: "logs/history_checkpoint.bin".to_string(),
             history_retention_sec: 21600,
+            wal_enabled: false,
+            wal_path: "logs/history.wal".to_string(),
+            wal_fsync_interval_sec: 2,
+            wal_compaction_interval_sec: 3600,
             debug_enabled: false,
             debug_output_path: "./debug.log".to_string(),
             log_level: "INFO".to_string(),

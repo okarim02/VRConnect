@@ -191,9 +191,9 @@ mod tests {
             output_ble_enabled: false,
             output_ble_device_name: "Test".to_string(),
             output_ble_service_uuid: "12345678-1234-5678-1234-567812345678".to_string(),
-            output_ble_values: "HR,SPO2".to_string(),           // ADDED
-            output_ble_empty_value: "null".to_string(),         // ADDED
-            output_ble_update_interval_ms: 100,                 // ADDED
+            output_ble_values: "HR,SPO2".to_string(), // ADDED
+            output_ble_empty_value: "null".to_string(), // ADDED
+            output_ble_update_interval_ms: 100,       // ADDED
             output_file_enabled: false,
             output_file_base_path: "./data/test".to_string(),
             output_file_max_size_mb: 500,
@@ -207,6 +207,10 @@ mod tests {
             history_checkpoint_max_age_sec: 21600,
             history_checkpoint_path: "logs/history_checkpoint.bin".to_string(),
             history_retention_sec: 21600,
+            wal_enabled: false,
+            wal_path: "logs/history.wal".to_string(),
+            wal_fsync_interval_sec: 2,
+            wal_compaction_interval_sec: 3600,
             debug_enabled: false,
             debug_output_path: "./debug.log".to_string(),
             log_level: "INFO".to_string(),

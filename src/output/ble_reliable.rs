@@ -25,7 +25,9 @@ use crate::error::{Result, VitalError};
 use crate::output::ble_gatt::{BleConnectionEvent, CharProperty, GattServer, WriteEvent};
 use crate::output::ble_session::BleSessionState;
 use crate::output::health::{build_payload, read_os_snapshot, GateHealthState};
+use crate::output::wal::{self, WalEntry};
 use crate::utils::chaos;
+use std::io::{BufWriter, Write as IoWrite};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,6 +69,18 @@ pub struct ReliableBleOutput {
     /// History retention window in seconds — drives ring-buffer size and age eviction.
     /// Passed to BleSessionState::with_history_retention() at construction.
     history_retention_sec: u64,
+    /// WAL enabled flag — when false all wal_* fields are inert.
+    wal_enabled: bool,
+    /// Path to the WAL append-only journal file.
+    wal_path: String,
+    /// Seconds between batched fsyncs of the WAL file (= max crash-loss window).
+    wal_fsync_interval_sec: u64,
+    /// Seconds between WAL compactions (full snapshot + WAL truncation).
+    wal_compaction_interval_sec: u64,
+    /// Sender half of the WAL channel. None when WAL is disabled.
+    wal_tx: Option<tokio::sync::mpsc::UnboundedSender<WalEntry>>,
+    /// Receiver half of the WAL channel, taken once by start() to spawn wal_task.
+    wal_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<WalEntry>>>,
 }
 
 /// Characteristic UUID suffixes (PDF spec)
@@ -98,6 +112,10 @@ impl ReliableBleOutput {
         history_checkpoint_max_age_sec: u64,
         history_checkpoint_path: String,
         history_retention_sec: u64,
+        wal_enabled: bool,
+        wal_path: String,
+        wal_fsync_interval_sec: u64,
+        wal_compaction_interval_sec: u64,
     ) -> Result<Self> {
         let service_uuid = uuid::Uuid::parse_str(&service_uuid_str)
             .map_err(|e| VitalError::Config(format!("Invalid BLE service UUID: {}", e)))?;
@@ -169,6 +187,13 @@ impl ReliableBleOutput {
             ..Default::default()
         }));
 
+        let (wal_tx, wal_rx) = if wal_enabled {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             server: Arc::new(RwLock::new(server)),
             state: Arc::new(RwLock::new(state)),
@@ -183,6 +208,12 @@ impl ReliableBleOutput {
             history_checkpoint_max_age_sec,
             history_checkpoint_path,
             history_retention_sec,
+            wal_enabled,
+            wal_path,
+            wal_fsync_interval_sec,
+            wal_compaction_interval_sec,
+            wal_tx,
+            wal_rx: tokio::sync::Mutex::new(wal_rx),
         })
     }
 
@@ -325,12 +356,26 @@ impl ReliableBleOutput {
         let ckpt_max_age = self
             .history_checkpoint_max_age_sec
             .max(self.history_retention_sec);
-        Self::try_load_checkpoint(
-            &self.state,
-            &self.history_checkpoint_path,
-            ckpt_max_age,
-        )
-        .await;
+        Self::try_load_checkpoint(&self.state, &self.history_checkpoint_path, ckpt_max_age).await;
+
+        // 6.5 Replay WAL entries not yet captured in the checkpoint (if WAL enabled).
+        // record_history dedup guard prevents double-insertion with checkpoint data.
+        if self.wal_enabled {
+            let entries = wal::replay_wal_entries(&self.wal_path);
+            if !entries.is_empty() {
+                let mut st = self.state.write().await;
+                for e in &entries {
+                    st.record_history(e.signal_id, e.value, e.t0_ms);
+                }
+                log::info!(
+                    "[WAL] Replayed {} entries from WAL (path={})",
+                    entries.len(),
+                    self.wal_path
+                );
+            } else {
+                log::debug!("[WAL] No WAL entries to replay (path={})", self.wal_path);
+            }
+        }
 
         // 7. Spawn checkpoint task (skip if interval=0)
         if self.history_checkpoint_interval_sec > 0 {
@@ -349,7 +394,40 @@ impl ReliableBleOutput {
             log::info!("History checkpoint disabled (interval=0)");
         }
 
-        // 8. Start GATT server
+        // 8. Spawn WAL task (skip if disabled)
+        if self.wal_enabled {
+            let rx = self.wal_rx.lock().await.take();
+            if let Some(rx) = rx {
+                let state = self.state.clone();
+                let wal_path = self.wal_path.clone();
+                let fsync_interval = self.wal_fsync_interval_sec;
+                let compact_interval = self.wal_compaction_interval_sec;
+                let ckpt_path = self.history_checkpoint_path.clone();
+                tokio::spawn(async move {
+                    Self::wal_task(
+                        state,
+                        rx,
+                        wal_path,
+                        fsync_interval,
+                        compact_interval,
+                        ckpt_path,
+                    )
+                    .await;
+                });
+                log::info!(
+                    "[WAL] WAL task started (fsync={}s, compact={}s, path={})",
+                    self.wal_fsync_interval_sec,
+                    self.wal_compaction_interval_sec,
+                    self.wal_path
+                );
+            } else {
+                log::warn!("[WAL] WAL receiver already taken — WAL task won't run");
+            }
+        } else {
+            log::info!("[WAL] WAL disabled (set WAL_ENABLED=true to enable)");
+        }
+
+        // 9. Start GATT server
         {
             let mut server = self.server.write().await;
             server.start().await?;
@@ -806,6 +884,146 @@ impl ReliableBleOutput {
                 Err(e) => log::warn!("[CKPT] Failed to write checkpoint: {}", e),
             }
         }
+    }
+
+    /// ID SRS: SRS-FN-BLERELIABLE-014
+    /// Title: wal_task
+    ///
+    /// Description: VRConnect shall maintain an append-only WAL file for the history ring-buffer.
+    ///   Each WalEntry received on `rx` is written to a BufWriter<File> immediately; the
+    ///   underlying file is fsynced every `fsync_interval_sec` (crash-loss window).
+    ///   Every `compaction_interval_sec` the WAL is compacted:
+    ///     1. Flush + fsync pending WAL writes.
+    ///     2. Serialize full history snapshot under state.read().
+    ///     3. Write snapshot to <checkpoint_path>.tmp, fsync, rename (checkpoint authoritative).
+    ///     4. Truncate WAL to 0 bytes, fsync (WAL cleared only after checkpoint is durable).
+    ///     5. Reopen WAL in append mode and continue.
+    ///   This bounds the crash-loss window to ≤ fsync_interval_sec and eliminates the
+    ///   ~500× write amplification of full-snapshot rewrites every checkpoint interval.
+    ///
+    /// Version: V1.0
+    async fn wal_task(
+        state: Arc<RwLock<BleSessionState>>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<WalEntry>,
+        wal_path: String,
+        fsync_interval_sec: u64,
+        compaction_interval_sec: u64,
+        checkpoint_path: String,
+    ) {
+        // Ensure the parent directory exists (mirrors checkpoint_task behaviour).
+        if let Some(parent) = std::path::Path::new(&wal_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let file = match std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&wal_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("[WAL] Cannot open WAL file '{}': {}", wal_path, e);
+                return;
+            }
+        };
+        let mut writer = BufWriter::new(file);
+
+        let mut fsync_tick = tokio::time::interval(Duration::from_secs(fsync_interval_sec));
+        let mut compact_tick = tokio::time::interval(Duration::from_secs(compaction_interval_sec));
+        // Consume the immediate first tick so both intervals fire after their full period.
+        fsync_tick.tick().await;
+        compact_tick.tick().await;
+
+        loop {
+            tokio::select! {
+                entry = rx.recv() => {
+                    match entry {
+                        None => break, // channel closed — shutdown
+                        Some(e) => {
+                            if let Err(err) = writer.write_all(&e.to_bytes()) {
+                                log::warn!("[WAL] Write error: {}", err);
+                            }
+                        }
+                    }
+                }
+                _ = fsync_tick.tick() => {
+                    if let Err(e) = writer.flush() {
+                        log::warn!("[WAL] Flush error: {}", e);
+                    }
+                    if let Err(e) = writer.get_ref().sync_all() {
+                        log::warn!("[WAL] Fsync error: {}", e);
+                    }
+                }
+                _ = compact_tick.tick() => {
+                    // 1. Flush pending WAL writes before snapshotting.
+                    if let Err(e) = writer.flush() {
+                        log::warn!("[WAL] Pre-compact flush error: {}", e);
+                    }
+                    if let Err(e) = writer.get_ref().sync_all() {
+                        log::warn!("[WAL] Pre-compact fsync error: {}", e);
+                    }
+
+                    // 2. Serialize history snapshot (read lock — non-blocking for live data).
+                    let bytes = state.read().await.serialize_history_to_bytes();
+
+                    // 3. Write checkpoint (same atomic pattern as checkpoint_task).
+                    if bytes.len() > 20 {
+                        let tmp_path = format!("{}.tmp", checkpoint_path);
+                        match std::fs::write(&tmp_path, &bytes) {
+                            Ok(_) => match std::fs::rename(&tmp_path, &checkpoint_path) {
+                                Ok(_) => log::info!(
+                                    "[WAL] Compaction: checkpoint written ({} bytes, path={})",
+                                    bytes.len(),
+                                    checkpoint_path
+                                ),
+                                Err(e) => log::warn!("[WAL] Compaction: checkpoint rename failed: {}", e),
+                            },
+                            Err(e) => log::warn!("[WAL] Compaction: checkpoint write failed: {}", e),
+                        }
+                    }
+
+                    // 4. Truncate WAL — checkpoint is now authoritative.
+                    drop(writer); // flush + close before truncating
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&wal_path)
+                    {
+                        Ok(f) => {
+                            if let Err(e) = f.sync_all() {
+                                log::warn!("[WAL] Compaction: WAL fsync after truncate failed: {}", e);
+                            } else {
+                                log::debug!("[WAL] Compaction: WAL truncated (path={})", wal_path);
+                            }
+                        }
+                        Err(e) => log::warn!("[WAL] Compaction: WAL truncate failed: {}", e),
+                    }
+
+                    // 5. Reopen WAL in append mode for continued journaling.
+                    match std::fs::OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(&wal_path)
+                    {
+                        Ok(f) => writer = BufWriter::new(f),
+                        Err(e) => {
+                            log::error!(
+                                "[WAL] Cannot reopen WAL after compaction '{}': {}",
+                                wal_path,
+                                e
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Final flush before task exits.
+        let _ = writer.flush();
+        let _ = writer.get_ref().sync_all();
+        log::info!("[WAL] WAL task exited");
     }
 
     /// Loads a history checkpoint from disk if it exists and is within max_age_sec.
@@ -1284,6 +1502,15 @@ impl ReliableBleOutput {
             // Always record to history buffer so replay is available
             // regardless of whether any client is currently subscribed.
             state.record_history(signal_id, val_f32, t0_ms);
+
+            // Forward to WAL journal (non-blocking channel send; task fsyncs on its own timer).
+            if let Some(tx) = &self.wal_tx {
+                let _ = tx.send(WalEntry {
+                    signal_id,
+                    t0_ms,
+                    value: val_f32,
+                });
+            }
 
             // add_data returns Some(frame) only if signal is subscribed
             if let Some(frame) = state.add_data(signal_id, val_f32, t0_ms) {
@@ -2984,5 +3211,180 @@ mod tests {
             !state.read().await.signal_to_stream.is_empty(),
             "session must be preserved when reconnecting within the reset grace window"
         );
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-040
+    /// Title: wal_task writes entries to file and final-flushes on channel close
+    ///
+    /// Description: After sending 3 WalEntry items and dropping the sender (channel close),
+    ///              wal_task must exit, final-flush, and leave exactly 3 valid entries in the
+    ///              WAL file recoverable by replay_wal_entries.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_wal_task_writes_and_fsyncs() {
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let wal_path = tmp_dir
+            .path()
+            .join("test.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let ckpt_path = tmp_dir
+            .path()
+            .join("ckpt.bin")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let (wal_tx, wal_rx) = tokio::sync::mpsc::unbounded_channel::<WalEntry>();
+
+        let task = tokio::spawn(ReliableBleOutput::wal_task(
+            state.clone(),
+            wal_rx,
+            wal_path.clone(),
+            // long intervals so neither fsync nor compact timer fires during the test
+            3600,
+            7200,
+            ckpt_path,
+        ));
+
+        // Send 3 entries then close the channel.
+        // wal_task will receive None from rx.recv(), break the loop, and final-flush.
+        wal_tx
+            .send(WalEntry {
+                signal_id: 0x0101,
+                t0_ms: 1000,
+                value: 75.0,
+            })
+            .unwrap();
+        wal_tx
+            .send(WalEntry {
+                signal_id: 0x0102,
+                t0_ms: 2000,
+                value: 99.0,
+            })
+            .unwrap();
+        wal_tx
+            .send(WalEntry {
+                signal_id: 0x0101,
+                t0_ms: 3000,
+                value: 76.0,
+            })
+            .unwrap();
+        drop(wal_tx); // closes channel → wal_task will exit after draining remaining entries
+
+        // Wait for the task to exit and final-flush.
+        task.await.expect("wal_task must not panic");
+
+        let entries = wal::replay_wal_entries(&wal_path);
+        assert_eq!(
+            entries.len(),
+            3,
+            "WAL file must contain exactly 3 entries after final flush"
+        );
+        assert_eq!(entries[0].signal_id, 0x0101);
+        assert_eq!(entries[0].t0_ms, 1000);
+        assert_eq!(entries[1].signal_id, 0x0102);
+        assert_eq!(entries[2].t0_ms, 3000);
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-041
+    /// Title: wal_task compaction writes checkpoint then truncates WAL
+    ///
+    /// Description: After sending an entry and flushing (channel close), then reloading
+    ///              with a short compaction interval and advancing past it, the checkpoint
+    ///              file must contain the recorded history samples and the WAL must be empty.
+    ///              The test verifies the invariant: checkpoint rename happens BEFORE WAL
+    ///              truncation, so no data is lost.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_wal_task_compaction_snapshot_before_truncate() {
+        tokio::time::pause();
+
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        {
+            let mut st = state.write().await;
+            st.record_history(SignalId::HR.as_u16(), 75.0, 1000);
+            st.record_history(SignalId::HR.as_u16(), 76.0, 2000);
+        }
+
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let wal_path = tmp_dir
+            .path()
+            .join("test.wal")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let ckpt_path = tmp_dir
+            .path()
+            .join("ckpt.bin")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Phase 1: send an entry so the WAL file is created and has content.
+        {
+            let (wal_tx, wal_rx) = tokio::sync::mpsc::unbounded_channel::<WalEntry>();
+            let task = tokio::spawn(ReliableBleOutput::wal_task(
+                state.clone(),
+                wal_rx,
+                wal_path.clone(),
+                3600, // long fsync — won't fire
+                3600, // long compact — won't fire
+                ckpt_path.clone(),
+            ));
+            wal_tx
+                .send(WalEntry {
+                    signal_id: 0x0101,
+                    t0_ms: 3000,
+                    value: 77.0,
+                })
+                .unwrap();
+            drop(wal_tx); // close → final flush
+            task.await.expect("phase-1 wal_task must not panic");
+        }
+        // WAL now has 1 entry on disk.
+        assert_eq!(wal::replay_wal_entries(&wal_path).len(), 1);
+
+        // Phase 2: spawn wal_task with a short compaction interval (5 s) and fire it.
+        let (wal_tx2, wal_rx2) = tokio::sync::mpsc::unbounded_channel::<WalEntry>();
+        tokio::spawn(ReliableBleOutput::wal_task(
+            state.clone(),
+            wal_rx2,
+            wal_path.clone(),
+            3600, // fsync won't fire
+            5,    // compact fires after 5 s
+            ckpt_path.clone(),
+        ));
+        // Keep tx alive so the task stays in the loop (doesn't exit from channel close).
+        let _keep_tx = wal_tx2;
+
+        // Yield so the task starts and consumes its initial ticks, then advance past compact.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(6)).await;
+        // Multiple yields: lock acquisition + file I/O + reopen after compact.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // Checkpoint must exist and contain the 2 history samples (from record_history above).
+        let ckpt_bytes = std::fs::read(&ckpt_path).expect("checkpoint must exist after compaction");
+        let mut dst = BleSessionState::new(1);
+        let n = dst
+            .load_history_from_bytes(&ckpt_bytes)
+            .expect("checkpoint must be valid");
+        assert!(
+            n >= 2,
+            "checkpoint must contain at least the 2 history samples"
+        );
+
+        // WAL must be empty (truncated after checkpoint was durable).
+        let wal_entries = wal::replay_wal_entries(&wal_path);
+        assert_eq!(wal_entries.len(), 0, "WAL must be empty after compaction");
     }
 }

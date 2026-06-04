@@ -50,8 +50,7 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Config, String> {
             .unwrap_or_else(|_| "VitalConnect".to_string()),
         output_ble_service_uuid: std::env::var("OUTPUT_BLE_SERVICE_UUID")
             .unwrap_or_else(|_| "12345678-1234-5678-1234-567812345678".to_string()),
-        output_ble_values: std::env::var("BLE_VALUES")
-            .unwrap_or_else(|_| "".to_string()),
+        output_ble_values: std::env::var("BLE_VALUES").unwrap_or_else(|_| "".to_string()),
         output_ble_empty_value: std::env::var("BLE_EMPTY_VALUE")
             .unwrap_or_else(|_| "null".to_string()),
         output_ble_update_interval_ms: std::env::var("BLE_UPDATE_INTERVAL_MS")
@@ -104,6 +103,19 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Config, String> {
             .unwrap_or_else(|_| "21600".to_string())
             .parse()
             .unwrap_or(21600),
+        wal_enabled: std::env::var("WAL_ENABLED")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse()
+            .unwrap_or(false),
+        wal_path: std::env::var("WAL_PATH").unwrap_or_else(|_| "logs/history.wal".to_string()),
+        wal_fsync_interval_sec: std::env::var("WAL_FSYNC_INTERVAL_SEC")
+            .unwrap_or_else(|_| "2".to_string())
+            .parse()
+            .unwrap_or(2),
+        wal_compaction_interval_sec: std::env::var("WAL_COMPACTION_INTERVAL_SEC")
+            .unwrap_or_else(|_| "3600".to_string())
+            .parse()
+            .unwrap_or(3600),
         debug_enabled: std::env::var("DEBUG_ENABLED")
             .unwrap_or_else(|_| "false".to_string())
             .parse()
@@ -148,6 +160,10 @@ mod tests {
             "HISTORY_CHECKPOINT_MAX_AGE_SEC",
             "HISTORY_CHECKPOINT_PATH",
             "HISTORY_RETENTION_SEC",
+            "WAL_ENABLED",
+            "WAL_PATH",
+            "WAL_FSYNC_INTERVAL_SEC",
+            "WAL_COMPACTION_INTERVAL_SEC",
             "DEBUG_ENABLED",
             "DEBUG_OUTPUT_PATH",
             "LOG_LEVEL",
@@ -307,7 +323,7 @@ mod tests {
             temp_file,
             "OUTPUT_BLE_SERVICE_UUID=12345678-1234-5678-1234-567812345678"
         )
-            .unwrap();
+        .unwrap();
         writeln!(temp_file, "BLE_VALUES=HR,SPO2,NIBP_SYS").unwrap();
         writeln!(temp_file, "BLE_EMPTY_VALUE=N/A").unwrap();
         writeln!(temp_file, "BLE_UPDATE_INTERVAL_MS=150").unwrap();
