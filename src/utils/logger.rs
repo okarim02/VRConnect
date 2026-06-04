@@ -203,6 +203,7 @@ mod tests {
             health_ble_flow_timeout_sec: 60,
             health_file: "logs/health.json".to_string(),
             ble_grace_period_sec: 10,
+            ble_supervision_timeout_sec: 30,
             history_checkpoint_interval_sec: 30,
             history_checkpoint_max_age_sec: 21600,
             history_checkpoint_path: "logs/history_checkpoint.bin".to_string(),

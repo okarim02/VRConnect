@@ -60,6 +60,10 @@ pub struct ReliableBleOutput {
     /// If Flutter reconnects within this window, session state is preserved.
     /// 0 = immediate reset (legacy behaviour).
     ble_grace_period_sec: u64,
+    /// Supervision timeout in seconds — if tx_buffer has pending frames and no ACK arrives
+    /// within this window, GATE treats it as a brutal link-layer disconnect and resets the
+    /// session. 0 = disabled (not recommended in production).
+    ble_supervision_timeout_sec: u64,
     /// Interval in seconds between periodic history checkpoints. 0 = disabled.
     history_checkpoint_interval_sec: u64,
     /// Maximum age in seconds of a checkpoint file to be loaded at startup.
@@ -108,6 +112,7 @@ impl ReliableBleOutput {
         health_ble_flow_timeout_sec: u64,
         health_file: String,
         ble_grace_period_sec: u64,
+        ble_supervision_timeout_sec: u64,
         history_checkpoint_interval_sec: u64,
         history_checkpoint_max_age_sec: u64,
         history_checkpoint_path: String,
@@ -204,6 +209,7 @@ impl ReliableBleOutput {
             health_check_interval_sec,
             health_file,
             ble_grace_period_sec,
+            ble_supervision_timeout_sec,
             history_checkpoint_interval_sec,
             history_checkpoint_max_age_sec,
             history_checkpoint_path,
@@ -272,6 +278,10 @@ impl ReliableBleOutput {
             server.set_read_value("Catalog", catalog_bytes);
         }
 
+        // Shared last-ACK timestamp: write_handler_loop updates it on every ACK received;
+        // supervision_task reads it to detect a frozen ACK channel (brutal link-layer drop).
+        let last_ack_time = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+
         // 2. Spawn write-handler task
         let write_rx = {
             let mut server = self.server.write().await;
@@ -283,9 +293,18 @@ impl ReliableBleOutput {
             let registry = self.registry.clone();
             let health_state = self.health_state.clone();
             let health_notify = self.health_notify.clone();
+            let last_ack_time_wh = last_ack_time.clone();
             tokio::spawn(async move {
-                Self::write_handler_loop(rx, state, server, registry, health_state, health_notify)
-                    .await;
+                Self::write_handler_loop(
+                    rx,
+                    state,
+                    server,
+                    registry,
+                    health_state,
+                    health_notify,
+                    last_ack_time_wh,
+                )
+                .await;
             });
             log::info!("Write handler task started (Data_IN / Subscribe / Unsubscribe)");
         } else {
@@ -331,6 +350,26 @@ impl ReliableBleOutput {
             } else {
                 log::warn!("Disconnect receiver already taken — disconnect detection won't work");
             }
+        }
+
+        // 4.5 Spawn supervision task — detects brutal link-layer disconnects (Central goes
+        // out of range without a CCCD update; SubscribedClientsChanged never fires).
+        if self.ble_supervision_timeout_sec > 0 {
+            let state = self.state.clone();
+            let health_state = self.health_state.clone();
+            let health_notify = self.health_notify.clone();
+            let last_ack_time_sv = last_ack_time.clone();
+            let timeout = self.ble_supervision_timeout_sec;
+            tokio::spawn(async move {
+                Self::supervision_task(state, health_state, health_notify, last_ack_time_sv, timeout)
+                    .await;
+            });
+            log::info!(
+                "Supervision task started (timeout={}s, check=5s)",
+                self.ble_supervision_timeout_sec
+            );
+        } else {
+            log::info!("Supervision task disabled (ble_supervision_timeout_sec=0)");
         }
 
         // 5. Spawn health task (was step 4 before disconnect handler was added)
@@ -445,6 +484,7 @@ impl ReliableBleOutput {
         registry: Arc<SignalRegistry>,
         health_state: Arc<RwLock<GateHealthState>>,
         health_notify: Arc<Notify>,
+        last_ack_time: Arc<tokio::sync::Mutex<tokio::time::Instant>>,
     ) {
         log::info!("Write handler loop running (IDT dispatcher)");
 
@@ -490,6 +530,7 @@ impl ReliableBleOutput {
                                     }
                                 }
                             }
+                            *last_ack_time.lock().await = tokio::time::Instant::now();
                         }
                         Some(InboundFrame::Nack(nack)) => {
                             log::info!(
@@ -557,6 +598,7 @@ impl ReliableBleOutput {
                                         }
                                     }
                                 }
+                                *last_ack_time.lock().await = tokio::time::Instant::now();
                             } else if let Some(ack) = AckFrame::from_flutter_bytes(data) {
                                 log::debug!(
                                     "Flutter ACK: stream={}, ack_upto={}, bitmap={:02X?}",
@@ -591,6 +633,7 @@ impl ReliableBleOutput {
                                         }
                                     }
                                 }
+                                *last_ack_time.lock().await = tokio::time::Instant::now();
                             } else {
                                 log::warn!(
                                     "Data_IN: unrecognized payload ({} bytes, byte[0]=0x{:02X}) — discarded",
@@ -855,6 +898,53 @@ impl ReliableBleOutput {
             }
         }
         log::info!("[BLE] Disconnect handler loop ended");
+    }
+
+    /// ID SRS: SRS-FN-BLERELIABLE-015
+    /// Title: supervision_task
+    ///
+    /// Description: VRConnect shall detect brutal link-layer disconnections that bypass the CCCD
+    ///   SubscribedClientsChanged event (Central goes out of range without a graceful BLE
+    ///   disconnect). Every CHECK_INTERVAL_SEC: if tx_buffer holds pending frames AND no ACK
+    ///   has been received for supervision_timeout_sec, GATE resets the session via
+    ///   do_session_reset() — the same path as grace-period expiry.
+    ///   last_ack_time is reset immediately after each trigger so the timer re-arms cleanly.
+    ///
+    ///   Why tx_buffer check is safe: record_history() and the WAL journal are called in
+    ///   output() BEFORE add_data(), so every sample is already durable when frames enter
+    ///   tx_buffer. A supervision-triggered reset does NOT lose data — it ensures the Central
+    ///   can recover all missed samples via BACKLOG_THEN_LIVE on reconnect.
+    ///
+    /// Version: V1.0
+    async fn supervision_task(
+        state: Arc<RwLock<BleSessionState>>,
+        health_state: Arc<RwLock<GateHealthState>>,
+        health_notify: Arc<Notify>,
+        last_ack_time: Arc<tokio::sync::Mutex<tokio::time::Instant>>,
+        supervision_timeout_sec: u64,
+    ) {
+        const CHECK_INTERVAL_SEC: u64 = 5;
+        let mut tick = tokio::time::interval(Duration::from_secs(CHECK_INTERVAL_SEC));
+        tick.tick().await; // skip the immediate first tick
+
+        loop {
+            tick.tick().await;
+            let pending = state.read().await.total_pending();
+            if pending == 0 {
+                continue;
+            }
+            let elapsed = last_ack_time.lock().await.elapsed().as_secs();
+            if elapsed >= supervision_timeout_sec {
+                log::warn!(
+                    "[BLE] Supervision timeout: {} frame(s) pending, no ACK for {}s \
+                     — brutal disconnect assumed, resetting session",
+                    pending,
+                    elapsed
+                );
+                Self::do_session_reset(&state, &health_state, &health_notify).await;
+                *last_ack_time.lock().await = tokio::time::Instant::now();
+            }
+        }
     }
 
     /// ID SRS: SRS-FN-BLERELIABLE-013
@@ -2620,6 +2710,7 @@ mod tests {
         let health_state = Arc::new(RwLock::new(GateHealthState::default()));
         let health_notify = Arc::new(Notify::new());
         let health_notify_check = health_notify.clone();
+        let last_ack_time = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
 
         tokio::spawn(async move {
             ReliableBleOutput::write_handler_loop(
@@ -2629,6 +2720,7 @@ mod tests {
                 registry,
                 health_state,
                 health_notify,
+                last_ack_time,
             )
             .await;
         });
@@ -2670,6 +2762,7 @@ mod tests {
             let health_state = Arc::new(RwLock::new(GateHealthState::default()));
             let health_notify = Arc::new(Notify::new());
             let health_notify_check = health_notify.clone();
+            let last_ack_time = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
 
             tokio::spawn(async move {
                 ReliableBleOutput::write_handler_loop(
@@ -2679,6 +2772,7 @@ mod tests {
                     registry,
                     health_state,
                     health_notify,
+                    last_ack_time,
                 )
                 .await;
             });
@@ -3386,5 +3480,64 @@ mod tests {
         // WAL must be empty (truncated after checkpoint was durable).
         let wal_entries = wal::replay_wal_entries(&wal_path);
         assert_eq!(wal_entries.len(), 0, "WAL must be empty after compaction");
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-042
+    /// Title: supervision_task resets session after brutal link-layer disconnect
+    ///
+    /// Description: With pending frames in tx_buffer and no ACK arriving (simulating a
+    ///   Central that went out of range without CCCD update), supervision_task must reset
+    ///   the session (total_pending → 0) once supervision_timeout_sec has elapsed.
+    ///   Data durability is unaffected: record_history() runs before add_data() in output(),
+    ///   so all samples are already in history before they enter tx_buffer.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_supervision_task_resets_on_timeout() {
+        tokio::time::pause();
+
+        use crate::domain::ble_protocol::SignalId;
+
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        let health_state = Arc::new(RwLock::new(GateHealthState::default()));
+        let health_notify = Arc::new(Notify::new());
+        let last_ack_time = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+
+        // Subscribe and queue 2 frames into tx_buffer (no ACK will arrive).
+        {
+            let mut st = state.write().await;
+            st.subscribe(SignalId::HR.as_u16());
+            st.add_data(SignalId::HR.as_u16(), 72.0, 1_000_000);
+            st.add_data(SignalId::HR.as_u16(), 73.0, 2_000_000);
+        }
+        assert_eq!(state.read().await.total_pending(), 2, "pre: 2 frames pending");
+
+        // Spawn supervision task with a 10 s timeout.
+        let state2 = state.clone();
+        let hs = health_state.clone();
+        let hn = health_notify.clone();
+        let lat = last_ack_time.clone();
+        tokio::spawn(async move {
+            ReliableBleOutput::supervision_task(state2, hs, hn, lat, 10).await;
+        });
+
+        // Yield to let the task start and consume its initial skip-tick.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // Advance past CHECK_INTERVAL (5 s) + supervision_timeout (10 s).
+        tokio::time::advance(Duration::from_secs(16)).await;
+
+        // Multiple yields: task wakes on tick, acquires locks, resets session.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            state.read().await.total_pending(),
+            0,
+            "supervision must reset session and clear tx_buffer"
+        );
     }
 }

@@ -114,6 +114,14 @@ pub struct Config {
     #[arg(long, default_value = "10")]
     pub ble_grace_period_sec: u64,
 
+    /// Supervision timeout in seconds — if tx_buffer has pending frames and no ACK is received
+    /// within this window, GATE assumes a brutal link-layer drop (Central out of range without
+    /// CCCD update) and resets the session. Must be > ble_grace_period_sec to avoid false fires.
+    /// Set to 0 to disable (not recommended in production).
+    /// ID SRS: SRS-CFG-BLE-001
+    #[arg(long, default_value = "30")]
+    pub ble_supervision_timeout_sec: u64,
+
     // History Checkpoint Configuration
     /// Interval in seconds between periodic history ring-buffer checkpoints (0 = disabled).
     /// ID SRS: SRS-CFG-CHECKPOINT-001
@@ -393,6 +401,13 @@ impl Config {
                 }
             }
         }
+        if !has_arg("--ble-supervision-timeout-sec") {
+            if let Ok(val) = std::env::var("BLE_SUPERVISION_TIMEOUT_SEC") {
+                if let Ok(secs) = val.parse() {
+                    config.ble_supervision_timeout_sec = secs;
+                }
+            }
+        }
         if !has_arg("--history-checkpoint-interval-sec") {
             if let Ok(val) = std::env::var("HISTORY_CHECKPOINT_INTERVAL_SEC") {
                 if let Ok(secs) = val.parse() {
@@ -587,6 +602,7 @@ mod tests {
             health_ble_flow_timeout_sec: 60,
             health_file: "logs/health.json".to_string(),
             ble_grace_period_sec: 10,
+            ble_supervision_timeout_sec: 30,
             history_checkpoint_interval_sec: 30,
             history_checkpoint_max_age_sec: 21600,
             history_checkpoint_path: "logs/history_checkpoint.bin".to_string(),
