@@ -1288,16 +1288,24 @@ impl ReliableBleOutput {
             }
         }
 
-        // Send historical replay frames for BACKLOG_THEN_LIVE / BACKLOG_ONLY
-        for (canonical_id, stream_id, mode, start_time_ms) in replay_requests {
-            let replay_frames = {
+        // Send historical replay frames for BACKLOG_THEN_LIVE / BACKLOG_ONLY.
+        //
+        // Phase A — collect frames from every signal that needs replay.
+        // start_replay() reserves the seq block eagerly and pushes frames into tx_buffer (F4),
+        // so un-sent frames remain NACK-recoverable even if this loop exits early.
+        struct ReplayBatch {
+            canonical_id: u16,
+            stream_id: u16,
+            mode: u8,
+            frames: Vec<crate::domain::ble_protocol::DataFrame>,
+        }
+        let mut batches: Vec<ReplayBatch> = Vec::new();
+        for (canonical_id, stream_id, mode, start_time_ms) in &replay_requests {
+            let frames = {
                 let mut st = state.write().await;
-                st.start_replay(canonical_id, start_time_ms)
+                st.start_replay(*canonical_id, *start_time_ms)
             };
-            // start_replay() reserves the seq block eagerly (frames already carry their final
-            // seq) and keeps them in tx_buffer (F4). If this loop breaks early on a notify
-            // failure, the un-sent frames remain NACK-recoverable — no commit step needed.
-            if replay_frames.is_empty() {
+            if frames.is_empty() {
                 log::info!(
                     "Replay requested for signal 0x{:04X} (stream {}) but history is empty",
                     canonical_id,
@@ -1305,39 +1313,67 @@ impl ReliableBleOutput {
                 );
             } else {
                 log::info!(
-                    "Replaying {} historical frame(s) for signal 0x{:04X} (stream {}, mode={})",
-                    replay_frames.len(),
+                    "Collected {} frame(s) for signal 0x{:04X} (stream {}, mode={})",
+                    frames.len(),
                     canonical_id,
                     stream_id,
                     mode
                 );
-                let srv = server.read().await;
-                for frame in &replay_frames {
-                    let bytes = frame.to_ble_bytes();
-                    if let Err(e) = srv.notify("Data_OUT", &bytes).await {
-                        log::warn!(
-                            "Replay notify failed for signal 0x{:04X} seq {}: {}",
-                            canonical_id,
-                            frame.header.seq,
-                            e
-                        );
-                        // Stop replay on first notify failure (device likely disconnected)
-                        break;
-                    }
-                    // Rate-limit replay to ~50 frames/s (20 ms inter-frame gap).
-                    // Without this, a full 3600-frame backlog floods the BLE stack
-                    // (~367 KB burst) causing Android to drop the connection. [DEV-6]
-                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-                }
             }
-            {
-                let mut st = state.write().await;
-                st.finish_replay(stream_id);
-                if mode == 2 {
-                    st.unsubscribe(canonical_id);
+            batches.push(ReplayBatch {
+                canonical_id: *canonical_id,
+                stream_id: *stream_id,
+                mode: *mode,
+                frames,
+            });
+        }
+
+        // Phase B — merge frames from all signals and sort by t0_ms.
+        // Sorting by timestamp interleaves signals proportionally to their natural rate:
+        // a 1 Hz signal contributes ~1 frame/s of history, a 5-min NBP signal contributes
+        // ~0.003 frames/s — they receive BLE airtime in that same ratio without any
+        // explicit token-bucket configuration. [F8]
+        let mut merged: Vec<(u64, u16, Vec<u8>)> = batches
+            .iter()
+            .flat_map(|b| {
+                b.frames
+                    .iter()
+                    .map(move |f| (f.t0_ms, b.canonical_id, f.to_ble_bytes()))
+            })
+            .collect();
+        merged.sort_by_key(|(t0, _, _)| *t0);
+
+        // Phase C — send the interleaved stream with the same 20 ms pacing. [DEV-6]
+        // Rate-limiting to ~50 frames/s prevents bursting a full backlog (~367 KB for 6 h)
+        // which causes Android's BLE stack to drop the connection.
+        if !merged.is_empty() {
+            log::info!(
+                "Replaying {} frame(s) across {} signal(s), interleaved by timestamp",
+                merged.len(),
+                batches.iter().filter(|b| !b.frames.is_empty()).count()
+            );
+            let srv = server.read().await;
+            for (_, signal_id, bytes) in &merged {
+                if let Err(e) = srv.notify("Data_OUT", bytes).await {
+                    log::warn!("Replay notify failed for signal 0x{:04X}: {}", signal_id, e);
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            }
+        }
+
+        // Phase D — finish all replays in one pass, even if notify failed partway.
+        // Without this single-pass approach, a notify failure in signal A would leave
+        // signal B permanently stuck with is_replaying=true.
+        {
+            let mut st = state.write().await;
+            for batch in &batches {
+                st.finish_replay(batch.stream_id);
+                if batch.mode == 2 {
+                    st.unsubscribe(batch.canonical_id);
                     log::info!(
                         "BACKLOG_ONLY: unsubscribed signal 0x{:04X} after replay",
-                        canonical_id
+                        batch.canonical_id
                     );
                 }
             }
@@ -2710,6 +2746,71 @@ mod tests {
                 "live frame after finish_replay must NOT carry FLAG_BACKLOG"
             );
         }
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-043
+    /// Title: Replay interleaves frames from multiple signals sorted by timestamp
+    ///
+    /// Description: When two signals are replayed simultaneously, their frames must be
+    ///              merged and sorted by t0_ms so no single signal monopolises the BLE
+    ///              channel. HR frames at odd timestamps and SpO2 at even timestamps must
+    ///              emerge interleaved, and both streams must finish with is_replaying=false.
+    #[tokio::test]
+    async fn test_replay_interleaves_signals_by_timestamp() {
+        use crate::domain::ble_protocol::SignalId;
+
+        let mut st = BleSessionState::new(1);
+
+        // Seed HR at odd timestamps and SpO2 at even timestamps
+        st.record_history(SignalId::HR.as_u16(), 60.0, 1000);
+        st.record_history(SignalId::SpO2.as_u16(), 98.0, 2000);
+        st.record_history(SignalId::HR.as_u16(), 61.0, 3000);
+        st.record_history(SignalId::SpO2.as_u16(), 97.0, 4000);
+        st.record_history(SignalId::HR.as_u16(), 62.0, 5000);
+        st.record_history(SignalId::SpO2.as_u16(), 96.0, 6000);
+
+        st.subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+        st.subscribe_with_stream_id(SignalId::SpO2.as_u16(), 2);
+
+        let hr_frames = st.start_replay(SignalId::HR.as_u16(), 0);
+        let spo2_frames = st.start_replay(SignalId::SpO2.as_u16(), 0);
+
+        assert_eq!(hr_frames.len(), 3);
+        assert_eq!(spo2_frames.len(), 3);
+
+        // Reproduce the merge-and-sort from handle_subscribe_req (Phase B)
+        let mut merged: Vec<(u64, u16)> = hr_frames
+            .iter()
+            .map(|f| (f.t0_ms, SignalId::HR.as_u16()))
+            .chain(spo2_frames.iter().map(|f| (f.t0_ms, SignalId::SpO2.as_u16())))
+            .collect();
+        merged.sort_by_key(|(t0, _)| *t0);
+
+        // Frames must alternate HR/SpO2 in timestamp order
+        let expected: Vec<(u64, u16)> = vec![
+            (1000, SignalId::HR.as_u16()),
+            (2000, SignalId::SpO2.as_u16()),
+            (3000, SignalId::HR.as_u16()),
+            (4000, SignalId::SpO2.as_u16()),
+            (5000, SignalId::HR.as_u16()),
+            (6000, SignalId::SpO2.as_u16()),
+        ];
+        assert_eq!(merged, expected, "frames must be interleaved by t0_ms");
+
+        // Both streams must finish replaying (Phase D — single-pass finish)
+        let hr_stream = st.get_stream_id(SignalId::HR.as_u16()).unwrap();
+        let spo2_stream = st.get_stream_id(SignalId::SpO2.as_u16()).unwrap();
+        st.finish_replay(hr_stream);
+        st.finish_replay(spo2_stream);
+
+        assert!(
+            !st.streams[&hr_stream].is_replaying,
+            "HR must finish replaying"
+        );
+        assert!(
+            !st.streams[&spo2_stream].is_replaying,
+            "SpO2 must finish replaying"
+        );
     }
 
     // ── Control pull-request (health on demand) ───────────────────────────────
