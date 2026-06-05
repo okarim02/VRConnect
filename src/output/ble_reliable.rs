@@ -85,7 +85,15 @@ pub struct ReliableBleOutput {
     wal_tx: Option<tokio::sync::mpsc::UnboundedSender<WalEntry>>,
     /// Receiver half of the WAL channel, taken once by start() to spawn wal_task.
     wal_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<WalEntry>>>,
+    // One-shot retry queue: frames whose notify() failed in the previous output() call.
+    // Drained at the start of Phase 2 on the next call; frames that fail again are
+    // discarded (they stay in tx_buffer and are NACK-recoverable by Flutter).
+    // Capped at RETRY_QUEUE_CAP to bound memory; excess is dropped with a WARN.
+    retry_queue: tokio::sync::Mutex<Vec<(Vec<u8>, u16, u16, u32)>>,
 }
+
+// Maximum frames held for one-shot retry (optimistic fast-path; NACK covers persistent loss).
+const RETRY_QUEUE_CAP: usize = 16;
 
 /// Characteristic UUID suffixes (PDF spec)
 const CATALOG_UUID_SUFFIX: &str = "90ae";
@@ -220,7 +228,32 @@ impl ReliableBleOutput {
             wal_compaction_interval_sec,
             wal_tx,
             wal_rx: tokio::sync::Mutex::new(wal_rx),
+            retry_queue: tokio::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn retry_queue_len(&self) -> usize {
+        self.retry_queue.lock().await.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn history_len_for_test(&self, signal_id: u16) -> usize {
+        self.state
+            .read()
+            .await
+            .history
+            .get(&signal_id)
+            .map(|h| h.len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn subscribe_for_test(&self, signal_id: u16, stream_id: u16) {
+        self.state
+            .write()
+            .await
+            .subscribe_with_stream_id(signal_id, stream_id);
     }
 
     /// Build a characteristic UUID from base UUID (32 hex chars) and suffix (4 hex chars).
@@ -1667,22 +1700,54 @@ impl ReliableBleOutput {
 
         // Phase 2 — send notifies without holding the state lock.
         // maybe_network_jitter has an .await so it must run outside the lock.
-        if !frames_to_send.is_empty() {
+
+        // Drain frames that failed in the previous output() call for a one-shot retry.
+        // Sent before fresh frames so older data reaches the tablet first.
+        let to_retry: Vec<(Vec<u8>, u16, u16, u32)> =
+            self.retry_queue.lock().await.drain(..).collect();
+
+        if !to_retry.is_empty() || !frames_to_send.is_empty() {
             let server = self.server.read().await;
+
+            for (bytes, signal_id, _stream_id, seq) in to_retry {
+                if let Err(e) = server.notify("Data_OUT", &bytes).await {
+                    // Not re-queued: tx_buffer keeps the frame NACK-recoverable.
+                    log::warn!(
+                        "BLE retry also failed for signal 0x{:04X} seq={}: {} — NACK path will recover",
+                        signal_id, seq, e
+                    );
+                } else {
+                    log::debug!(
+                        "Data_OUT (retry ok): signal=0x{:04X}, seq={}",
+                        signal_id, seq
+                    );
+                }
+            }
+
             for (bytes, signal_id, stream_id, seq) in frames_to_send {
                 // --- CHAOS MONKEY: network-jitter (env-driven, has .await) ---
                 chaos::maybe_network_jitter("ble_reliable.rs").await;
                 // -------------------------------------------------------------
 
                 if let Err(e) = server.notify("Data_OUT", &bytes).await {
-                    log::warn!("BLE notify failed for signal 0x{:04X}: {}", signal_id, e);
+                    let mut q = self.retry_queue.lock().await;
+                    if q.len() < RETRY_QUEUE_CAP {
+                        log::warn!(
+                            "BLE notify failed for signal 0x{:04X}: {} — queued for one-shot retry",
+                            signal_id, e
+                        );
+                        q.push((bytes, signal_id, stream_id, seq));
+                    } else {
+                        log::warn!(
+                            "BLE notify failed for signal 0x{:04X} seq={}: {} — retry queue full \
+                             (cap={}), NACK path will recover",
+                            signal_id, seq, e, RETRY_QUEUE_CAP
+                        );
+                    }
                 } else {
                     log::debug!(
                         "Data_OUT: signal=0x{:04X}, stream={}, seq={}, {} bytes",
-                        signal_id,
-                        stream_id,
-                        seq,
-                        bytes.len()
+                        signal_id, stream_id, seq, bytes.len()
                     );
                 }
             }
@@ -3662,5 +3727,129 @@ mod tests {
             0,
             "supervision must reset session and clear tx_buffer"
         );
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-045
+    /// Title: E6 — failed notify is queued for one-shot retry, discarded on second failure
+    ///
+    /// Description: When server.notify() always fails (GattServer not started → local_chars
+    ///   empty → VitalError::Config), the first output() call must queue the failed frame in
+    ///   retry_queue. The second output() call (same data → fully deduped, no new frame) must
+    ///   drain and attempt the retry, discard on failure, and leave retry_queue empty.
+    ///   History must contain the sample regardless of notify outcomes.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_failed_notify_queued_then_drained_on_retry() {
+        use crate::domain::ble_protocol::SignalId;
+
+        // GattServer::new() does not call Windows APIs.
+        // add_characteristic() (called inside new()) only fills `chars`, not `local_chars`.
+        // `local_chars` is populated only by start(), which we never call here.
+        // Therefore server.notify() always returns Err("Unknown characteristic 'Data_OUT'").
+        let ble = ReliableBleOutput::new(
+            "Test".to_string(),
+            "12345678-1234-1234-1234-1234567890ab".to_string(),
+            0,                      // _update_interval_ms (unused)
+            None,                   // registry (uses default)
+            30,                     // health_check_interval_sec
+            60,                     // health_ble_flow_timeout_sec
+            "logs/health.json".to_string(),
+            5,                      // ble_grace_period_sec
+            30,                     // ble_supervision_timeout_sec
+            3600,                   // history_checkpoint_interval_sec
+            86400,                  // history_checkpoint_max_age_sec
+            "".to_string(),         // history_checkpoint_path (disabled)
+            21600,                  // history_retention_sec
+            false,                  // wal_enabled
+            "".to_string(),
+            30,
+            3600,
+        )
+        .await
+        .expect("minimal ReliableBleOutput must construct");
+
+        ble.subscribe_for_test(SignalId::HR.as_u16(), 1).await;
+
+        let data = ProcessedData::new(
+            "VR-TEST".to_string(),
+            vec![ProcessedRoom {
+                room_index: 0,
+                room_name: "BED_01".to_string(),
+                tracks: vec![create_test_track("HR", 75.0, 0i32, "BED_01")],
+            }],
+        );
+
+        // First output(): add_data returns Some(frame), notify fails → frame queued.
+        ble.output(&data).await.expect("output must not propagate notify errors");
+        assert_eq!(
+            ble.retry_queue_len().await,
+            1,
+            "first failed frame must be held in retry queue"
+        );
+        assert_eq!(
+            ble.history_len_for_test(SignalId::HR.as_u16()).await,
+            1,
+            "history must be populated regardless of notify outcome"
+        );
+
+        // Second output() with same data: record_history and add_data both dedup on t0_ms,
+        // so frames_to_send is empty. Only to_retry is drained → retry fails → discarded.
+        ble.output(&data).await.expect("output must not propagate retry errors");
+        assert_eq!(
+            ble.retry_queue_len().await,
+            0,
+            "retry queue must be drained and frame discarded after one-shot retry"
+        );
+        assert_eq!(
+            ble.history_len_for_test(SignalId::HR.as_u16()).await,
+            1,
+            "history count unchanged: second call was fully deduped"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-044
+    /// Title: N3 — WAL send failure does not affect history ring-buffer
+    ///
+    /// Description: When the WAL channel receiver is dropped (wal_task exited or session reset),
+    ///              send() on the closed channel must return Err gracefully (no panic), and
+    ///              record_history must still have populated the history ring-buffer.
+    ///              Mirrors the ordering in output(): record_history is called before the WAL
+    ///              send, so history is always durable even when the WAL path is unavailable.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_wal_closed_channel_does_not_affect_history() {
+        use crate::output::wal::WalEntry;
+
+        let mut state = BleSessionState::new(1);
+
+        // Drop the receiver immediately — simulates wal_task having exited.
+        let (wal_tx, wal_rx) = tokio::sync::mpsc::unbounded_channel::<WalEntry>();
+        drop(wal_rx);
+
+        // record_history is always called before the WAL send in output().
+        state.record_history(0x0101, 72.0, 1000);
+        state.record_history(0x0101, 73.0, 2000);
+
+        // WAL send on a closed channel must return Err, not panic.
+        let result = wal_tx.send(WalEntry {
+            signal_id: 0x0101,
+            t0_ms: 1000,
+            value: 72.0,
+        });
+        assert!(
+            result.is_err(),
+            "send on closed WAL channel must fail gracefully"
+        );
+
+        // History must contain both samples regardless of the WAL send failure.
+        let history = state
+            .history
+            .get(&0x0101)
+            .expect("HR history must be populated");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0], (1000, 72.0));
+        assert_eq!(history[1], (2000, 73.0));
     }
 }
