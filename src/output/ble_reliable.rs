@@ -1437,6 +1437,11 @@ impl ReliableBleOutput {
             0x0201 => 4,    // SBP
             0x0202 => 5,    // DBP
             0x0203 => 6,    // MBP
+            0x0301 => 8,    // ST_II
+            0x0302 => 9,    // ST_V
+            0x0303 => 10,   // ST_AVL
+            0x0401 => 11,   // SPV
+            0x0402 => 12,   // PPV
             0x0501 => 7,    // AmbPres
             other => other, // unknown signal — pass-through, will likely be dropped by Flutter
         }
@@ -1474,8 +1479,8 @@ impl ReliableBleOutput {
                     );
                 }
                 // Flutter v2 reads stream_id from SUBSCRIBE_RSP to build activeStreams.
-                // We use a fixed 1-7 mapping so stream IDs are stable and predictable:
-                //   0x0101→1, 0x0102→2, 0x0103→3, 0x0201→4, 0x0202→5, 0x0203→6, 0x0501→7
+                // We use a fixed mapping so stream IDs are stable and predictable:
+                //   0x0101→1, 0x0102→2, 0x0103→3, 0x0201→4..6, 0x0301→8..10, 0x0401→11..12, 0x0501→7
                 // RSP and DATA_FRAMEs both use this mapping — they must be consistent.
                 let flutter_sid = Self::flutter_stream_id(canonical_id);
                 let stream_id = st.subscribe_with_stream_id(canonical_id, flutter_sid);
@@ -1543,6 +1548,7 @@ impl ReliableBleOutput {
     /// - DBP:         "DBP", "NIBP_DBP"
     /// - MBP:         "MBP", "NIBP_MBP"
     /// - AmbPres:     "AMB_PRES", "AMBIENT_PRESSURE"
+    /// - ST_II / ST_V / ST_AVL / SPV / PPV: exact name match
     #[cfg(test)]
     fn extract_signal_values(data: &ProcessedData) -> Vec<(u16, f32)> {
         use std::collections::HashMap;
@@ -1562,6 +1568,11 @@ impl ReliableBleOutput {
             ("NIBP_DBP", SignalId::DBP.as_u16()),
             ("MBP", SignalId::MBP.as_u16()),
             ("NIBP_MBP", SignalId::MBP.as_u16()),
+            ("ST_II", SignalId::StII.as_u16()),
+            ("ST_V", SignalId::StV.as_u16()),
+            ("ST_AVL", SignalId::StAvl.as_u16()),
+            ("SPV", SignalId::Spv.as_u16()),
+            ("PPV", SignalId::Ppv.as_u16()),
             ("AMB_PRES", SignalId::AmbPres.as_u16()),
             ("AMBIENT_PRESSURE", SignalId::AmbPres.as_u16()),
         ]
@@ -1639,6 +1650,11 @@ impl ReliableBleOutput {
                     "SBP" | "NIBP_SBP" => SignalId::SBP.as_u16(),
                     "DBP" | "NIBP_DBP" => SignalId::DBP.as_u16(),
                     "MBP" | "NIBP_MBP" => SignalId::MBP.as_u16(),
+                    "ST_II" => SignalId::StII.as_u16(),
+                    "ST_V" => SignalId::StV.as_u16(),
+                    "ST_AVL" => SignalId::StAvl.as_u16(),
+                    "SPV" => SignalId::Spv.as_u16(),
+                    "PPV" => SignalId::Ppv.as_u16(),
                     "AMB_PRES" | "AMBIENT_PRESSURE" => SignalId::AmbPres.as_u16(),
                     _ => continue,
                 };
@@ -2432,7 +2448,6 @@ mod tests {
             tracks: vec![
                 create_test_track("ART1_SBP", 120.0, 0, "BED_01"),
                 create_test_track("ECG1", 0.5, 0, "BED_01"),
-                create_test_track("PPV", 10.0, 0, "BED_01"),
             ],
         };
         let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);

@@ -148,3 +148,13 @@ CLAUDE.local.md
 .agents
 docs
 .claude
+AGENTS.local.md
+scripts/deploy.ps1
+tools/ble_central_test.py
+tools/deploy.ps1
+tools/patch_prod_config_v2.ps1
+tools/sio_feeder.py
+tools/zero_loss_diff.py
+tools/__pycache__/ble_central_test.cpython-312.pyc
+tools/__pycache__/sio_feeder.cpython-312.pyc
+tools/__pycache__/zero_loss_diff.cpython-312.pyc

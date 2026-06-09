@@ -46,6 +46,7 @@ pub const UNIT_PCT: u8 = 2;
 pub const UNIT_MMHG: u8 = 3;
 pub const UNIT_DEGC: u8 = 4;
 pub const UNIT_HPA: u8 = 5;
+pub const UNIT_MM: u8 = 6;
 
 // subscribe op codes
 pub const SUB_OP_SUBSCRIBE: u8 = 1;
@@ -66,6 +67,11 @@ pub enum SignalId {
     SBP = 0x0201,
     DBP = 0x0202,
     MBP = 0x0203,
+    StII = 0x0301,
+    StV = 0x0302,
+    StAvl = 0x0303,
+    Spv = 0x0401,
+    Ppv = 0x0402,
     AmbPres = 0x0501,
 }
 
@@ -83,6 +89,11 @@ impl SignalId {
             0x0201 => Some(SignalId::SBP),
             0x0202 => Some(SignalId::DBP),
             0x0203 => Some(SignalId::MBP),
+            0x0301 => Some(SignalId::StII),
+            0x0302 => Some(SignalId::StV),
+            0x0303 => Some(SignalId::StAvl),
+            0x0401 => Some(SignalId::Spv),
+            0x0402 => Some(SignalId::Ppv),
             0x0501 => Some(SignalId::AmbPres),
             // Legacy simple IDs (spec "Proposition de protocole BLE.pdf" / older Central implementations)
             1 => Some(SignalId::HR),
@@ -101,6 +112,11 @@ impl SignalId {
             SignalId::SBP => "SBP",
             SignalId::DBP => "DBP",
             SignalId::MBP => "MBP",
+            SignalId::StII => "ST_II",
+            SignalId::StV => "ST_V",
+            SignalId::StAvl => "ST_AVL",
+            SignalId::Spv => "SPV",
+            SignalId::Ppv => "PPV",
             SignalId::AmbPres => "AMB_PRES",
         }
     }
@@ -120,6 +136,8 @@ impl SignalId {
             SignalId::SpO2 => UNIT_PCT,
             SignalId::Temperature => UNIT_DEGC,
             SignalId::SBP | SignalId::DBP | SignalId::MBP => UNIT_MMHG,
+            SignalId::StII | SignalId::StV | SignalId::StAvl => UNIT_MM,
+            SignalId::Spv | SignalId::Ppv => UNIT_PCT,
             SignalId::AmbPres => UNIT_HPA,
         }
     }
@@ -131,6 +149,8 @@ impl SignalId {
             SignalId::SpO2 => "%",
             SignalId::Temperature => "\u{00B0}C", // °C
             SignalId::SBP | SignalId::DBP | SignalId::MBP => "mmHg",
+            SignalId::StII | SignalId::StV | SignalId::StAvl => "mm",
+            SignalId::Spv | SignalId::Ppv => "%",
             SignalId::AmbPres => "hPa",
         }
     }
@@ -148,6 +168,9 @@ impl SignalId {
             SignalId::Temperature => 2000,
             // Discontinuous signals (NIBP cuff / ambient sensor)
             SignalId::SBP | SignalId::DBP | SignalId::MBP => 300_000,
+            // ST segments and pressure variability — spec 1.5 Hz
+            SignalId::StII | SignalId::StV | SignalId::StAvl => 667,
+            SignalId::Spv | SignalId::Ppv => 667,
             SignalId::AmbPres => 10_000,
         }
     }
@@ -989,6 +1012,11 @@ impl Catalog {
                 SignalId::SBP,
                 SignalId::DBP,
                 SignalId::MBP,
+                SignalId::StII,
+                SignalId::StV,
+                SignalId::StAvl,
+                SignalId::Spv,
+                SignalId::Ppv,
                 SignalId::AmbPres,
             ]
             .iter()
@@ -1126,8 +1154,7 @@ impl SignalRegistry {
         }
     }
 
-    /// Pre-register the seven V1 medical signals: HR (0x0101), SpO2 (0x0102),
-    /// Temperature (0x0103), SBP (0x0201), DBP (0x0202), MBP (0x0203), AmbPres (0x0501).
+    /// Pre-register all twelve medical signals.
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
         for sig in [
@@ -1137,6 +1164,11 @@ impl SignalRegistry {
             SignalId::SBP,
             SignalId::DBP,
             SignalId::MBP,
+            SignalId::StII,
+            SignalId::StV,
+            SignalId::StAvl,
+            SignalId::Spv,
+            SignalId::Ppv,
             SignalId::AmbPres,
         ] {
             r.register(SignalMeta {
@@ -1623,14 +1655,19 @@ mod tests {
     #[test]
     fn test_catalog_default_medical() {
         let catalog = Catalog::default_medical_catalog();
-        assert_eq!(catalog.entries.len(), 7);
-        assert_eq!(catalog.entries[0].signal_id, 0x0101);
-        assert_eq!(catalog.entries[1].signal_id, 0x0102);
-        assert_eq!(catalog.entries[2].signal_id, 0x0103);
-        assert_eq!(catalog.entries[3].signal_id, 0x0201);
-        assert_eq!(catalog.entries[4].signal_id, 0x0202);
-        assert_eq!(catalog.entries[5].signal_id, 0x0203);
-        assert_eq!(catalog.entries[6].signal_id, 0x0501);
+        assert_eq!(catalog.entries.len(), 12);
+        assert_eq!(catalog.entries[0].signal_id, 0x0101); // HR
+        assert_eq!(catalog.entries[1].signal_id, 0x0102); // SpO2
+        assert_eq!(catalog.entries[2].signal_id, 0x0103); // Temperature
+        assert_eq!(catalog.entries[3].signal_id, 0x0201); // SBP
+        assert_eq!(catalog.entries[4].signal_id, 0x0202); // DBP
+        assert_eq!(catalog.entries[5].signal_id, 0x0203); // MBP
+        assert_eq!(catalog.entries[6].signal_id, 0x0301); // ST_II
+        assert_eq!(catalog.entries[7].signal_id, 0x0302); // ST_V
+        assert_eq!(catalog.entries[8].signal_id, 0x0303); // ST_AVL
+        assert_eq!(catalog.entries[9].signal_id, 0x0401); // SPV
+        assert_eq!(catalog.entries[10].signal_id, 0x0402); // PPV
+        assert_eq!(catalog.entries[11].signal_id, 0x0501); // AmbPres
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-019
@@ -1956,8 +1993,13 @@ mod tests {
         assert!(r.get(0x0201).is_some(), "SBP must be registered");
         assert!(r.get(0x0202).is_some(), "DBP must be registered");
         assert!(r.get(0x0203).is_some(), "MBP must be registered");
+        assert!(r.get(0x0301).is_some(), "ST_II must be registered");
+        assert!(r.get(0x0302).is_some(), "ST_V must be registered");
+        assert!(r.get(0x0303).is_some(), "ST_AVL must be registered");
+        assert!(r.get(0x0401).is_some(), "SPV must be registered");
+        assert!(r.get(0x0402).is_some(), "PPV must be registered");
         assert!(r.get(0x0501).is_some(), "AmbPres must be registered");
-        assert_eq!(r.all_signal_ids().len(), 7);
+        assert_eq!(r.all_signal_ids().len(), 12);
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-046
@@ -1974,11 +2016,11 @@ mod tests {
             sample_kind: 0,
             nominal_period_ms: 1000,
         });
-        assert_eq!(r.all_signal_ids().len(), 8);
+        assert_eq!(r.all_signal_ids().len(), 13);
         assert!(r.get(0x0204).is_some());
         let catalog = r.build_catalog();
-        assert_eq!(catalog.entries.len(), 8);
-        // Sorted by signal_id: 0x0101, 0x0102, 0x0103, 0x0201, 0x0202, 0x0203, 0x0204, 0x0501
+        assert_eq!(catalog.entries.len(), 13);
+        // Sorted by signal_id: 0x0101..0x0103, 0x0201..0x0204, 0x0301..0x0303, 0x0401..0x0402, 0x0501
         assert_eq!(catalog.entries[6].signal_id, 0x0204);
     }
 
