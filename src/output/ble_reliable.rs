@@ -1915,9 +1915,10 @@ impl ReliableBleOutput {
                         );
                     } else {
                         log::debug!(
-                            "[health] Health payload sent ({} bytes, ok={})",
-                            bytes.len(),
-                            payload.ok
+                            "[health] Health payload sent ({} bytes, ok={} gate={} sio={} ble={} flow={} vr={} disk={} wd_vr={} wd_gate={})",
+                            bytes.len(), payload.ok, payload.gate, payload.sio,
+                            payload.ble, payload.flow, payload.vr, payload.disk,
+                            payload.wd_vr, payload.wd_gate
                         );
                     }
                 }
