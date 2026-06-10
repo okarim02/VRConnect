@@ -163,8 +163,11 @@ pub fn read_os_snapshot(path: &Path, stale_threshold_sec: u64) -> OsHealthSnapsh
         Ok(s)  => s,
         Err(_) => return OsHealthSnapshot::default(),
     };
+    // PS 5.1 Out-File / WriteAllText with Encoding::UTF8 prepends a UTF-8 BOM (EF BB BF).
+    // Strip it so serde_json can parse the file regardless of how it was written.
+    let content = content.trim_start_matches('\u{FEFF}');
 
-    let snapshot: OsHealthSnapshot = match serde_json::from_str(&content) {
+    let snapshot: OsHealthSnapshot = match serde_json::from_str(content) {
         Ok(s)  => s,
         Err(e) => {
             log::warn!("[health] Failed to parse {}: {}", path.display(), e);
