@@ -1277,12 +1277,27 @@ impl ReliableBleOutput {
                             stream_id,
                             item.mode
                         );
+                        // FORCE_BACKLOG_REPLAY=true overrides Flutter mode=0 (LIVE) → mode=1
+                        // (BACKLOG_THEN_LIVE) so historical replay triggers without a Flutter update.
+                        let force_replay = std::env::var("FORCE_BACKLOG_REPLAY")
+                            .ok()
+                            .and_then(|v| v.parse::<bool>().ok())
+                            .unwrap_or(false);
+                        let effective_mode = if force_replay && item.mode == 0 {
+                            log::info!(
+                                "[backlog] FORCE_BACKLOG_REPLAY active — overriding mode 0→1 for signal 0x{:04X}",
+                                canonical_id
+                            );
+                            1u8
+                        } else {
+                            item.mode
+                        };
                         // Queue replay if mode=1 (BACKLOG_THEN_LIVE) or mode=2 (BACKLOG_ONLY)
-                        if item.mode == 1 || item.mode == 2 {
+                        if effective_mode == 1 || effective_mode == 2 {
                             replay_requests.push((
                                 canonical_id,
                                 stream_id,
-                                item.mode,
+                                effective_mode,
                                 item.start_time_ms,
                             ));
                         }
