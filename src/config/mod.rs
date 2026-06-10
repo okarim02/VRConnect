@@ -237,8 +237,29 @@ impl Config {
         config.config_file = config_file_path.clone();
 
         // If config file was loaded, override with env vars where CLI didn't specify
-        if config_file_path.is_some() {
+        if let Some(ref cf) = config_file_path {
             config = Self::apply_env_overrides(config, &args);
+
+            // Resolve relative file paths against the project root (parent of the config/ dir)
+            // so that CWD at process startup does not affect file resolution.
+            let project_root = cf
+                .parent()                  // <root>/config/
+                .and_then(|p| p.parent())  // <root>/
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let resolve = |raw: &str| -> String {
+                if raw.starts_with('/') || PathBuf::from(raw).is_absolute() {
+                    raw.to_string()
+                } else {
+                    project_root.join(raw).to_string_lossy().into_owned()
+                }
+            };
+            config.health_file             = resolve(&config.health_file);
+            config.wal_path                = resolve(&config.wal_path);
+            config.history_checkpoint_path = resolve(&config.history_checkpoint_path);
+            config.debug_output_path       = resolve(&config.debug_output_path);
+            config.log_dir                 = resolve(&config.log_dir);
+            config.output_file_base_path   = resolve(&config.output_file_base_path);
         }
 
         // Validate
