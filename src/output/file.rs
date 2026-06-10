@@ -742,10 +742,48 @@ impl FileOutput {
             Ok(usage_percent)
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            // Fallback for non-Unix systems (Windows)
-            log::warn!("Disk usage checking not fully implemented on this platform");
+            use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+            use windows::core::PCWSTR;
+
+            // Resolve drive root from path (e.g. "C:\some\path" → "C:\")
+            let drive_root = {
+                let s = path.to_string_lossy();
+                if s.len() >= 2 && s.chars().nth(1) == Some(':') {
+                    format!("{}\\", &s[..2])
+                } else {
+                    "C:\\".to_string()
+                }
+            };
+            let wide: Vec<u16> = drive_root.encode_utf16().chain(std::iter::once(0)).collect();
+
+            let mut free_bytes_caller: u64 = 0;
+            let mut total_bytes:       u64 = 0;
+            let mut total_free_bytes:  u64 = 0;
+
+            unsafe {
+                GetDiskFreeSpaceExW(
+                    PCWSTR(wide.as_ptr()),
+                    Some(&mut free_bytes_caller),
+                    Some(&mut total_bytes),
+                    Some(&mut total_free_bytes),
+                )
+            }
+            .map_err(|e| VitalError::Processing(format!("GetDiskFreeSpaceExW: {e}")))?;
+
+            let usage_percent = if total_bytes > 0 {
+                let used = total_bytes.saturating_sub(total_free_bytes);
+                ((used as f64 / total_bytes as f64) * 100.0) as u8
+            } else {
+                0
+            };
+            Ok(usage_percent)
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            log::debug!("Disk usage checking not implemented on this platform");
             Ok(0)
         }
     }

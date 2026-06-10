@@ -167,7 +167,7 @@ pub fn read_os_snapshot(path: &Path, stale_threshold_sec: u64) -> OsHealthSnapsh
     let snapshot: OsHealthSnapshot = match serde_json::from_str(&content) {
         Ok(s)  => s,
         Err(e) => {
-            log::error!("[health] Failed to parse {}: {}", path.display(), e);
+            log::warn!("[health] Failed to parse {}: {}", path.display(), e);
             return OsHealthSnapshot::default();
         }
     };
