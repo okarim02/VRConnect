@@ -748,6 +748,17 @@ impl ReliableBleOutput {
                         drop(hs);
                         health_notify.notify_one();
                     }
+                    // Reset supervision timer on successful subscribe so Flutter has a full
+                    // supervision_timeout_sec window to send its first ACK.  Without this,
+                    // a stale last_ack_time (e.g. from VRConnect startup or the previous
+                    // session) causes the supervision task to fire within seconds of the
+                    // SUBSCRIBE_REQ, resetting the session mid-handshake and pushing Flutter
+                    // into a SUBSCRIBE_REQ retry loop (observed: 635s elapsed → immediate
+                    // fire → 14-minute loop with 30+ retries, session_id cycling 2→3).
+                    if ble_active {
+                        *last_ack_time.lock().await = tokio::time::Instant::now();
+                        log::debug!("[supervision] Timer reset after successful subscribe");
+                    }
                 }
 
                 // ── Unsubscribe: IDT SUBSCRIBE_REQ (op=2) or legacy 2-byte ───
