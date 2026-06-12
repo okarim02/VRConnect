@@ -482,6 +482,34 @@ impl Config {
             }
         }
 
+        // WAL
+        if !has_arg("--wal-enabled") {
+            if let Ok(val) = std::env::var("WAL_ENABLED") {
+                if let Ok(enabled) = val.parse() {
+                    config.wal_enabled = enabled;
+                }
+            }
+        }
+        if !has_arg("--wal-path") {
+            if let Ok(val) = std::env::var("WAL_PATH") {
+                config.wal_path = val;
+            }
+        }
+        if !has_arg("--wal-fsync-interval-sec") {
+            if let Ok(val) = std::env::var("WAL_FSYNC_INTERVAL_SEC") {
+                if let Ok(secs) = val.parse() {
+                    config.wal_fsync_interval_sec = secs;
+                }
+            }
+        }
+        if !has_arg("--wal-compaction-interval-sec") {
+            if let Ok(val) = std::env::var("WAL_COMPACTION_INTERVAL_SEC") {
+                if let Ok(secs) = val.parse() {
+                    config.wal_compaction_interval_sec = secs;
+                }
+            }
+        }
+
         config
     }
 
@@ -1191,5 +1219,35 @@ mod tests {
         std::env::remove_var("HISTORY_CHECKPOINT_INTERVAL_SEC");
         std::env::remove_var("HISTORY_CHECKPOINT_MAX_AGE_SEC");
         std::env::remove_var("HISTORY_CHECKPOINT_PATH");
+    }
+
+    /// ID SRS: SRS-TEST-CFG-WAL-001
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn test_wal_env_override() {
+        std::env::remove_var("WAL_ENABLED");
+        std::env::remove_var("WAL_PATH");
+        std::env::remove_var("WAL_FSYNC_INTERVAL_SEC");
+        std::env::remove_var("WAL_COMPACTION_INTERVAL_SEC");
+
+        std::env::set_var("WAL_ENABLED", "true");
+        std::env::set_var("WAL_PATH", "logs/custom.wal");
+        std::env::set_var("WAL_FSYNC_INTERVAL_SEC", "5");
+        std::env::set_var("WAL_COMPACTION_INTERVAL_SEC", "7200");
+
+        let args = vec!["vrconnect".to_string()];
+        let base = Config::parse_from(&args);
+        let config = Config::apply_env_overrides(base, &args);
+
+        assert!(config.wal_enabled);
+        assert_eq!(config.wal_path, "logs/custom.wal");
+        assert_eq!(config.wal_fsync_interval_sec, 5);
+        assert_eq!(config.wal_compaction_interval_sec, 7200);
+
+        std::env::remove_var("WAL_ENABLED");
+        std::env::remove_var("WAL_PATH");
+        std::env::remove_var("WAL_FSYNC_INTERVAL_SEC");
+        std::env::remove_var("WAL_COMPACTION_INTERVAL_SEC");
     }
 }
