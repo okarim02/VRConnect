@@ -32,7 +32,9 @@ pub struct SocketIOServer {
     cleaner: VitalDataCleaner,
     transformer: VitalDataTransformer,
     /// Optional health hooks — wired up by processor.rs when BLE is enabled.
-    /// sio_connected is set true on connect, false on disconnect; notify fires immediately.
+    /// sio_connected is set true after a successful WebSocket handshake (not on raw
+    /// TCP connect — port probes must not flip it), false on disconnect; notify fires
+    /// immediately.
     health_state: Option<Arc<RwLock<GateHealthState>>>,
     health_notify: Option<Arc<Notify>>,
 }
@@ -193,6 +195,18 @@ impl SocketIOServer {
         health_state: Option<Arc<RwLock<GateHealthState>>>,
         health_notify: Option<Arc<Notify>>,
     ) -> Result<()> {
+        // Handshake FIRST. Port probes and aborted connections (watchdog checks,
+        // client retry storms — os error 10053) open a TCP socket without ever
+        // speaking WebSocket; they must not flip sio_connected nor push health.
+        // Returning Ok keeps them out of the per-connection error log path.
+        let ws_stream = match accept_async(stream).await {
+            Ok(ws) => ws,
+            Err(e) => {
+                Self::log_handshake_failure_throttled(addr, &e);
+                return Ok(());
+            }
+        };
+
         log::info!("New Socket.IO v4 connection from {}", addr);
 
         // sio connected → immediate health push
@@ -200,10 +214,6 @@ impl SocketIOServer {
             hs.write().await.sio_connected = true;
             hn.notify_one();
         }
-
-        let ws_stream = accept_async(stream)
-            .await
-            .map_err(|e| VitalError::SocketIo(format!("WebSocket handshake failed: {}", e)))?;
 
         let (mut write, mut read) = ws_stream.split();
 
@@ -362,6 +372,52 @@ impl SocketIOServer {
 
         log::info!("Connection handler finished for {}", addr);
         Ok(())
+    }
+
+    /// ID SRS: SRS-FN-SOCKETIO-006
+    /// Title: log_handshake_failure_throttled
+    ///
+    /// Description: VRConnect shall rate-limit WebSocket handshake failure logs to one
+    ///              line per 5 s window, reporting the number of suppressed occurrences.
+    ///              Aborted pre-handshake connections (port probes, client retry storms —
+    ///              e.g. os error 10053) arrive in bursts of hundreds; logging each one at
+    ///              error level saturated the tokio runtime and starved the BLE grace
+    ///              timer (observed: 10 s grace firing after 2 min 22 s).
+    ///
+    /// Version: V1.0
+    fn log_handshake_failure_throttled(addr: SocketAddr, err: &dyn std::fmt::Display) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::OnceLock;
+
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+        static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+        const WINDOW_MS: u64 = 5_000;
+
+        let start = *START.get_or_init(std::time::Instant::now);
+        // +1 keeps 0 as the "never logged yet" sentinel.
+        let now_ms = start.elapsed().as_millis() as u64 + 1;
+        let last = LAST_LOG_MS.load(Ordering::Relaxed);
+        let due = last == 0 || now_ms.saturating_sub(last) >= WINDOW_MS;
+        if due
+            && LAST_LOG_MS
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let suppressed = SUPPRESSED.swap(0, Ordering::Relaxed);
+            if suppressed == 0 {
+                log::warn!("WebSocket handshake failed from {}: {}", addr, err);
+            } else {
+                log::warn!(
+                    "WebSocket handshake failed from {}: {} ({} similar failures suppressed in the last 5s)",
+                    addr,
+                    err,
+                    suppressed
+                );
+            }
+        } else {
+            SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// ID SRS: SRS-FN-SOCKETIO-004

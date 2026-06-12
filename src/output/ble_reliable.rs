@@ -365,14 +365,14 @@ impl ReliableBleOutput {
                 let state = self.state.clone();
                 let health_state = self.health_state.clone();
                 let health_notify = self.health_notify.clone();
-                let grace_period_sec = self.ble_grace_period_sec;
+                let grace_period = Duration::from_secs(self.ble_grace_period_sec);
                 tokio::spawn(async move {
                     Self::disconnect_handler_loop(
                         rx,
                         state,
                         health_state,
                         health_notify,
-                        grace_period_sec,
+                        grace_period,
                     )
                     .await;
                 });
@@ -850,29 +850,57 @@ impl ReliableBleOutput {
         }
     }
 
+    /// ID SRS: SRS-FN-BLERELIABLE-016
+    /// Title: spawn_grace_timer
+    ///
+    /// Description: VRConnect shall arm the grace-period timer on a dedicated OS thread
+    ///              instead of tokio::time::sleep. The tokio time driver is only polled
+    ///              when a worker thread parks; under runtime saturation (observed during
+    ///              Socket.IO handshake error bursts, os error 10053) a 10 s sleep fired
+    ///              after 2 min 22 s. An OS thread sleeping with std::thread::sleep and
+    ///              signalling through a oneshot channel wakes the handler task directly
+    ///              via the scheduler, independent of the time driver. If thread spawn
+    ///              fails, the sender is dropped and the receiver resolves immediately —
+    ///              failing safe towards an immediate session reset rather than a session
+    ///              that never resets.
+    ///
+    /// Version: V1.0
+    fn spawn_grace_timer(duration: Duration) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = std::thread::Builder::new()
+            .name("ble-grace-timer".into())
+            .spawn(move || {
+                std::thread::sleep(duration);
+                let _ = tx.send(());
+            });
+        rx
+    }
+
     /// ID SRS: SRS-FN-BLERELIABLE-012
     /// Title: disconnect_handler_loop
     ///
     /// Description: VRConnect shall implement a configurable grace period before resetting
     ///              BLE session state on Central disconnect (Data_OUT SubscribedClientsChanged
     ///              count → 0). When a Disconnected event arrives, the handler waits up to
-    ///              grace_period_sec seconds for a Connected event. If Flutter reconnects
+    ///              grace_period for a Connected event. If Flutter reconnects
     ///              within the grace window, session state is preserved and ble_subscriber
     ///              remains true — no re-SUBSCRIBE is needed. If the timer expires without
     ///              reconnect, on_disconnect() fires and ble_subscriber is reset to false.
-    ///              grace_period_sec=0 bypasses the timer entirely (immediate reset).
+    ///              grace_period=0 bypasses the timer entirely (immediate reset).
+    ///              The timer runs on a dedicated OS thread (spawn_grace_timer) so its
+    ///              expiry cannot be delayed by tokio time-driver starvation.
     ///
-    /// Version: V2.0
+    /// Version: V2.1
     async fn disconnect_handler_loop(
         mut rx: tokio::sync::mpsc::UnboundedReceiver<BleConnectionEvent>,
         state: Arc<RwLock<BleSessionState>>,
         health_state: Arc<RwLock<GateHealthState>>,
         health_notify: Arc<Notify>,
-        grace_period_sec: u64,
+        grace_period: Duration,
     ) {
         log::info!(
-            "[BLE] Disconnect handler loop running (grace={}s)",
-            grace_period_sec
+            "[BLE] Disconnect handler loop running (grace={:?})",
+            grace_period
         );
         loop {
             match rx.recv().await {
@@ -889,22 +917,22 @@ impl ReliableBleOutput {
                 }
                 Some(BleConnectionEvent::Disconnected) => {
                     log::info!(
-                        "[BLE] Central disconnected — starting grace period ({}s)",
-                        grace_period_sec
+                        "[BLE] Central disconnected — starting grace period ({:?})",
+                        grace_period
                     );
 
-                    if grace_period_sec == 0 {
+                    if grace_period.is_zero() {
                         Self::do_session_reset(&state, &health_state, &health_notify).await;
                         continue;
                     }
 
-                    // Wait for reconnect or grace timer expiry.
-                    let grace = tokio::time::sleep(Duration::from_secs(grace_period_sec));
-                    tokio::pin!(grace);
+                    // Wait for reconnect or grace timer expiry. OS-thread timer:
+                    // immune to tokio time-driver starvation (SRS-FN-BLERELIABLE-016).
+                    let mut grace_rx = Self::spawn_grace_timer(grace_period);
 
                     loop {
                         tokio::select! {
-                            _ = &mut grace => {
+                            _ = &mut grace_rx => {
                                 log::warn!("[BLE] Grace period expired — resetting session");
                                 Self::do_session_reset(&state, &health_state, &health_notify).await;
                                 break;
@@ -929,11 +957,10 @@ impl ReliableBleOutput {
                                 }
                                 Some(BleConnectionEvent::Disconnected) => {
                                     // Re-disconnect during grace: restart the timer.
+                                    // Dropping the old receiver abandons the previous
+                                    // timer thread; its send fails silently on wake-up.
                                     log::info!("[BLE] Re-disconnect during grace — timer reset");
-                                    grace.as_mut().reset(
-                                        tokio::time::Instant::now()
-                                            + Duration::from_secs(grace_period_sec),
-                                    );
+                                    grace_rx = Self::spawn_grace_timer(grace_period);
                                 }
                             }
                         }
@@ -3298,11 +3325,9 @@ mod tests {
     ///              on_disconnect() to fire without any delay. signal_to_stream must be
     ///              empty and ble_subscriber must be false immediately after yielding.
     ///
-    /// Version: V1.0
+    /// Version: V1.1
     #[tokio::test]
     async fn test_grace_zero_resets_immediately() {
-        tokio::time::pause();
-
         let state = Arc::new(RwLock::new(BleSessionState::new(1)));
         state
             .write()
@@ -3317,7 +3342,7 @@ mod tests {
             state.clone(),
             health_state.clone(),
             health_notify.clone(),
-            0,
+            Duration::ZERO,
         ));
 
         tx.send(BleConnectionEvent::Disconnected).unwrap();
@@ -3340,11 +3365,9 @@ mod tests {
     ///              on_disconnect() must NOT be called: signal_to_stream remains intact,
     ///              current_session_id is unchanged, and ble_subscriber stays true.
     ///
-    /// Version: V1.0
+    /// Version: V1.1
     #[tokio::test]
     async fn test_grace_reconnect_preserves_session() {
-        tokio::time::pause();
-
         let initial_session_id = 1u16;
         let state = Arc::new(RwLock::new(BleSessionState::new(initial_session_id)));
         state
@@ -3355,21 +3378,20 @@ mod tests {
         let health_notify = Arc::new(Notify::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BleConnectionEvent>();
 
+        // Grace timer runs on a real OS thread — real (short) durations, no time mocking.
         tokio::spawn(ReliableBleOutput::disconnect_handler_loop(
             rx,
             state.clone(),
             health_state.clone(),
             health_notify.clone(),
-            10,
+            Duration::from_secs(2),
         ));
 
-        // Disconnect then reconnect within the 10 s window (only 5 s elapse)
+        // Disconnect then reconnect well within the 2 s window
         tx.send(BleConnectionEvent::Disconnected).unwrap();
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(5)).await;
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         tx.send(BleConnectionEvent::Connected).unwrap();
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let st = state.read().await;
         assert!(
@@ -3393,11 +3415,9 @@ mod tests {
     ///              fires: signal_to_stream is cleared, current_session_id increments,
     ///              and ble_subscriber becomes false.
     ///
-    /// Version: V1.0
+    /// Version: V1.1
     #[tokio::test]
     async fn test_grace_expiry_resets_session() {
-        tokio::time::pause();
-
         let initial_session_id = 1u16;
         let state = Arc::new(RwLock::new(BleSessionState::new(initial_session_id)));
         state
@@ -3408,20 +3428,26 @@ mod tests {
         let health_notify = Arc::new(Notify::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BleConnectionEvent>();
 
+        // Grace timer runs on a real OS thread — real (short) durations, no time mocking.
         tokio::spawn(ReliableBleOutput::disconnect_handler_loop(
             rx,
             state.clone(),
             health_state.clone(),
             health_notify.clone(),
-            10,
+            Duration::from_millis(100),
         ));
 
         tx.send(BleConnectionEvent::Disconnected).unwrap();
-        tokio::task::yield_now().await;
 
-        // Advance past the full grace period (11 s > 10 s window)
-        tokio::time::advance(Duration::from_secs(11)).await;
-        tokio::task::yield_now().await;
+        // Poll until the OS-thread grace timer fires (well past the 100 ms window).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !state.read().await.signal_to_stream.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grace expiry must reset the session within 5 s"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         let st = state.read().await;
         assert!(
@@ -3490,14 +3516,12 @@ mod tests {
     /// Title: Re-disconnect during grace period resets the grace timer
     ///
     /// Description: A second Disconnected event arriving while the grace timer is running
-    ///              must restart the 10 s window. A Connected event arriving after the
+    ///              must restart the grace window. A Connected event arriving after the
     ///              second disconnect but within the new window must preserve the session.
     ///
-    /// Version: V1.0
+    /// Version: V1.1
     #[tokio::test]
     async fn test_redisconnect_resets_grace_timer() {
-        tokio::time::pause();
-
         let state = Arc::new(RwLock::new(BleSessionState::new(1)));
         state
             .write()
@@ -3507,29 +3531,28 @@ mod tests {
         let health_notify = Arc::new(Notify::new());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BleConnectionEvent>();
 
+        // Grace timer runs on a real OS thread — real (short) durations, no time mocking.
         tokio::spawn(ReliableBleOutput::disconnect_handler_loop(
             rx,
             state.clone(),
             health_state.clone(),
             health_notify.clone(),
-            10,
+            Duration::from_millis(1000),
         ));
 
-        // First disconnect — starts 10 s timer
+        // First disconnect — starts 1000 ms timer
         tx.send(BleConnectionEvent::Disconnected).unwrap();
         tokio::task::yield_now().await;
 
-        // 8 s pass, then a second disconnect — must reset timer to a new 10 s window
-        tokio::time::advance(Duration::from_secs(8)).await;
-        tokio::task::yield_now().await;
+        // 600 ms pass, then a second disconnect — must reset timer to a new 1000 ms window
+        tokio::time::sleep(Duration::from_millis(600)).await;
         tx.send(BleConnectionEvent::Disconnected).unwrap();
         tokio::task::yield_now().await;
 
-        // 5 s after the second disconnect (total 13 s, but timer was reset) — reconnect
-        tokio::time::advance(Duration::from_secs(5)).await;
-        tokio::task::yield_now().await;
+        // 600 ms after the second disconnect (1200 ms total, but timer was reset) — reconnect
+        tokio::time::sleep(Duration::from_millis(600)).await;
         tx.send(BleConnectionEvent::Connected).unwrap();
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert!(
             !state.read().await.signal_to_stream.is_empty(),
