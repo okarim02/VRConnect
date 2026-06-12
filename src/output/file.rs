@@ -1902,13 +1902,15 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-FILEOUT-033
-    /// Title: Test Windows disk usage fallback
+    /// Title: Test Windows disk usage via GetDiskFreeSpaceExW
     ///
-    /// Description: VRConnect shall return 0 on non-Unix platforms.
+    /// Description: VRConnect shall return a valid percentage (0-100) on Windows
+    ///              using GetDiskFreeSpaceExW. The 0 fallback only applies to
+    ///              platforms that are neither Unix nor Windows.
     ///
-    /// Version: V1.0
+    /// Version: V1.1
     #[tokio::test]
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     async fn test_disk_usage_windows_fallback() {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
@@ -1919,7 +1921,7 @@ mod tests {
 
         let usage = file_output.get_disk_usage_percent(temp_dir.path()).unwrap();
 
-        // On Windows, should return 0 (fallback)
-        assert_eq!(usage, 0);
+        // On Windows, GetDiskFreeSpaceExW returns real disk usage (0-100)
+        assert!(usage <= 100);
     }
 }
