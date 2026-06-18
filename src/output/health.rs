@@ -47,11 +47,18 @@ pub struct OsHealthSnapshot {
 /// This reflects active data flow, NOT merely a BLE link presence. A Central
 /// that is connected but has not yet sent SUBSCRIBE_REQ yields ble = 0.
 ///
+/// `sio_connected` is derived from `sio_connection_count > 0`. VitalRecorder
+/// performs a rolling reconnect at midnight (opens new connections before closing
+/// the old one). Using a reference count prevents the old-connection close event
+/// from clearing `sio=1` while the new connections are already active.
+///
 /// Version: V1.0
 #[derive(Debug)]
 pub struct GateHealthState {
-    /// Socket.IO client is connected to VitalRecorder.
+    /// True when at least one Socket.IO WebSocket connection is active (sio_connection_count > 0).
     pub sio_connected: bool,
+    /// Number of active Socket.IO WebSocket connections. sio_connected = count > 0.
+    pub sio_connection_count: u32,
     /// At least one IDT signal stream is active (Central subscribed via SUBSCRIBE_REQ).
     /// Updated from BleSessionState::signal_to_stream: !is_empty() → true.
     pub ble_subscriber: bool,
@@ -65,6 +72,7 @@ impl Default for GateHealthState {
     fn default() -> Self {
         Self {
             sio_connected: false,
+            sio_connection_count: 0,
             ble_subscriber: false,
             last_processed_data: None,
             flow_timeout_sec: 60,
@@ -261,6 +269,7 @@ mod tests {
     fn all_ok_gate() -> GateHealthState {
         GateHealthState {
             sio_connected: true,
+            sio_connection_count: 1,
             ble_subscriber: true,
             last_processed_data: Some(Instant::now() - Duration::from_secs(5)),
             flow_timeout_sec: 60,

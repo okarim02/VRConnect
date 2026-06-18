@@ -211,7 +211,10 @@ impl SocketIOServer {
 
         // sio connected → immediate health push
         if let (Some(ref hs), Some(ref hn)) = (&health_state, &health_notify) {
-            hs.write().await.sio_connected = true;
+            let mut g = hs.write().await;
+            g.sio_connection_count = g.sio_connection_count.saturating_add(1);
+            g.sio_connected = true;
+            drop(g);
             hn.notify_one();
         }
 
@@ -364,9 +367,12 @@ impl SocketIOServer {
             }
         }
 
-        // sio disconnected → immediate health push
+        // sio disconnected → decrement counter; clear sio only when last connection closes
         if let (Some(ref hs), Some(ref hn)) = (&health_state, &health_notify) {
-            hs.write().await.sio_connected = false;
+            let mut g = hs.write().await;
+            g.sio_connection_count = g.sio_connection_count.saturating_sub(1);
+            g.sio_connected = g.sio_connection_count > 0;
+            drop(g);
             hn.notify_one();
         }
 
