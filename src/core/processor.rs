@@ -413,7 +413,7 @@ mod tests {
             output_file_base_path: "./data/test".to_string(),
             output_file_max_size_mb: 500,
             output_file_archive_threshold_gb: 5,
-            output_file_critical_disk_percent: 95,
+            output_file_critical_disk_percent: 100,
             health_check_interval_sec: 30,
             health_ble_flow_timeout_sec: 60,
             health_file: "logs/health.json".to_string(),

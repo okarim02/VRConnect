@@ -807,7 +807,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let result = FileOutput::new(base_path.clone(), 500, 5, 95).await;
+        let result = FileOutput::new(base_path.clone(), 500, 5, 100).await;
         assert!(result.is_ok());
 
         let file_output = result.unwrap();
@@ -829,7 +829,7 @@ mod tests {
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
         // Very small size for testing (1 KB)
-        let file_output = FileOutput::new(base_path.clone(), 1, 5, 95).await.unwrap();
+        let file_output = FileOutput::new(base_path.clone(), 1, 5, 100).await.unwrap();
 
         // Create large data to exceed 1 KB
         let mut tracks = Vec::new();
@@ -890,7 +890,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -932,7 +932,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -959,7 +959,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1000,7 +1000,7 @@ mod tests {
         File::create(old_dir.join("vrconnect_20250114_100000_110000.json")).unwrap();
 
         // Create FileOutput - should trigger archiving
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1030,7 +1030,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1093,7 +1093,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1114,7 +1114,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1152,7 +1152,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1175,7 +1175,7 @@ mod tests {
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
         // Very small threshold (1 byte) to trigger archiving
-        let file_output = FileOutput::new(base_path.clone(), 500, 0, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 0, 100)
             .await
             .unwrap();
 
@@ -1205,7 +1205,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1232,7 +1232,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1259,7 +1259,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1280,7 +1280,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1301,7 +1301,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1322,7 +1322,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1343,7 +1343,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1376,7 +1376,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1407,7 +1407,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 1, 5, 95).await.unwrap();
+        let file_output = FileOutput::new(base_path.clone(), 1, 5, 100).await.unwrap();
 
         let room = ProcessedRoom {
             room_index: 0,
@@ -1459,7 +1459,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1503,7 +1503,7 @@ mod tests {
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
         // Set high threshold so we don't trigger shutdown
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 99)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1524,7 +1524,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1545,7 +1545,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1591,7 +1591,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1668,7 +1668,7 @@ mod tests {
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
         // Small size to trigger rotation quickly
-        let file_output = FileOutput::new(base_path.clone(), 1, 5, 95).await.unwrap();
+        let file_output = FileOutput::new(base_path.clone(), 1, 5, 100).await.unwrap();
 
         let room = ProcessedRoom {
             room_index: 0,
@@ -1732,7 +1732,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1759,7 +1759,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1819,7 +1819,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1845,7 +1845,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1879,7 +1879,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1915,7 +1915,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 95)
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
