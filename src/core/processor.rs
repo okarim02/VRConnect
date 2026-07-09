@@ -413,6 +413,9 @@ mod tests {
             output_file_base_path: "./data/test".to_string(),
             output_file_max_size_mb: 500,
             output_file_archive_threshold_gb: 5,
+            // 100, NOT the prod default (95): check_disk_space() calls process::exit(1)
+            // at >= threshold, so 95 lets a nearly-full dev/CI disk kill the whole test
+            // harness. Keep 100 in every test config.
             output_file_critical_disk_percent: 100,
             health_check_interval_sec: 30,
             health_ble_flow_timeout_sec: 60,

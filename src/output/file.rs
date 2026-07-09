@@ -789,6 +789,9 @@ impl FileOutput {
     }
 }
 
+// NOTE for test authors: every FileOutput::new() below passes critical_disk_percent=100,
+// NOT the prod default (95). check_disk_space() calls process::exit(1) at >= threshold,
+// so 95 lets a nearly-full dev/CI disk kill the whole test harness mid-run. Keep 100.
 #[cfg(test)]
 mod tests {
     use super::*;
