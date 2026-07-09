@@ -299,6 +299,29 @@ impl ReliableBleOutput {
     pub async fn start(&self) -> Result<()> {
         log::info!("Starting Reliable BLE GATT server (IDT protocol)...");
 
+        self.start_background_tasks().await;
+
+        // 9. Start GATT server
+        {
+            let mut server = self.server.write().await;
+            server.start().await?;
+        }
+        log::info!("Reliable BLE GATT server started successfully (IDT v1)");
+        log::info!("Waiting for BLE client connections...");
+        Ok(())
+    }
+
+    /// ID SRS: SRS-FN-BLERELIABLE-017
+    /// Title: start_background_tasks
+    ///
+    /// Description: VRConnect shall prepare the catalog and spawn all background tasks
+    ///              (steps 1–8 of `start`: write handler, ACK watchdog, disconnect
+    ///              handler, supervision, health, checkpoint load/save, WAL replay/task).
+    ///              Contains no hardware access — the WinRT GATT service is only created
+    ///              by `start` (step 9), which keeps this part unit-testable.
+    ///
+    /// Version: V1.0
+    async fn start_background_tasks(&self) {
         // 1. Serialize catalog using new IDT TLV binary format
         let catalog_bytes = self.catalog.to_ble_bytes();
         log::info!(
@@ -498,15 +521,6 @@ impl ReliableBleOutput {
         } else {
             log::info!("[WAL] WAL disabled (set WAL_ENABLED=true to enable)");
         }
-
-        // 9. Start GATT server
-        {
-            let mut server = self.server.write().await;
-            server.start().await?;
-        }
-        log::info!("Reliable BLE GATT server started successfully (IDT v1)");
-        log::info!("Waiting for BLE client connections...");
-        Ok(())
     }
 
     /// Background task: reads write events from the GATT server and dispatches them.
@@ -2118,8 +2132,8 @@ mod tests {
     use super::*;
     use crate::domain::ble_protocol::{
         AckFrame, IdtHeader, InboundFrame, SubscribeRsp, SubscribeRspItem, FLAG_RETRANSMIT,
-        IDT_MAGIC, IDT_VERSION, MSG_ACK_FRAME, MSG_SUBSCRIBE_REQ, MSG_SUBSCRIBE_RSP,
-        SUB_OP_SUBSCRIBE,
+        IDT_MAGIC, IDT_VERSION, MSG_ACK_FRAME, MSG_NACK_FRAME, MSG_SUBSCRIBE_REQ,
+        MSG_SUBSCRIBE_RSP, SUB_OP_SUBSCRIBE,
     };
     use crate::domain::{ProcessedRoom, ProcessedTrack, TrackType};
     use chrono::Utc;
@@ -4000,5 +4014,475 @@ mod tests {
     fn test_log_subscribe_parse_failure_crc_mismatch_legacy_id() {
         let buf = make_bad_subscribe_bytes(20, 0x0001, false);
         ReliableBleOutput::log_subscribe_parse_failure(&buf);
+    }
+
+    // ── Background tasks / write-handler loop (no hardware required) ─────────
+
+    /// Helper: construct a ReliableBleOutput without hardware access.
+    /// Only supervision / checkpoint / WAL vary between tests; the rest is fixed.
+    async fn make_reliable_output(
+        supervision_sec: u64,
+        ckpt_interval_sec: u64,
+        ckpt_path: &str,
+        wal_enabled: bool,
+        wal_path: &str,
+    ) -> ReliableBleOutput {
+        ReliableBleOutput::new(
+            "Test".to_string(),
+            "12345678-1234-1234-1234-1234567890ab".to_string(),
+            0,    // _update_interval_ms (unused)
+            None, // registry (uses default)
+            30,   // health_check_interval_sec
+            60,   // health_ble_flow_timeout_sec
+            "logs/health.json".to_string(),
+            5,                     // ble_grace_period_sec
+            supervision_sec,       // ble_supervision_timeout_sec
+            ckpt_interval_sec,     // history_checkpoint_interval_sec
+            86400,                 // history_checkpoint_max_age_sec
+            ckpt_path.to_string(), // history_checkpoint_path
+            21600,                 // history_retention_sec
+            wal_enabled,
+            wal_path.to_string(),
+            2,    // wal_fsync_interval_sec
+            3600, // wal_compaction_interval_sec
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Helper: spawn write_handler_loop on a fresh channel wired to `ble`'s shared state.
+    fn spawn_write_handler(
+        ble: &ReliableBleOutput,
+        last_ack: &Arc<tokio::sync::Mutex<tokio::time::Instant>>,
+    ) -> (
+        tokio::sync::mpsc::UnboundedSender<WriteEvent>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn(ReliableBleOutput::write_handler_loop(
+            rx,
+            ble.state.clone(),
+            ble.server.clone(),
+            ble.registry.clone(),
+            ble.health_state.clone(),
+            ble.health_notify.clone(),
+            last_ack.clone(),
+        ));
+        (tx, handle)
+    }
+
+    /// Helper: WriteEvent on a named characteristic.
+    fn write_event(characteristic: &str, data: Vec<u8>) -> WriteEvent {
+        WriteEvent {
+            characteristic_name: characteristic.to_string(),
+            data,
+        }
+    }
+
+    /// Helper: build a MyPredi ACK (45 bytes: 24-byte header + 17-byte payload + CRC32C).
+    fn make_mypredi_ack_bytes(session_id: u16, stream_id: u16, ack_upto: u32) -> Vec<u8> {
+        let header = IdtHeader {
+            magic: IDT_MAGIC,
+            version: IDT_VERSION,
+            msg_type: MSG_ACK_FRAME,
+            flags: 0,
+            session_id,
+            stream_id,
+            seq: 0,
+        };
+        let mut buf: Vec<u8> = header.to_bytes().to_vec(); // 13 bytes
+        buf.extend_from_slice(&0u64.to_le_bytes()); // t0_ms        → 21
+        buf.push(1u8); // count                                     → 22
+        buf.extend_from_slice(&17u16.to_le_bytes()); // payloadLen  → 24
+        buf.extend_from_slice(&session_id.to_le_bytes());
+        buf.extend_from_slice(&stream_id.to_le_bytes());
+        buf.extend_from_slice(&ack_upto.to_le_bytes());
+        buf.push(8u8); // bitmap_len
+        buf.extend_from_slice(&[0u8; 8]); // bitmap                 → 41
+        let crc = crc32c::crc32c(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes()); // → 45
+        buf
+    }
+
+    /// Helper: build a legacy Flutter ACK (17 bytes, no IDT magic, no CRC) [DEV-2].
+    fn make_flutter_ack_bytes(session_id: u16, stream_id: u16, ack_upto: u32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(17);
+        buf.extend_from_slice(&session_id.to_le_bytes());
+        buf.extend_from_slice(&stream_id.to_le_bytes());
+        buf.extend_from_slice(&ack_upto.to_le_bytes());
+        buf.push(8u8); // bitmap_len
+        buf.extend_from_slice(&[0u8; 8]);
+        buf
+    }
+
+    /// Helper: build a valid IDT NACK_FRAME (header + n + reason + seq_list + CRC32C).
+    fn make_nack_bytes(session_id: u16, stream_id: u16, seqs: &[u32]) -> Vec<u8> {
+        let header = IdtHeader {
+            magic: IDT_MAGIC,
+            version: IDT_VERSION,
+            msg_type: MSG_NACK_FRAME,
+            flags: 0,
+            session_id,
+            stream_id,
+            seq: 0,
+        };
+        let mut buf: Vec<u8> = header.to_bytes().to_vec();
+        buf.push(seqs.len() as u8);
+        buf.push(1u8); // reason
+        for s in seqs {
+            buf.extend_from_slice(&s.to_le_bytes());
+        }
+        let crc = crc32c::crc32c(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-049
+    /// Title: Test start_background_tasks — full configuration + WAL replay
+    ///
+    /// Description: VRConnect shall spawn every background task without hardware
+    /// access, consume the write/disconnect/WAL receivers, and replay WAL entries
+    /// into the history buffer. A second call must take the "receiver already
+    /// taken" paths without panicking.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_start_background_tasks_full_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wal_path = dir.path().join("test.wal");
+        let ckpt_path = dir.path().join("ckpt.bin");
+
+        // Seed a WAL file with two valid entries for replay.
+        let e1 = WalEntry {
+            signal_id: 0x0101,
+            t0_ms: 1000,
+            value: 72.0,
+        };
+        let e2 = WalEntry {
+            signal_id: 0x0102,
+            t0_ms: 2000,
+            value: 98.0,
+        };
+        let mut bytes = e1.to_bytes().to_vec();
+        bytes.extend_from_slice(&e2.to_bytes());
+        std::fs::write(&wal_path, bytes).unwrap();
+
+        let ble = make_reliable_output(
+            30,
+            30,
+            ckpt_path.to_str().unwrap(),
+            true,
+            wal_path.to_str().unwrap(),
+        )
+        .await;
+
+        ble.start_background_tasks().await;
+
+        // Every receiver must have been consumed by its spawned task.
+        {
+            let mut server = ble.server.write().await;
+            assert!(server.take_write_receiver().is_none());
+            assert!(server.take_disconnect_receiver().is_none());
+        }
+        assert!(ble.wal_rx.lock().await.is_none());
+
+        // WAL entries must have been replayed into the history buffer.
+        {
+            let st = ble.state.read().await;
+            assert_eq!(st.history.get(&0x0101).map(|h| h.len()), Some(1));
+            assert_eq!(st.history.get(&0x0102).map(|h| h.len()), Some(1));
+        }
+
+        // Second call: all "receiver already taken" branches, must not panic.
+        ble.start_background_tasks().await;
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-050
+    /// Title: Test start_background_tasks — disabled features
+    ///
+    /// Description: VRConnect shall skip supervision (timeout=0), checkpoint
+    /// (interval=0) and WAL (disabled) tasks while still spawning the write and
+    /// disconnect handlers.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_start_background_tasks_disabled_paths() {
+        let ble = make_reliable_output(0, 0, "", false, "").await;
+
+        ble.start_background_tasks().await;
+
+        {
+            let mut server = ble.server.write().await;
+            assert!(server.take_write_receiver().is_none());
+            assert!(server.take_disconnect_receiver().is_none());
+        }
+        // WAL disabled: no channel was ever created.
+        assert!(ble.wal_rx.lock().await.is_none());
+        assert!(ble.wal_tx.is_none());
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-051
+    /// Title: Test write_handler_loop — IDT subscribe activates BLE health flag
+    ///
+    /// Description: VRConnect shall process a strict-IDT SUBSCRIBE_REQ received on
+    /// the Subscribe characteristic, register the stream, and raise ble_subscriber.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_write_handler_loop_subscribe_activates_ble() {
+        let ble = make_reliable_output(0, 0, "", false, "").await;
+        let last_ack = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+        let (tx, handle) = spawn_write_handler(&ble, &last_ack);
+
+        tx.send(write_event(
+            "Subscribe",
+            make_subscribe_req_bytes(1, 7, SUB_OP_SUBSCRIBE, 0x0101),
+        ))
+        .unwrap();
+        drop(tx); // close the channel → loop drains the queue then exits
+        handle.await.unwrap();
+
+        assert!(
+            ble.state
+                .read()
+                .await
+                .signal_to_stream
+                .contains_key(&0x0101),
+            "HR must be subscribed"
+        );
+        assert!(
+            ble.health_state.read().await.ble_subscriber,
+            "ble_subscriber must be raised after subscribe"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-052
+    /// Title: Test write_handler_loop — dispatch of malformed and legacy events
+    ///
+    /// Description: VRConnect shall discard malformed payloads on every
+    /// characteristic without panicking, honor the legacy 2-byte unsubscribe,
+    /// trigger a health push on Control writes, and warn on unknown
+    /// characteristics. After unsubscribe, ble_subscriber must fall back to false.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_write_handler_loop_dispatch_and_unsubscribe() {
+        let ble = make_reliable_output(0, 0, "", false, "").await;
+        let last_ack = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+        let (tx, handle) = spawn_write_handler(&ble, &last_ack);
+
+        // Valid IDT subscribe, then a storm of malformed/legacy events.
+        tx.send(write_event(
+            "Subscribe",
+            make_subscribe_req_bytes(1, 7, SUB_OP_SUBSCRIBE, 0x0101),
+        ))
+        .unwrap();
+        // IDT magic but msg_type=ACK on Subscribe → discarded
+        tx.send(write_event("Subscribe", make_ack_bytes(1, 1, 0)))
+            .unwrap();
+        // Unrecognized format on Subscribe → parse-failure diagnostic
+        tx.send(write_event("Subscribe", vec![0xFF, 0x00, 0x13]))
+            .unwrap();
+        // Garbage on Data_IN → discarded
+        tx.send(write_event("Data_IN", vec![0xDE, 0xAD])).unwrap();
+        // Control write → immediate health push request
+        tx.send(write_event("Control", vec![0x01])).unwrap();
+        // Unknown characteristic → warn
+        tx.send(write_event("Bogus", vec![0x00])).unwrap();
+        // Legacy 2-byte unsubscribe for HR
+        tx.send(write_event("Unsubscribe", 0x0101u16.to_le_bytes().to_vec()))
+            .unwrap();
+        // Too-short unsubscribe → discarded
+        tx.send(write_event("Unsubscribe", vec![0x01])).unwrap();
+
+        drop(tx);
+        handle.await.unwrap();
+
+        assert!(
+            ble.state.read().await.signal_to_stream.is_empty(),
+            "legacy unsubscribe must remove the HR stream"
+        );
+        assert!(
+            !ble.health_state.read().await.ble_subscriber,
+            "ble_subscriber must fall back to false after unsubscribe"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-053
+    /// Title: Test write_handler_loop — ACK/NACK paths drain the tx buffer
+    ///
+    /// Description: VRConnect shall drain pending frames through all three ACK wire
+    /// formats (IDT strict, MyPredi 45-byte [DEV-5], legacy Flutter 17-byte [DEV-2]),
+    /// retransmit on NACK, and refresh last_ack_time on every accepted ACK.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_write_handler_loop_ack_nack_paths() {
+        let ble = make_reliable_output(0, 0, "", false, "").await;
+        let last_ack = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+
+        // Phase A: subscribe HR through the loop, then let it exit.
+        let (tx, handle) = spawn_write_handler(&ble, &last_ack);
+        tx.send(write_event(
+            "Subscribe",
+            make_subscribe_req_bytes(1, 7, SUB_OP_SUBSCRIBE, 0x0101),
+        ))
+        .unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        // Queue three frames and capture the live session/stream/seq numbers.
+        let (session_id, stream_id, seqs) = {
+            let mut st = ble.state.write().await;
+            let f1 = st.add_data(0x0101, 72.0, 1000).expect("subscribed");
+            let f2 = st.add_data(0x0101, 73.0, 2000).expect("subscribed");
+            let f3 = st.add_data(0x0101, 74.0, 3000).expect("subscribed");
+            (
+                st.current_session_id,
+                f1.header.stream_id,
+                [f1.header.seq, f2.header.seq, f3.header.seq],
+            )
+        };
+        assert_eq!(ble.state.read().await.total_pending(), 3);
+
+        // Phase B: drive NACK + the three ACK formats through a fresh loop.
+        let t0 = *last_ack.lock().await;
+        let (tx, handle) = spawn_write_handler(&ble, &last_ack);
+        // NACK on the first pending seq → retransmit path (notify fails harmlessly)
+        tx.send(write_event(
+            "Data_IN",
+            make_nack_bytes(session_id, stream_id, &seqs[..1]),
+        ))
+        .unwrap();
+        // IDT strict ACK clears seq 1
+        tx.send(write_event(
+            "Data_IN",
+            make_ack_bytes(session_id, stream_id, seqs[0]),
+        ))
+        .unwrap();
+        // Legacy Flutter ACK clears seq 2 [DEV-2]
+        tx.send(write_event(
+            "Data_IN",
+            make_flutter_ack_bytes(session_id, stream_id, seqs[1]),
+        ))
+        .unwrap();
+        // MyPredi 45-byte ACK clears seq 3 [DEV-5]
+        tx.send(write_event(
+            "Data_IN",
+            make_mypredi_ack_bytes(session_id, stream_id, seqs[2]),
+        ))
+        .unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        assert_eq!(
+            ble.state.read().await.total_pending(),
+            0,
+            "all pending frames must be drained by the three ACK formats"
+        );
+        assert!(
+            *last_ack.lock().await > t0,
+            "last_ack_time must be refreshed by accepted ACKs"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-054
+    /// Title: Test output — full signal alias table, room filter and dedup
+    ///
+    /// Description: VRConnect shall map every VitalRecorder alias to its IDT
+    /// signal_id and record it to history, skip tracks outside room 0, skip
+    /// unknown signal names, and skip duplicate (signal_id, t0_ms) pairs.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_output_signal_aliases_and_dedup() {
+        let ble = make_reliable_output(0, 0, "", false, "").await;
+
+        let mut tracks = vec![
+            create_test_track("HR", 72.0, 0, "BED_01"),
+            create_test_track("PLETH_SPO2", 98.0, 0, "BED_01"),
+            create_test_track("BT1_TEMP", 36.8, 0, "BED_01"),
+            create_test_track("NIBP_SBP", 120.0, 0, "BED_01"),
+            create_test_track("NIBP_DBP", 80.0, 0, "BED_01"),
+            create_test_track("NIBP_MBP", 93.0, 0, "BED_01"),
+            create_test_track("ST_II", 0.1, 0, "BED_01"),
+            create_test_track("ST_V", 0.2, 0, "BED_01"),
+            create_test_track("ST_AVL", 0.3, 0, "BED_01"),
+            create_test_track("SPV", 12.0, 0, "BED_01"),
+            create_test_track("PPV", 14.0, 0, "BED_01"),
+            create_test_track("AMB_PRES", 1013.0, 0, "BED_01"),
+            // Unknown name and non-room-0 track: both skipped.
+            create_test_track("UNKNOWN_SIGNAL", 1.0, 0, "BED_01"),
+            create_test_track("HR", 75.0, 1, "BED_02"),
+        ];
+        // Duplicate (signal_id, t0_ms) of the first HR sample → skipped by dedup.
+        let mut dup = create_test_track("HR", 99.0, 0, "BED_01");
+        dup.timestamp = tracks[0].timestamp;
+        tracks.push(dup);
+
+        let room = ProcessedRoom {
+            room_index: 0,
+            room_name: "BED_01".to_string(),
+            tracks,
+        };
+        let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+
+        ble.output(&data).await.unwrap();
+
+        let st = ble.state.read().await;
+        for sid in [
+            0x0101u16, 0x0102, 0x0103, 0x0201, 0x0202, 0x0203, 0x0301, 0x0302, 0x0303, 0x0401,
+            0x0402, 0x0501,
+        ] {
+            assert!(
+                st.history.contains_key(&sid),
+                "history must contain signal 0x{:04X}",
+                sid
+            );
+        }
+        assert_eq!(
+            st.history.len(),
+            12,
+            "unknown and non-room-0 signals must not be recorded"
+        );
+        assert_eq!(
+            st.history.get(&0x0101).unwrap().len(),
+            1,
+            "duplicate HR (signal, t0_ms) must be skipped"
+        );
+        drop(st);
+        assert!(
+            ble.health_state.read().await.last_processed_data.is_some(),
+            "output() must refresh the flow timestamp"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-055
+    /// Title: Test health_task — notify-triggered and heartbeat iterations
+    ///
+    /// Description: VRConnect shall run a health iteration on health_notify and on
+    /// the heartbeat timer, building the payload from a missing health file (stale
+    /// OS snapshot) and tolerating the absent Control subscriber. Uses paused tokio
+    /// time so the heartbeat fires instantly.
+    ///
+    /// Version: V1.0
+    #[tokio::test(start_paused = true)]
+    async fn test_health_task_iterations() {
+        let ble = make_reliable_output(0, 0, "", false, "").await;
+
+        let handle = tokio::spawn(ReliableBleOutput::health_task(
+            ble.health_state.clone(),
+            ble.server.clone(),
+            ble.health_notify.clone(),
+            30,
+            "logs/nonexistent_health_test.json".to_string(),
+        ));
+
+        // Notify-triggered iteration, then one heartbeat (virtual 31 s).
+        ble.health_notify.notify_one();
+        tokio::time::sleep(Duration::from_secs(31)).await;
+
+        assert!(!handle.is_finished(), "health task must keep running");
+        handle.abort();
     }
 }
