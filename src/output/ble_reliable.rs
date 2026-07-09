@@ -3917,4 +3917,88 @@ mod tests {
         assert_eq!(history[0], (1000, 72.0));
         assert_eq!(history[1], (2000, 73.0));
     }
+
+    // ── Flutter stream ID mapping / subscribe parse diagnostics ──────────────
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-046
+    /// Title: Test flutter_stream_id fixed mapping
+    ///
+    /// Description: VRConnect shall map each catalog signal_id to the stream ID
+    /// hardcoded by Flutter's `_initStreams()`. This table is FIXED — any change
+    /// makes Flutter drop every DATA_FRAME (activeStreams[streamId] == null).
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_flutter_stream_id_mapping() {
+        assert_eq!(ReliableBleOutput::flutter_stream_id(0x0101), 1); // HR
+        assert_eq!(ReliableBleOutput::flutter_stream_id(0x0102), 2); // SpO2
+        assert_eq!(ReliableBleOutput::flutter_stream_id(0x0103), 3); // Temp
+        assert_eq!(ReliableBleOutput::flutter_stream_id(0x0201), 4); // SBP
+        assert_eq!(ReliableBleOutput::flutter_stream_id(0x0202), 5); // DBP
+        assert_eq!(ReliableBleOutput::flutter_stream_id(0x0203), 6); // MBP
+        assert_eq!(ReliableBleOutput::flutter_stream_id(0x0501), 7); // AmbPres
+        assert_eq!(ReliableBleOutput::flutter_stream_id(0x0301), 8); // ST_II
+        assert_eq!(ReliableBleOutput::flutter_stream_id(0x0302), 9); // ST_V
+        assert_eq!(ReliableBleOutput::flutter_stream_id(0x0303), 10); // ST_AVL
+        assert_eq!(ReliableBleOutput::flutter_stream_id(0x0401), 11); // SPV
+        assert_eq!(ReliableBleOutput::flutter_stream_id(0x0402), 12); // PPV
+
+        // Unknown signals pass through unchanged
+        assert_eq!(ReliableBleOutput::flutter_stream_id(0x0999), 0x0999);
+    }
+
+    /// Helper: build a SUBSCRIBE_REQ-shaped frame with a non-standard item size
+    /// (valid IDT header, unparseable items). CRC is valid or corrupted on demand.
+    fn make_bad_subscribe_bytes(item_size: usize, signal_id: u16, valid_crc: bool) -> Vec<u8> {
+        let header = IdtHeader {
+            magic: IDT_MAGIC,
+            version: IDT_VERSION,
+            msg_type: MSG_SUBSCRIBE_REQ,
+            flags: 0,
+            session_id: 1,
+            stream_id: 0,
+            seq: 0,
+        };
+        let mut buf: Vec<u8> = header.to_bytes().to_vec();
+        buf.extend_from_slice(&7u16.to_le_bytes()); // req_id
+        buf.push(SUB_OP_SUBSCRIBE); // op
+        buf.push(1u8); // n = 1 item
+        let mut item = vec![0u8; item_size];
+        item[0] = 1; // source_id
+        item[1..3].copy_from_slice(&signal_id.to_le_bytes());
+        buf.extend_from_slice(&item);
+        let crc = crc32c::crc32c(&buf);
+        let crc = if valid_crc { crc } else { crc ^ 1 };
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-047
+    /// Title: Test subscribe parse-failure diagnostic — CRC match branch
+    ///
+    /// Description: VRConnect shall identify the actual item size of an unparseable
+    /// SUBSCRIBE_REQ by brute-forcing candidate sizes (17..=30) and report the size
+    /// whose CRC matches. The diagnostic must not panic on any input.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_log_subscribe_parse_failure_crc_match() {
+        // 20-byte items (server expects 17) with a valid CRC → "CRC MATCH" branch
+        // + item dump with IDT compound signal_id label.
+        let buf = make_bad_subscribe_bytes(20, 0x0101, true);
+        ReliableBleOutput::log_subscribe_parse_failure(&buf);
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-048
+    /// Title: Test subscribe parse-failure diagnostic — CRC mismatch + legacy ID
+    ///
+    /// Description: VRConnect shall report a CRC mismatch for a size-matching
+    /// candidate and label legacy simple signal IDs (1/2/3) in the item dump.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_log_subscribe_parse_failure_crc_mismatch_legacy_id() {
+        let buf = make_bad_subscribe_bytes(20, 0x0001, false);
+        ReliableBleOutput::log_subscribe_parse_failure(&buf);
+    }
 }

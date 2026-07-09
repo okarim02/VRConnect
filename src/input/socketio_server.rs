@@ -898,4 +898,48 @@ mod tests {
         assert_eq!(processed.rooms.len(), 2);
         assert_eq!(processed.all_tracks.len(), 2);
     }
+
+    /// ID SRS: SRS-TEST-SOCKETIO-011
+    /// Title: Test set_health_hooks wiring
+    ///
+    /// Description: VRConnect shall leave health hooks unset at construction and
+    /// wire health state + notify into the server when set_health_hooks is called.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_set_health_hooks() {
+        let debug_file = Arc::new(RwLock::new(None));
+        let mut server = SocketIOServer::new("127.0.0.1".to_string(), 3000, false, debug_file);
+
+        assert!(server.health_state.is_none());
+        assert!(server.health_notify.is_none());
+
+        let health_state = Arc::new(RwLock::new(GateHealthState::default()));
+        let health_notify = Arc::new(Notify::new());
+        server.set_health_hooks(health_state, health_notify);
+
+        assert!(server.health_state.is_some());
+        assert!(server.health_notify.is_some());
+    }
+
+    /// ID SRS: SRS-TEST-SOCKETIO-012
+    /// Title: Test handshake failure log throttling
+    ///
+    /// Description: VRConnect shall log the first handshake failure of a 5 s window
+    /// and route rapid follow-up failures through the suppression counter instead of
+    /// logging each one. Regression test for the log-storm incident that starved the
+    /// BLE grace timer (os error 10053 bursts).
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_log_handshake_failure_throttled() {
+        let addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let err = "Connection reset without closing handshake (os error 10053)";
+
+        // First call of the window takes the logging branch; the rapid follow-ups
+        // take the suppression branch. Neither must panic.
+        for _ in 0..4 {
+            SocketIOServer::log_handshake_failure_throttled(addr, &err);
+        }
+    }
 }

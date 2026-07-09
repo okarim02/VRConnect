@@ -1250,4 +1250,104 @@ mod tests {
         std::env::remove_var("WAL_FSYNC_INTERVAL_SEC");
         std::env::remove_var("WAL_COMPACTION_INTERVAL_SEC");
     }
+
+    /// ID SRS: SRS-TEST-CFG-ENV-001
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn test_ble_output_env_override() {
+        std::env::remove_var("BLE_EMPTY_VALUE");
+        std::env::remove_var("BLE_UPDATE_INTERVAL_MS");
+
+        std::env::set_var("BLE_EMPTY_VALUE", "N/A");
+        std::env::set_var("BLE_UPDATE_INTERVAL_MS", "250");
+
+        let args = vec!["vrconnect".to_string()];
+        let base = Config::parse_from(&args);
+        let config = Config::apply_env_overrides(base, &args);
+
+        assert_eq!(config.output_ble_empty_value, "N/A");
+        assert_eq!(config.output_ble_update_interval_ms, 250);
+
+        std::env::remove_var("BLE_EMPTY_VALUE");
+        std::env::remove_var("BLE_UPDATE_INTERVAL_MS");
+    }
+
+    /// ID SRS: SRS-TEST-CFG-ENV-002
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn test_file_output_env_override() {
+        std::env::remove_var("OUTPUT_FILE_BASE_PATH");
+        std::env::remove_var("OUTPUT_FILE_MAX_SIZE_MB");
+        std::env::remove_var("OUTPUT_FILE_ARCHIVE_THRESHOLD_GB");
+        std::env::remove_var("OUTPUT_FILE_CRITICAL_DISK_PERCENT");
+
+        std::env::set_var("OUTPUT_FILE_BASE_PATH", "/custom/recordings");
+        std::env::set_var("OUTPUT_FILE_MAX_SIZE_MB", "750");
+        std::env::set_var("OUTPUT_FILE_ARCHIVE_THRESHOLD_GB", "12");
+        std::env::set_var("OUTPUT_FILE_CRITICAL_DISK_PERCENT", "90");
+
+        let args = vec!["vrconnect".to_string()];
+        let base = Config::parse_from(&args);
+        let config = Config::apply_env_overrides(base, &args);
+
+        assert_eq!(config.output_file_base_path, "/custom/recordings");
+        assert_eq!(config.output_file_max_size_mb, 750);
+        assert_eq!(config.output_file_archive_threshold_gb, 12);
+        assert_eq!(config.output_file_critical_disk_percent, 90);
+
+        std::env::remove_var("OUTPUT_FILE_BASE_PATH");
+        std::env::remove_var("OUTPUT_FILE_MAX_SIZE_MB");
+        std::env::remove_var("OUTPUT_FILE_ARCHIVE_THRESHOLD_GB");
+        std::env::remove_var("OUTPUT_FILE_CRITICAL_DISK_PERCENT");
+    }
+
+    /// ID SRS: SRS-TEST-CFG-ENV-003
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn test_supervision_retention_env_override() {
+        std::env::remove_var("BLE_SUPERVISION_TIMEOUT_SEC");
+        std::env::remove_var("HISTORY_RETENTION_SEC");
+
+        std::env::set_var("BLE_SUPERVISION_TIMEOUT_SEC", "45");
+        std::env::set_var("HISTORY_RETENTION_SEC", "7200");
+
+        let args = vec!["vrconnect".to_string()];
+        let base = Config::parse_from(&args);
+        let config = Config::apply_env_overrides(base, &args);
+
+        assert_eq!(config.ble_supervision_timeout_sec, 45);
+        assert_eq!(config.history_retention_sec, 7200);
+
+        std::env::remove_var("BLE_SUPERVISION_TIMEOUT_SEC");
+        std::env::remove_var("HISTORY_RETENTION_SEC");
+    }
+
+    /// ID SRS: SRS-TEST-CFG-ENV-004
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn test_debug_log_env_override() {
+        std::env::remove_var("DEBUG_ENABLED");
+        std::env::remove_var("DEBUG_OUTPUT_PATH");
+        std::env::remove_var("LOG_DIR");
+
+        std::env::set_var("DEBUG_ENABLED", "true");
+        std::env::set_var("DEBUG_OUTPUT_PATH", "logs/custom_debug.log");
+        std::env::set_var("LOG_DIR", "logs/custom_dir");
+
+        let args = vec!["vrconnect".to_string()];
+        let base = Config::parse_from(&args);
+        let config = Config::apply_env_overrides(base, &args);
+
+        assert!(config.debug_enabled);
+        assert_eq!(config.debug_output_path, "logs/custom_debug.log");
+        assert_eq!(config.log_dir, "logs/custom_dir");
+
+        std::env::remove_var("DEBUG_ENABLED");
+        std::env::remove_var("DEBUG_OUTPUT_PATH");
+        std::env::remove_var("LOG_DIR");
+    }
 }
