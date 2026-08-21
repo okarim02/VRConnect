@@ -146,7 +146,6 @@ rust-project.json
 CLAUDE.local.md
 
 .agents
-docs
 .claude
 AGENTS.local.md
 scripts/deploy.ps1
