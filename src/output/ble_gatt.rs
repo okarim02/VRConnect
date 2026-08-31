@@ -80,7 +80,14 @@ struct CharConfig {
 // GattServer
 // ---------------------------------------------------------------------------
 
-/// Custom Windows BLE GATT server with full Read / Write / Notify support.
+/// ID SRS: SRS-MOD-BLEGATT-001
+/// Title: GattServer
+///
+/// Description: VRConnect shall provide a custom Windows BLE GATT server with full
+///              Read / Write / Notify support, replacing the ble-windows-server crate
+///              (v0.2.1) which only supports Read + Notify characteristics.
+///
+/// Version: V1.0
 ///
 /// # Lifecycle
 /// 1. `new()` → stores device name + service UUID, creates write channel
@@ -106,7 +113,12 @@ pub struct GattServer {
 }
 
 impl GattServer {
-    /// Create a new GATT server (does not start it).
+    /// ID SRS: SRS-FN-BLEGATT-001
+    /// Title: new
+    ///
+    /// Description: VRConnect shall create a new GATT server without starting it.
+    ///
+    /// Version: V1.0
     pub fn new(device_name: String, service_uuid: uuid::Uuid) -> Self {
         let (write_tx, write_rx) = mpsc::unbounded_channel();
         let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel::<BleConnectionEvent>();
@@ -124,7 +136,13 @@ impl GattServer {
         }
     }
 
-    /// Register a characteristic to be created when `start()` is called.
+    /// ID SRS: SRS-FN-BLEGATT-002
+    /// Title: add_characteristic
+    ///
+    /// Description: VRConnect shall register a characteristic to be created when
+    ///              `start()` is called.
+    ///
+    /// Version: V1.0
     pub fn add_characteristic(
         &mut self,
         name: &str,
@@ -140,30 +158,52 @@ impl GattServer {
         self
     }
 
-    /// Set a static read value for a Read characteristic (e.g. Catalog bytes).
-    /// Must be called before `start()`.
+    /// ID SRS: SRS-FN-BLEGATT-003
+    /// Title: set_read_value
+    ///
+    /// Description: VRConnect shall set a static read value for a Read characteristic
+    ///              (e.g. Catalog bytes). Must be called before `start()`.
+    ///
+    /// Version: V1.0
     pub fn set_read_value(&mut self, name: &str, value: Vec<u8>) {
         if let Some(cfg) = self.chars.iter_mut().find(|c| c.name == name) {
             cfg.read_value = Some(value);
         }
     }
 
-    /// Take the write-event receiver. Must be called exactly once before `start()`.
+    /// ID SRS: SRS-FN-BLEGATT-004
+    /// Title: take_write_receiver
+    ///
+    /// Description: VRConnect shall hand over the write-event receiver. Must be
+    ///              called exactly once before `start()`.
+    ///
+    /// Version: V1.0
     pub fn take_write_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<WriteEvent>> {
         self.write_rx.take()
     }
 
-    /// Take the disconnect receiver. Fires `BleConnectionEvent` when the Data_OUT CCCD
-    /// subscriber count changes (Connected when count → ≥ 1, Disconnected when count → 0).
-    /// Must be called exactly once before `start()`.
+    /// ID SRS: SRS-FN-BLEGATT-005
+    /// Title: take_disconnect_receiver
+    ///
+    /// Description: VRConnect shall hand over the disconnect receiver, which fires a
+    ///              `BleConnectionEvent` when the Data_OUT CCCD subscriber count changes
+    ///              (Connected when count → ≥ 1, Disconnected when count → 0). Must be
+    ///              called exactly once before `start()`.
+    ///
+    /// Version: V1.0
     pub fn take_disconnect_receiver(
         &mut self,
     ) -> Option<mpsc::UnboundedReceiver<BleConnectionEvent>> {
         self.disconnect_rx.take()
     }
 
-    /// Start the GATT server: create the Windows BLE service, register characteristic
-    /// handlers, and begin advertising.
+    /// ID SRS: SRS-FN-BLEGATT-006
+    /// Title: start
+    ///
+    /// Description: VRConnect shall start the GATT server: create the Windows BLE
+    ///              service, register characteristic handlers, and begin advertising.
+    ///
+    /// Version: V1.0
     pub async fn start(&mut self) -> Result<()> {
         let service_guid = uuid_to_guid(&self.service_uuid);
 
@@ -380,7 +420,14 @@ impl GattServer {
         Ok(())
     }
 
-    /// Send a notification on a Notify characteristic.
+    /// ID SRS: SRS-FN-BLEGATT-007
+    /// Title: notify
+    ///
+    /// Description: VRConnect shall send a notification on a Notify characteristic,
+    ///              running the blocking NotifyValueAsync().get() wait on the
+    ///              blocking-thread-pool rather than a tokio worker thread.
+    ///
+    /// Version: V1.0
     pub async fn notify(&self, name: &str, data: &[u8]) -> Result<()> {
         let local_char = self
             .local_chars
@@ -445,12 +492,22 @@ impl GattServer {
         Ok(())
     }
 
-    /// Whether the server is currently running.
+    /// ID SRS: SRS-FN-BLEGATT-008
+    /// Title: is_running
+    ///
+    /// Description: VRConnect shall report whether the server is currently running.
+    ///
+    /// Version: V1.0
     pub fn is_running(&self) -> bool {
         self.running
     }
 
-    /// Stop advertising and tear down the GATT service.
+    /// ID SRS: SRS-FN-BLEGATT-009
+    /// Title: stop
+    ///
+    /// Description: VRConnect shall stop advertising and tear down the GATT service.
+    ///
+    /// Version: V1.0
     pub fn stop(&mut self) {
         if let Some(ref provider) = self.provider {
             let _ = provider.StopAdvertising();
@@ -462,12 +519,18 @@ impl GattServer {
     }
 }
 
-/// Fallback teardown for when no caller explicitly calls `stop()` — e.g. the
-/// process exits with the GATT server still running (Ctrl+C shutdown doesn't
-/// currently propagate a signal into the spawned BLE task). Without this,
-/// the Windows GATT provider and BLE advertisement are never deregistered,
-/// and a fast supervised restart risks racing the OS's own cleanup of the
-/// previous advertisement under the same UUID.
+/// ID SRS: SRS-FN-BLEGATT-010
+/// Title: drop
+///
+/// Description: VRConnect shall provide a fallback teardown for when no caller
+///              explicitly calls `stop()` — e.g. the process exits with the GATT
+///              server still running (Ctrl+C shutdown doesn't currently propagate
+///              a signal into the spawned BLE task). Without this, the Windows
+///              GATT provider and BLE advertisement are never deregistered, and a
+///              fast supervised restart risks racing the OS's own cleanup of the
+///              previous advertisement under the same UUID.
+///
+/// Version: V1.0
 impl Drop for GattServer {
     fn drop(&mut self) {
         if self.running {
@@ -480,7 +543,12 @@ impl Drop for GattServer {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a `uuid::Uuid` to a Windows `GUID`.
+/// ID SRS: SRS-FN-BLEGATT-011
+/// Title: uuid_to_guid
+///
+/// Description: VRConnect shall convert a `uuid::Uuid` to a Windows `GUID`.
+///
+/// Version: V1.0
 fn uuid_to_guid(uuid: &uuid::Uuid) -> GUID {
     let b = uuid.as_bytes();
     GUID {
@@ -499,6 +567,8 @@ fn uuid_to_guid(uuid: &uuid::Uuid) -> GUID {
 mod tests {
     use super::*;
 
+    /// ID SRS: SRS-TEST-BLEGATT-001
+    /// Version: V1.0
     #[test]
     fn test_uuid_to_guid() {
         let uuid = uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap();
@@ -509,6 +579,8 @@ mod tests {
         assert_eq!(guid.data4, [0x12, 0x34, 0x12, 0x34, 0x56, 0x78, 0x90, 0xAB]);
     }
 
+    /// ID SRS: SRS-TEST-BLEGATT-002
+    /// Version: V1.0
     #[test]
     fn test_gatt_server_new() {
         let uuid = uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap();
@@ -517,6 +589,8 @@ mod tests {
         assert_eq!(server.device_name, "TestDevice");
     }
 
+    /// ID SRS: SRS-TEST-BLEGATT-003
+    /// Version: V1.0
     #[test]
     fn test_drop_tears_down_running_server_without_panicking() {
         let uuid = uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap();
@@ -527,6 +601,8 @@ mod tests {
         drop(server); // exercises the Drop fallback path added for stop()
     }
 
+    /// ID SRS: SRS-TEST-BLEGATT-004
+    /// Version: V1.0
     #[test]
     fn test_drop_is_harmless_when_never_started() {
         let uuid = uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap();
@@ -535,6 +611,8 @@ mod tests {
         drop(server); // must not call stop()'s teardown a needless time
     }
 
+    /// ID SRS: SRS-TEST-BLEGATT-005
+    /// Version: V1.0
     #[test]
     fn test_add_characteristics() {
         let uuid = uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap();
@@ -555,6 +633,8 @@ mod tests {
         assert_eq!(server.chars[1].name, "Data_IN");
     }
 
+    /// ID SRS: SRS-TEST-BLEGATT-006
+    /// Version: V1.0
     #[test]
     fn test_set_read_value() {
         let uuid = uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap();
@@ -569,6 +649,8 @@ mod tests {
         assert_eq!(server.chars[0].read_value.as_ref().unwrap(), &catalog_data);
     }
 
+    /// ID SRS: SRS-TEST-BLEGATT-007
+    /// Version: V1.0
     #[test]
     fn test_take_write_receiver() {
         let uuid = uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap();
@@ -580,6 +662,8 @@ mod tests {
         assert!(server.take_write_receiver().is_none());
     }
 
+    /// ID SRS: SRS-TEST-BLEGATT-008
+    /// Version: V1.0
     #[test]
     fn test_write_event_channel() {
         let uuid = uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap();
@@ -599,6 +683,8 @@ mod tests {
         assert_eq!(received.data, vec![0x01, 0x02]);
     }
 
+    /// ID SRS: SRS-TEST-BLEGATT-009
+    /// Version: V1.0
     #[test]
     fn test_char_properties() {
         assert_ne!(CharProperty::Read, CharProperty::Write);
@@ -614,6 +700,9 @@ mod send_check {
     // is Send but IBuffer is not — that's why notify()'s spawn_blocking closure
     // builds the IBuffer from raw bytes internally instead of receiving one.
     fn assert_send<T: Send>() {}
+
+    /// ID SRS: SRS-TEST-BLEGATT-010
+    /// Version: V1.0
     #[test]
     fn gatt_server_is_send() {
         assert_send::<super::GattServer>();
