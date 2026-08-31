@@ -114,7 +114,6 @@ impl ReliableBleOutput {
     pub async fn new(
         device_name: String,
         service_uuid_str: String,
-        _update_interval_ms: u64,
         registry: Option<SignalRegistry>,
         health_check_interval_sec: u64,
         health_ble_flow_timeout_sec: u64,
@@ -3829,18 +3828,17 @@ mod tests {
         let ble = ReliableBleOutput::new(
             "Test".to_string(),
             "12345678-1234-1234-1234-1234567890ab".to_string(),
-            0,                      // _update_interval_ms (unused)
-            None,                   // registry (uses default)
-            30,                     // health_check_interval_sec
-            60,                     // health_ble_flow_timeout_sec
+            None, // registry (uses default)
+            30,   // health_check_interval_sec
+            60,   // health_ble_flow_timeout_sec
             "logs/health.json".to_string(),
-            5,                      // ble_grace_period_sec
-            30,                     // ble_supervision_timeout_sec
-            3600,                   // history_checkpoint_interval_sec
-            86400,                  // history_checkpoint_max_age_sec
-            "".to_string(),         // history_checkpoint_path (disabled)
-            21600,                  // history_retention_sec
-            false,                  // wal_enabled
+            5,              // ble_grace_period_sec
+            30,             // ble_supervision_timeout_sec
+            3600,           // history_checkpoint_interval_sec
+            86400,          // history_checkpoint_max_age_sec
+            "".to_string(), // history_checkpoint_path (disabled)
+            21600,          // history_retention_sec
+            false,          // wal_enabled
             "".to_string(),
             30,
             3600,
@@ -4030,7 +4028,6 @@ mod tests {
         ReliableBleOutput::new(
             "Test".to_string(),
             "12345678-1234-1234-1234-1234567890ab".to_string(),
-            0,    // _update_interval_ms (unused)
             None, // registry (uses default)
             30,   // health_check_interval_sec
             60,   // health_ble_flow_timeout_sec
