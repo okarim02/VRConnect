@@ -247,6 +247,47 @@ impl BleSessionState {
         self
     }
 
+    /// ID SRS: SRS-FN-BLESESSION-019
+    /// Title: insert_stream
+    ///
+    /// Description: VRConnect shall insert a new stream, keeping `streams` and
+    ///              `signal_to_stream` in sync. Single choke point for stream
+    ///              creation — replaces what used to be 2 independently-updated
+    ///              insert sites (subscribe, subscribe_with_stream_id), each of
+    ///              which had to remember to update both maps by hand.
+    ///
+    /// Version: V1.0
+    fn insert_stream(&mut self, entry: StreamEntry) {
+        self.signal_to_stream
+            .insert(entry.signal_id, entry.stream_id);
+        self.streams.insert(entry.stream_id, entry);
+    }
+
+    /// ID SRS: SRS-FN-BLESESSION-020
+    /// Title: remove_stream_by_signal
+    ///
+    /// Description: VRConnect shall remove a stream by signal_id, keeping `streams`
+    ///              and `signal_to_stream` in sync. No-op if not subscribed.
+    ///
+    /// Version: V1.0
+    fn remove_stream_by_signal(&mut self, signal_id: u16) {
+        if let Some(stream_id) = self.signal_to_stream.remove(&signal_id) {
+            self.streams.remove(&stream_id);
+        }
+    }
+
+    /// ID SRS: SRS-FN-BLESESSION-021
+    /// Title: clear_streams
+    ///
+    /// Description: VRConnect shall clear all streams, keeping `streams` and
+    ///              `signal_to_stream` in sync.
+    ///
+    /// Version: V1.0
+    fn clear_streams(&mut self) {
+        self.signal_to_stream.clear();
+        self.streams.clear();
+    }
+
     /// ID SRS: SRS-FN-BLESESSION-003
     /// Title: subscribe
     ///
@@ -268,19 +309,15 @@ impl BleSessionState {
         }
         let stream_id = self.next_stream_id;
         self.next_stream_id += 1;
-        self.streams.insert(
+        self.insert_stream(StreamEntry {
             stream_id,
-            StreamEntry {
-                stream_id,
-                signal_id,
-                source_id: 1,
-                last_seq: 0,
-                last_t0_ms: None,
-                tx_buffer: VecDeque::new(),
-                is_replaying: false,
-            },
-        );
-        self.signal_to_stream.insert(signal_id, stream_id);
+            signal_id,
+            source_id: 1,
+            last_seq: 0,
+            last_t0_ms: None,
+            tx_buffer: VecDeque::new(),
+            is_replaying: false,
+        });
         stream_id
     }
 
@@ -294,19 +331,15 @@ impl BleSessionState {
         if self.next_stream_id <= stream_id {
             self.next_stream_id = stream_id + 1;
         }
-        self.streams.insert(
+        self.insert_stream(StreamEntry {
             stream_id,
-            StreamEntry {
-                stream_id,
-                signal_id,
-                source_id: 1,
-                last_seq: 0,
-                last_t0_ms: None,
-                tx_buffer: VecDeque::new(),
-                is_replaying: false,
-            },
-        );
-        self.signal_to_stream.insert(signal_id, stream_id);
+            signal_id,
+            source_id: 1,
+            last_seq: 0,
+            last_t0_ms: None,
+            tx_buffer: VecDeque::new(),
+            is_replaying: false,
+        });
         stream_id
     }
 
@@ -321,9 +354,7 @@ impl BleSessionState {
     /// # Arguments
     /// * `signal_id` - IDT signal identifier to unsubscribe
     pub fn unsubscribe(&mut self, signal_id: u16) {
-        if let Some(stream_id) = self.signal_to_stream.remove(&signal_id) {
-            self.streams.remove(&stream_id);
-        }
+        self.remove_stream_by_signal(signal_id);
     }
 
     /// ID SRS: SRS-FN-BLESESSION-018
@@ -336,8 +367,7 @@ impl BleSessionState {
     ///
     /// Version: V1.0
     pub fn unsubscribe_all(&mut self) {
-        self.signal_to_stream.clear();
-        self.streams.clear();
+        self.clear_streams();
         log::info!("All streams cleared (unsubscribe_all)");
     }
 
@@ -754,8 +784,7 @@ impl BleSessionState {
                 flushed
             );
         }
-        self.signal_to_stream.clear();
-        self.streams.clear();
+        self.clear_streams();
         self.next_stream_id = 1;
         self.current_session_id = self.current_session_id.wrapping_add(1);
         log::info!(
