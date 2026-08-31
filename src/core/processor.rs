@@ -268,13 +268,22 @@ impl VitalProcessor {
             }
         });
 
-        // Both tasks run indefinitely in normal operation; awaiting them here
-        // just means a panic surfaces immediately instead of going unnoticed
-        // until the BLE health payload times out.
+        // ReliableBleOutput::start() returns Ok as soon as setup finishes (background
+        // tasks spawned, GATT server advertising) — it does not block until the BLE
+        // server stops. So an Ok here is normal mid-run behavior, not a shutdown
+        // condition, and must not resolve this future; only a panic (Err) should.
         let ble_task_fut = async {
             match ble_task {
-                Some(handle) => handle.await,
-                None => std::future::pending().await,
+                Some(handle) => match handle.await {
+                    Ok(_) => {
+                        std::future::pending::<std::result::Result<(), tokio::task::JoinError>>()
+                            .await
+                    }
+                    Err(e) => Err(e),
+                },
+                None => {
+                    std::future::pending::<std::result::Result<(), tokio::task::JoinError>>().await
+                }
             }
         };
 
@@ -297,7 +306,7 @@ impl VitalProcessor {
             }
             result = ble_task_fut => {
                 match result {
-                    Ok(_) => log::info!("BLE server task stopped"),
+                    Ok(_) => unreachable!("ble_task_fut only resolves via panic or pending"),
                     Err(e) => log::error!("BLE server task panicked: {}", e),
                 }
             }
