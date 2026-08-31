@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Notify, RwLock};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
 
 /// ID SRS: SRS-MOD-SOCKETIO-001
 /// Title: SocketIOServer
@@ -218,6 +218,57 @@ impl SocketIOServer {
             hn.notify_one();
         }
 
+        // Run the connection body separately from the increment/decrement above so
+        // that a `?`-propagated send failure (e.g. connection response, pong) still
+        // reaches the decrement below instead of skipping it via early return — that
+        // used to leave sio_connection_count stuck above 0 and the BLE health payload
+        // permanently reporting sio=1 even after the client was gone.
+        let result = Self::run_connection(
+            ws_stream,
+            addr,
+            tx,
+            decompressor,
+            cleaner,
+            transformer,
+            debug_enabled,
+            &debug_file,
+        )
+        .await;
+
+        // sio disconnected → decrement counter; clear sio only when last connection closes
+        if let (Some(ref hs), Some(ref hn)) = (&health_state, &health_notify) {
+            let mut g = hs.write().await;
+            g.sio_connection_count = g.sio_connection_count.saturating_sub(1);
+            g.sio_connected = g.sio_connection_count > 0;
+            drop(g);
+            hn.notify_one();
+        }
+
+        log::info!("Connection handler finished for {}", addr);
+        result
+    }
+
+    /// ID SRS: SRS-FN-SOCKETIO-007
+    /// Title: run_connection
+    ///
+    /// Description: VRConnect shall run the Socket.IO message loop for an
+    /// already-upgraded WebSocket connection, split out of `handle_connection`
+    /// so the sio_connection_count decrement in the caller always runs on the
+    /// way out, regardless of which `?` (if any) ends this function early.
+    ///
+    /// Version: V1.0
+    #[cfg(not(tarpaulin_include))] // Requires real WebSocket connection, integration test only
+    #[allow(clippy::too_many_arguments)]
+    async fn run_connection(
+        ws_stream: WebSocketStream<TcpStream>,
+        addr: SocketAddr,
+        tx: Arc<mpsc::UnboundedSender<ProcessedData>>,
+        decompressor: Arc<VitalDataDecompressor>,
+        cleaner: Arc<VitalDataCleaner>,
+        transformer: Arc<VitalDataTransformer>,
+        debug_enabled: bool,
+        debug_file: &Arc<RwLock<Option<File>>>,
+    ) -> Result<()> {
         let (mut write, mut read) = ws_stream.split();
 
         // Send Socket.IO connection response (Engine.IO v4)
@@ -327,7 +378,7 @@ impl SocketIOServer {
                             &cleaner,
                             &transformer,
                             debug_enabled,
-                            &debug_file,
+                            debug_file,
                         )
                         .await
                         {
@@ -367,16 +418,6 @@ impl SocketIOServer {
             }
         }
 
-        // sio disconnected → decrement counter; clear sio only when last connection closes
-        if let (Some(ref hs), Some(ref hn)) = (&health_state, &health_notify) {
-            let mut g = hs.write().await;
-            g.sio_connection_count = g.sio_connection_count.saturating_sub(1);
-            g.sio_connected = g.sio_connection_count > 0;
-            drop(g);
-            hn.notify_one();
-        }
-
-        log::info!("Connection handler finished for {}", addr);
         Ok(())
     }
 
