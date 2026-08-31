@@ -198,10 +198,12 @@ pub async fn maybe_network_jitter(file_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     /// ID SRS: SRS-TEST-CHAOS-001
     /// Version: V1.0
     #[test]
+    #[serial]
     fn unset_app_env_disables_chaos_even_with_master_switch_on() {
         std::env::remove_var("APP_ENV");
         std::env::set_var("ENABLE_CHAOS_MONKEY", "true");
@@ -212,6 +214,7 @@ mod tests {
     /// ID SRS: SRS-TEST-CHAOS-002
     /// Version: V1.0
     #[test]
+    #[serial]
     fn production_app_env_disables_chaos_even_with_master_switch_on() {
         std::env::set_var("APP_ENV", "production");
         std::env::set_var("ENABLE_CHAOS_MONKEY", "true");
@@ -223,6 +226,7 @@ mod tests {
     /// ID SRS: SRS-TEST-CHAOS-003
     /// Version: V1.0
     #[test]
+    #[serial]
     fn explicit_development_app_env_allows_chaos_when_switch_on() {
         std::env::set_var("APP_ENV", "development");
         std::env::set_var("ENABLE_CHAOS_MONKEY", "true");
@@ -234,6 +238,7 @@ mod tests {
     /// ID SRS: SRS-TEST-CHAOS-004
     /// Version: V1.0
     #[test]
+    #[serial]
     fn startup_status_none_when_master_switch_off() {
         std::env::set_var("APP_ENV", "development");
         std::env::remove_var("ENABLE_CHAOS_MONKEY");
