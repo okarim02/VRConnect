@@ -597,6 +597,17 @@ impl Config {
             return Err("health_ble_flow_timeout_sec must be greater than 0".to_string());
         }
 
+        // Validate WAL config — tokio::time::interval() panics on a zero duration,
+        // which would otherwise surface as a silent death of the spawned wal_task.
+        if self.wal_enabled {
+            if self.wal_fsync_interval_sec == 0 {
+                return Err("wal_fsync_interval_sec must be greater than 0".to_string());
+            }
+            if self.wal_compaction_interval_sec == 0 {
+                return Err("wal_compaction_interval_sec must be greater than 0".to_string());
+            }
+        }
+
         // Validate log level
         let valid_levels = ["SUCCESS", "INFO", "WARNING", "ERROR", "DEBUG"];
         if !valid_levels.contains(&self.log_level.to_uppercase().as_str()) {
@@ -957,6 +968,30 @@ mod tests {
         assert!(config.validate().is_err());
 
         config.output_file_base_path = "./data/test".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    /// ID SRS: SRS-TEST-CFG-WAL-002
+    /// Version: V1.0
+    #[test]
+    fn test_wal_validation() {
+        let mut config = create_test_config();
+        config.wal_enabled = true;
+
+        config.wal_fsync_interval_sec = 0;
+        assert!(config.validate().is_err());
+
+        config.wal_fsync_interval_sec = 2;
+        config.wal_compaction_interval_sec = 0;
+        assert!(config.validate().is_err());
+
+        config.wal_compaction_interval_sec = 3600;
+        assert!(config.validate().is_ok());
+
+        // Zero intervals are fine when WAL is disabled — never reached by wal_task.
+        config.wal_enabled = false;
+        config.wal_fsync_interval_sec = 0;
+        config.wal_compaction_interval_sec = 0;
         assert!(config.validate().is_ok());
     }
 
