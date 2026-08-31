@@ -4,6 +4,7 @@
 
 use vrconnect::config::Config;
 use vrconnect::core::VitalProcessor;
+use vrconnect::utils::chaos;
 use vrconnect::utils::logger::Logger;
 
 /// ID SRS: SRS-MAIN-001
@@ -28,6 +29,13 @@ async fn main() {
     }
 
     log::info!("VRConnect v1.0.0 starting...");
+
+    // Chaos Monkey is fail-safe by design (see utils::chaos::is_enabled), but log
+    // loudly if it's somehow active anyway — defense in depth against a
+    // misconfigured .env reaching a real deployment.
+    if let Some(status) = chaos::startup_status() {
+        log::warn!("[CHAOS] Fault injection is ACTIVE at startup — {}", status);
+    }
 
     // Print banner
     print_banner(&config);
@@ -133,6 +141,12 @@ fn print_banner(config: &Config) {
 
     println!("  Log Level:        {}", config.log_level);
     println!("  Log Directory:    {}", config.log_dir);
+
+    if let Some(status) = chaos::startup_status() {
+        println!("{}", "═".repeat(70));
+        println!("  ⚠ CHAOS MONKEY ACTIVE — {}", status);
+    }
+
     println!("{}", "═".repeat(70));
     println!("  Press Ctrl+C to stop");
     println!("{}\n", "═".repeat(70));

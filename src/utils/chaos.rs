@@ -3,7 +3,9 @@
 // Purpose: Chaos Monkey — probabilistic fault injection for non-production testing.
 //
 // Env variables:
-//   APP_ENV              — set to "production"/"prod" to permanently disable all chaos.
+//   APP_ENV              — must be explicitly "development"/"dev"/"staging"/"test"/"local"
+//                           for chaos to ever run. Fail-safe: unset, empty, "production",
+//                           "prod", or any unrecognized value disables all chaos.
 //   ENABLE_CHAOS_MONKEY  — "true" to activate (master switch). Default: false.
 //   CHAOS_RATIO          — trigger probability per check point, 0.0–1.0. Default: 0.1.
 //   CHAOS_DISK_FULL      — "true" to enable disk-full simulation in file output.
@@ -27,12 +29,23 @@ static CHAOS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Returns `true` if chaos is globally active:
-///   - `APP_ENV` is NOT "production" / "prod"   (safety guardrail)
+///   - `APP_ENV` is explicitly one of a known non-production value (allow-list
+///     guardrail — fail-safe: unset, empty, or unrecognized `APP_ENV` disables
+///     chaos, same as "production" does. This is the opposite of a deny-list on
+///     "production"/"prod" alone, which would stay active if `APP_ENV` were simply
+///     never set — the default state of a freshly copied `.env` file)
 ///   - `ENABLE_CHAOS_MONKEY=true`               (master switch)
 fn is_enabled() -> bool {
-    // Safety guardrail: never run in production.
-    let app_env = std::env::var("APP_ENV").unwrap_or_default();
-    if matches!(app_env.to_lowercase().as_str(), "production" | "prod") {
+    // Safety guardrail: only ever run when APP_ENV explicitly opts in to a
+    // known non-production environment. A missing/unset APP_ENV — e.g. a
+    // staging .env copied to a production host without editing it — is
+    // treated the same as production: chaos stays off.
+    let app_env = std::env::var("APP_ENV").unwrap_or_default().to_lowercase();
+    let is_known_non_production = matches!(
+        app_env.as_str(),
+        "development" | "dev" | "staging" | "test" | "local"
+    );
+    if !is_known_non_production {
         return false;
     }
 
@@ -60,6 +73,44 @@ fn should_trigger() -> bool {
 
     let c = CHAOS_COUNTER.fetch_add(1, Ordering::Relaxed);
     c % 100 < threshold
+}
+
+/// Returns a human-readable summary of active chaos modes for startup logging,
+/// or `None` when chaos is fully inactive (the expected state in production).
+///
+/// Called once at startup so an operator sees an unmissable log/console line
+/// if a misconfigured `.env` left chaos active — defense in depth on top of
+/// the `is_enabled()` guardrail itself.
+pub fn startup_status() -> Option<String> {
+    if !is_enabled() {
+        return None;
+    }
+
+    let mut modes = Vec::new();
+    if std::env::var("CHAOS_DISK_FULL")
+        .ok()
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(false)
+    {
+        modes.push("DiskFull");
+    }
+    if std::env::var("CHAOS_NETWORK_JITTER")
+        .ok()
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(false)
+    {
+        modes.push("NetworkJitter");
+    }
+    // PacketDrop has no separate per-mode toggle — it's active whenever the
+    // master switch is, unlike DiskFull/NetworkJitter which need an extra flag.
+    modes.push("PacketDrop");
+
+    let app_env = std::env::var("APP_ENV").unwrap_or_default();
+    Some(format!(
+        "ENABLE_CHAOS_MONKEY=true, APP_ENV={:?}, modes=[{}]",
+        app_env,
+        modes.join(", ")
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -142,4 +193,51 @@ pub async fn maybe_network_jitter(file_name: &str) {
         file_name
     );
     tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ID SRS: SRS-TEST-CHAOS-001
+    /// Version: V1.0
+    #[test]
+    fn unset_app_env_disables_chaos_even_with_master_switch_on() {
+        std::env::remove_var("APP_ENV");
+        std::env::set_var("ENABLE_CHAOS_MONKEY", "true");
+        assert!(!is_enabled());
+        std::env::remove_var("ENABLE_CHAOS_MONKEY");
+    }
+
+    /// ID SRS: SRS-TEST-CHAOS-002
+    /// Version: V1.0
+    #[test]
+    fn production_app_env_disables_chaos_even_with_master_switch_on() {
+        std::env::set_var("APP_ENV", "production");
+        std::env::set_var("ENABLE_CHAOS_MONKEY", "true");
+        assert!(!is_enabled());
+        std::env::remove_var("APP_ENV");
+        std::env::remove_var("ENABLE_CHAOS_MONKEY");
+    }
+
+    /// ID SRS: SRS-TEST-CHAOS-003
+    /// Version: V1.0
+    #[test]
+    fn explicit_development_app_env_allows_chaos_when_switch_on() {
+        std::env::set_var("APP_ENV", "development");
+        std::env::set_var("ENABLE_CHAOS_MONKEY", "true");
+        assert!(is_enabled());
+        std::env::remove_var("APP_ENV");
+        std::env::remove_var("ENABLE_CHAOS_MONKEY");
+    }
+
+    /// ID SRS: SRS-TEST-CHAOS-004
+    /// Version: V1.0
+    #[test]
+    fn startup_status_none_when_master_switch_off() {
+        std::env::set_var("APP_ENV", "development");
+        std::env::remove_var("ENABLE_CHAOS_MONKEY");
+        assert_eq!(startup_status(), None);
+        std::env::remove_var("APP_ENV");
+    }
 }
