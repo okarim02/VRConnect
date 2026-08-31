@@ -2209,6 +2209,7 @@ mod tests {
     // ── UUID / build ──────────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLERELIABLE-001
+    /// Version: V1.0
     /// Title: Test UUID building
     #[test]
     fn test_build_char_uuid() {
@@ -2221,6 +2222,7 @@ mod tests {
     // ── Catalog ───────────────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLERELIABLE-002
+    /// Version: V1.0
     /// Title: Test catalog serialization (IDT TLV format)
     #[test]
     fn test_serialize_catalog() {
@@ -2239,6 +2241,7 @@ mod tests {
     // ── extract_signal_values ─────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLERELIABLE-003
+    /// Version: V1.0
     /// Title: Test signal value extraction uses IDT signal IDs
     #[test]
     fn test_extract_signal_values() {
@@ -2267,6 +2270,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-004
+    /// Version: V1.0
     /// Title: Test room filtering (only room_index=0 is processed)
     #[test]
     fn test_room_filtering() {
@@ -2291,6 +2295,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-005
+    /// Version: V1.0
     /// Title: Test case-insensitive signal matching
     #[test]
     fn test_case_insensitive_matching() {
@@ -2312,6 +2317,7 @@ mod tests {
     // ── Session state helpers ─────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLERELIABLE-006
+    /// Version: V1.0
     /// Title: Test ACK dispatch purges retransmit buffer
     #[tokio::test]
     async fn test_write_handler_ack_dispatch() {
@@ -2340,6 +2346,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-007
+    /// Version: V1.0
     /// Title: Test subscribe/unsubscribe via IDT signal IDs
     #[tokio::test]
     async fn test_subscribe_unsubscribe_via_signal_id() {
@@ -2358,6 +2365,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-008
+    /// Version: V1.0
     /// Title: Test SUBSCRIBE_REQ IDT payload parsing
     ///
     /// Description: A valid IDT SUBSCRIBE_REQ for SpO2 (0x0102) shall be parsed
@@ -2375,6 +2383,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-009
+    /// Version: V1.0
     /// Title: Test NACK triggers retransmit with FLAG_RETRANSMIT
     #[tokio::test]
     async fn test_nack_triggers_retransmit() {
@@ -2404,6 +2413,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-010
+    /// Version: V1.0
     /// Title: SUBSCRIBE_RSP sent on Data_OUT as full 24-byte IDT frame [DEV-6]
     ///
     /// Description: Flutter v2 routes msgType=0x02 on Data_OUT to _handleSubscribeResponse(),
@@ -2460,6 +2470,7 @@ mod tests {
     // ── Signal name alias coverage ────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLERELIABLE-011
+    /// Version: V1.0
     /// Title: Test all VitalRecorder signal name aliases are matched
     ///
     /// Description: extract_signal_values shall recognise every alias for SpO2
@@ -2501,6 +2512,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-012
+    /// Version: V1.0
     /// Title: Test unknown signal names produce no output
     ///
     /// Description: Tracks whose names are not in the signal map must be silently
@@ -2521,6 +2533,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-013
+    /// Version: V1.0
     /// Title: Test extract_signal_values uses display_value when raw_value is None
     ///
     /// Description: If raw_value is None, the track's display_value string shall be
@@ -2546,6 +2559,7 @@ mod tests {
     // ── FLAG_BACKLOG on outgoing frames ───────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLERELIABLE-015
+    /// Version: V1.0
     /// Title: Live frames must NOT carry FLAG_BACKLOG outside of replay
     ///
     /// Description: FLAG_BACKLOG is restricted to historical-replay frames only
@@ -2580,6 +2594,7 @@ mod tests {
     // ── Selective ACK bitmap retransmit ───────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLERELIABLE-016
+    /// Version: V1.0
     /// Title: Test handle_ack_with_bitmap returns lost frames for retransmission
     ///
     /// Description: 4 frames buffered (seq 1-4). ACK: ack_upto=1, bitmap
@@ -2620,6 +2635,7 @@ mod tests {
     // ── subscribe_with_stream_id ──────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLERELIABLE-017
+    /// Version: V1.0
     /// Title: Test subscribe_with_stream_id assigns IDs 1, 2, 3 for HR/SpO2/Temp
     ///
     /// Description: subscribe_with_stream_id with preferred_stream_id = 1, 2, 3.
@@ -2641,6 +2657,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-018
+    /// Version: V1.0
     /// build_char_uuid returns Err when the resulting string is not a valid UUID
     #[test]
     fn test_build_char_uuid_invalid_base_returns_error() {
@@ -2650,6 +2667,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-019
+    /// Version: V1.0
     /// extract_signal_values with room 0 having no tracks returns an empty Vec
     #[test]
     fn test_extract_signal_values_empty_tracks() {
@@ -2667,6 +2685,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-020
+    /// Version: V1.0
     /// extract_signal_values skips a track when raw_value is None and display_value
     /// cannot be parsed as f32 (e.g., "N/A")
     #[test]
@@ -2689,6 +2708,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-021
+    /// Version: V1.0
     /// extract_signal_values returns an empty Vec when no rooms are present
     #[test]
     fn test_extract_signal_values_no_rooms() {
@@ -2698,6 +2718,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-022
+    /// Version: V1.0
     /// extract_signal_values correctly maps "BT" (an alias) to Temperature signal_id
     #[test]
     fn test_extract_signal_values_bt_alias_maps_to_temperature() {
@@ -2719,6 +2740,7 @@ mod tests {
     // objects that the async handlers use internally.
 
     /// ID SRS: SRS-TEST-BLERELIABLE-023
+    /// Version: V1.0
     /// normalize_id returns None for IDs that must be rejected by subscribe handlers
     ///
     /// Validates the `normalize_id(unknown) → None → warn+skip` guard used in both
@@ -2746,6 +2768,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-024
+    /// Version: V1.0
     /// After normalize_id succeeds, registry.get(canonical) returns correct metadata
     ///
     /// Validates the invariant relied upon by both subscribe handlers:
@@ -2767,6 +2790,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-025
+    /// Version: V1.0
     /// Full normalized-subscribe path: legacy raw_id=1 → 0x0101 → state tracks canonical ID
     ///
     /// Validates that subscribe_with_stream_id(canonical, preferred) records the subscription
@@ -2798,6 +2822,7 @@ mod tests {
     // ── HistoryBuffer / replay integration ───────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLERELIABLE-026
+    /// Version: V1.0
     /// Title: output() feeds history buffer regardless of subscription state
     ///
     /// Description: record_history must be called for every incoming sample in output(),
@@ -2839,6 +2864,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-027
+    /// Version: V1.0
     /// Title: start_replay returns FLAG_BACKLOG frames; live frames never carry FLAG_BACKLOG
     ///
     /// Description: After subscribing and seeding history, start_replay() must return
@@ -2894,6 +2920,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-043
+    /// Version: V1.0
     /// Title: Replay interleaves frames from multiple signals sorted by timestamp
     ///
     /// Description: When two signals are replayed simultaneously, their frames must be
@@ -2961,6 +2988,7 @@ mod tests {
     // ── Control pull-request (health on demand) ───────────────────────────────
 
     /// ID SRS: SRS-TEST-BLERELIABLE-029
+    /// Version: V1.0
     /// Title: Control write triggers immediate health_notify
     ///
     /// Description: Any write on the Control characteristic shall call notify_one()
@@ -3011,6 +3039,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-030
+    /// Version: V1.0
     /// Title: Control write content is ignored — any payload triggers health push
     ///
     /// Description: Writes of [0x00], [0xFF], and [] (empty) on Control must all
@@ -3064,6 +3093,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-031
+    /// Version: V1.0
     /// Title: Concurrent health event + pull request coalesce — health_task wakes once
     ///
     /// Description: tokio::Notify stores at most one permit. Two consecutive notify_one()
@@ -3201,6 +3231,7 @@ mod tests {
     // BleSessionState operations the async handlers perform internally.
 
     /// ID SRS: SRS-TEST-BLERELIABLE-032
+    /// Version: V1.0
     /// Title: SUB_OP_SUBSCRIBE path: unsubscribe_all then subscribe replaces prior set
     ///
     /// Description: Mirrors handle_subscribe_req (op=SUBSCRIBE): pre-subscribed HR+SpO2,
@@ -3240,6 +3271,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-033
+    /// Version: V1.0
     /// Title: SUB_OP_UNSUBSCRIBE path: no unsubscribe_all, only individual removal
     ///
     /// Description: Mirrors handle_subscribe_req (op=UNSUBSCRIBE): pre-subscribed HR+SpO2,
@@ -3280,6 +3312,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLERELIABLE-034
+    /// Version: V1.0
     /// Title: TLV-subscribe path: unsubscribe_all + subscribe_with_stream_id replaces prior set
     ///
     /// Description: Mirrors handle_tlv_subscribe: pre-subscribed HR+SpO2, then

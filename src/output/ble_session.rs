@@ -933,6 +933,7 @@ mod tests {
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-001
+    /// Version: V1.0
     /// Title: Test session creation
     ///
     /// Description: BleSessionState::new shall start with no streams and next_stream_id=1.
@@ -947,6 +948,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-002
+    /// Version: V1.0
     /// Title: Test subscribe allocates stream_id
     ///
     /// Description: subscribe(0x0101) shall allocate stream_id=1 for the first signal.
@@ -961,6 +963,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-003
+    /// Version: V1.0
     /// Title: Test subscribe is idempotent
     ///
     /// Description: Calling subscribe twice for the same signal_id shall return
@@ -976,6 +979,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-004
+    /// Version: V1.0
     /// Title: Test unsubscribe removes stream
     ///
     /// Description: unsubscribe shall remove both the StreamEntry and the signal→stream mapping.
@@ -994,6 +998,7 @@ mod tests {
     // ── add_data ──────────────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-005
+    /// Version: V1.0
     /// Title: Test add_data returns None when not subscribed
     #[test]
     fn test_add_data_no_subscription() {
@@ -1004,6 +1009,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-006
+    /// Version: V1.0
     /// Title: Test add_data produces a valid IDT DATA_FRAME
     ///
     /// Description: The returned DataFrame shall carry the correct IDT magic, msg_type,
@@ -1031,6 +1037,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-007
+    /// Version: V1.0
     /// Title: Test sequence number increments per stream
     ///
     /// Description: Three successive add_data calls on the same signal shall produce
@@ -1052,6 +1059,7 @@ mod tests {
     // ── handle_ack ────────────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-008
+    /// Version: V1.0
     /// Title: Test handle_ack purges acknowledged frames
     ///
     /// Description: handle_ack(ack_upto=3) on a buffer of 5 frames shall leave
@@ -1075,6 +1083,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-009
+    /// Version: V1.0
     /// Title: Test handle_ack with new session_id resets all buffers
     ///
     /// Description: If session_id in the ACK differs from current_session_id, all
@@ -1101,6 +1110,7 @@ mod tests {
     // ── handle_nack ───────────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-010
+    /// Version: V1.0
     /// Title: Test handle_nack returns frames with FLAG_RETRANSMIT
     ///
     /// Description: handle_nack for seq=2 shall return exactly that frame with
@@ -1130,6 +1140,7 @@ mod tests {
     // ── Buffer size limit ─────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-011
+    /// Version: V1.0
     /// Title: Test buffer size limit evicts oldest frames
     ///
     /// Description: with_buffer_size(3) followed by 5 add_data calls shall retain
@@ -1152,6 +1163,7 @@ mod tests {
     // ── Multi-signal ──────────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-012
+    /// Version: V1.0
     /// Title: Test multiple signals get independent streams and sequence counters
     ///
     /// Description: HR and SpO2 shall receive distinct stream_ids and independent
@@ -1179,6 +1191,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-013
+    /// Version: V1.0
     /// Title: Test get_stream_id returns correct stream_id
     #[test]
     fn test_get_stream_id() {
@@ -1190,6 +1203,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-014
+    /// Version: V1.0
     /// Title: Test total_pending sums all stream buffers
     ///
     /// Description: 2 HR frames + 1 SpO2 frame → total_pending = 3.
@@ -1211,6 +1225,7 @@ mod tests {
     // ── subscribe_with_stream_id ───────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-015
+    /// Version: V1.0
     /// Title: Test subscribe_with_stream_id assigns the preferred stream_id
     ///
     /// Description: Calling subscribe_with_stream_id(HR, 5) shall allocate stream_id=5,
@@ -1225,6 +1240,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-016
+    /// Version: V1.0
     /// Title: Test subscribe_with_stream_id is idempotent
     ///
     /// Description: A second call with the same signal_id must return the first
@@ -1241,6 +1257,7 @@ mod tests {
     // ── FLAG_BACKLOG behaviour ─────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-017
+    /// Version: V1.0
     /// Title: Test FLAG_BACKLOG is NOT set on normal live frames
     ///
     /// Description: FLAG_BACKLOG must NOT be set on live DATA_FRAMEs when the stream
@@ -1270,6 +1287,7 @@ mod tests {
     // ── reset_session ─────────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-018
+    /// Version: V1.0
     /// Title: Test reset_session clears all buffers and sequence counters
     ///
     /// Description: After reset_session(99), all stream buffers must be empty,
@@ -1300,6 +1318,7 @@ mod tests {
     // ── handle_nack edge cases ────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-019
+    /// Version: V1.0
     /// Title: Test handle_nack returns empty Vec for unknown stream_id
     #[test]
     fn test_handle_nack_unknown_stream() {
@@ -1309,6 +1328,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-020
+    /// Version: V1.0
     /// Title: Test handle_nack for seq not in buffer returns empty Vec
     ///
     /// Description: If the requested seq has already been evicted (buffer capped),
@@ -1330,6 +1350,7 @@ mod tests {
     // ── handle_ack_with_bitmap ────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-021
+    /// Version: V1.0
     /// Title: Test handle_ack_with_bitmap purges cumulatively acknowledged frames
     ///
     /// Description: ack_upto=3 with all-zero bitmap must purge seq 1,2,3 and leave
@@ -1354,6 +1375,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-022
+    /// Version: V1.0
     /// Title: Test handle_ack_with_bitmap detects a hole and returns retransmit
     ///
     /// Description: 5 frames buffered (seq 1-5). ack_upto=1, bitmap has bit1 set
@@ -1384,6 +1406,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-023
+    /// Version: V1.0
     /// Title: Test handle_ack_with_bitmap with all-zero bitmap and no highest_acked_offset
     ///
     /// Description: When bitmap is all zeros (no out-of-order frames confirmed),
@@ -1411,6 +1434,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-024
+    /// Version: V1.0
     /// Title: Test handle_ack_with_bitmap new session_id resets all streams
     ///
     /// Description: If session_id in the bitmap-ACK differs from current_session_id,
@@ -1434,6 +1458,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-025
+    /// Version: V1.0
     /// subscribe_with_stream_id does NOT advance next_stream_id when preferred_id < current next
     #[test]
     fn test_subscribe_with_stream_id_lower_than_next_does_not_advance() {
@@ -1457,6 +1482,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-026
+    /// Version: V1.0
     /// subscribe_with_stream_id with preferred_id < next does not advance counter (fresh signal)
     #[test]
     fn test_subscribe_with_stream_id_preferred_lower_than_next_fresh() {
@@ -1473,6 +1499,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-027
+    /// Version: V1.0
     /// unsubscribe on a signal_id that was never subscribed is a silent no-op
     #[test]
     fn test_unsubscribe_noop_on_never_subscribed() {
@@ -1488,6 +1515,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-028
+    /// Version: V1.0
     /// handle_ack with an unknown stream_id is a silent no-op (no panic, no state change)
     #[test]
     fn test_handle_ack_unknown_stream_id_noop() {
@@ -1507,6 +1535,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-029
+    /// Version: V1.0
     /// get_pending_count for a signal_id that was never subscribed returns 0
     #[test]
     fn test_get_pending_count_unsubscribed_returns_zero() {
@@ -1517,6 +1546,7 @@ mod tests {
     // ── unsubscribe_all ───────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-031
+    /// Version: V1.0
     /// Title: unsubscribe_all clears all maps
     ///
     /// Description: After subscribing HR+SpO2 and calling unsubscribe_all(), both
@@ -1542,6 +1572,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-032
+    /// Version: V1.0
     /// Title: unsubscribe_all then re-subscribe leaves only the new signal
     ///
     /// Description: Subscribe HR+SpO2, call unsubscribe_all(), then subscribe only HR.
@@ -1570,6 +1601,7 @@ mod tests {
     // ── on_disconnect ─────────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLESESSION-033
+    /// Version: V1.0
     /// Title: on_disconnect clears all streams and signal mappings
     ///
     /// Description: After subscribing HR+SpO2 and calling on_disconnect(),
@@ -1595,6 +1627,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-034
+    /// Version: V1.0
     /// Title: on_disconnect increments session_id by 1 (wrapping)
     ///
     /// Description: session_id shall be wrapping_add(1) after on_disconnect.
@@ -1611,6 +1644,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-035
+    /// Version: V1.0
     /// Title: on_disconnect resets next_stream_id to 1
     ///
     /// Description: After on_disconnect, the stream_id allocator resets so the
@@ -1631,6 +1665,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-036
+    /// Version: V1.0
     /// Title: Double on_disconnect is safe (no panic, increments session_id twice)
     ///
     /// Description: Calling on_disconnect twice consecutively must not panic.
@@ -1652,6 +1687,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLESESSION-030
+    /// Version: V1.0
     /// handle_ack_with_bitmap with unknown stream_id returns empty Vec (no panic)
     #[test]
     fn test_handle_ack_with_bitmap_unknown_stream_noop() {

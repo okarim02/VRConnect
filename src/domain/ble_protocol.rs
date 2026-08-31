@@ -19,6 +19,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// ID SRS: SRS-MOD-BLEPROTOCOL-001
+/// Version: V1.0
 /// Magic number identifying every IDT frame (bytes [0..2] LE = 0x7A 0xD1)
 pub const IDT_MAGIC: u16 = 0xD17A;
 
@@ -57,6 +58,7 @@ pub const SUB_OP_UNSUBSCRIBE: u8 = 2;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// ID SRS: SRS-MOD-BLEPROTOCOL-002
+/// Version: V1.0
 /// IDT signal identifiers per PDF signal allocation table
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -181,6 +183,7 @@ impl SignalId {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// ID SRS: SRS-MOD-BLEPROTOCOL-003
+/// Version: V1.0
 /// IDT frame header — exactly 13 bytes, little-endian.
 /// Matches app's decodeHeader() which reads magic→version→msg_type→flags→
 /// session_id→stream_id→seq and then immediately reads t0ms (no payload_len field).
@@ -258,6 +261,7 @@ impl IdtHeader {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// ID SRS: SRS-MOD-BLEPROTOCOL-004
+/// Version: V1.0
 /// IDT DATA_FRAME for a single float32 sample (count=1).
 ///
 /// Wire format (34 bytes total — [TODO-1 resolved] CRC32C appended):
@@ -357,6 +361,7 @@ impl DataFrame {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// ID SRS: SRS-MOD-BLEPROTOCOL-005
+/// Version: V1.0
 /// Cumulative + selective ACK from the BLE Central.
 ///
 /// IDT wire format (30 bytes):
@@ -537,6 +542,7 @@ impl AckFrame {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// ID SRS: SRS-MOD-BLEPROTOCOL-006
+/// Version: V1.0
 /// Explicit NACK from the BLE Central requesting retransmission of specific frames.
 ///
 /// Wire format:
@@ -623,6 +629,7 @@ impl SubscribeItem {
 }
 
 /// ID SRS: SRS-MOD-BLEPROTOCOL-007
+/// Version: V1.0
 /// SUBSCRIBE_REQ frame from the BLE Central.
 ///
 /// Payload: [req_id(2b)] [op(1b)] [n(1b)] [items[n × 17b]]
@@ -797,6 +804,7 @@ impl SubscribeRspItem {
 }
 
 /// ID SRS: SRS-MOD-BLEPROTOCOL-008
+/// Version: V1.0
 /// SUBSCRIBE_RSP frame sent by VRConnect on Data_OUT characteristic.
 ///
 /// Payload: [req_id(2b)] [status(1b)] [n(1b)] [results[n × 10b]]
@@ -995,6 +1003,7 @@ pub struct CatalogEntry {
 }
 
 /// ID SRS: SRS-MOD-BLEPROTOCOL-009
+/// Version: V1.0
 /// Available signal catalog, read by the BLE Central at connection time.
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -1064,6 +1073,7 @@ impl Catalog {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// ID SRS: SRS-MOD-BLEPROTOCOL-010
+/// Version: V1.0
 /// Dispatches inbound BLE writes by msg_type.
 pub enum InboundFrame {
     Ack(AckFrame),
@@ -1402,6 +1412,7 @@ mod tests {
     // ── SignalId tests ────────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-001
+    /// Version: V1.0
     #[test]
     fn test_signal_id_new_values() {
         assert_eq!(SignalId::HR.as_u16(), 0x0101);
@@ -1410,6 +1421,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-002
+    /// Version: V1.0
     #[test]
     fn test_signal_id_from_u16_roundtrip() {
         // IDT compound IDs (primary spec)
@@ -1432,6 +1444,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-003
+    /// Version: V1.0
     #[test]
     fn test_signal_id_metadata() {
         assert_eq!(SignalId::HR.name(), "HR");
@@ -1459,6 +1472,7 @@ mod tests {
     // ── IdtHeader tests ───────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-004
+    /// Version: V1.0
     #[test]
     fn test_idt_header_byte_layout() {
         let h = IdtHeader::new_data(42, 7, 100);
@@ -1477,6 +1491,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-005
+    /// Version: V1.0
     #[test]
     fn test_idt_header_magic_mismatch() {
         let mut b = IdtHeader::new_data(1, 1, 1).to_bytes();
@@ -1485,6 +1500,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-006
+    /// Version: V1.0
     #[test]
     fn test_idt_header_roundtrip() {
         let original = IdtHeader::new_data(5, 3, 999);
@@ -1495,6 +1511,7 @@ mod tests {
     // ── DataFrame tests ───────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-007
+    /// Version: V1.0
     #[test]
     fn test_data_frame_total_length() {
         let frame = DataFrame::new(1, 1, 1, 0, 65.0);
@@ -1503,6 +1520,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-008
+    /// Version: V1.0
     #[test]
     fn test_data_frame_byte_layout() {
         let t0_ms: u64 = 1_700_000_000_000;
@@ -1538,6 +1556,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-009
+    /// Version: V1.0
     /// Data frame with corrupted magic returns None from from_ble_bytes
     #[test]
     fn test_data_frame_bad_magic() {
@@ -1547,6 +1566,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-010
+    /// Version: V1.0
     #[test]
     fn test_data_frame_roundtrip() {
         let original = DataFrame::new(3, 2, 42, 1_700_000_000_123, 98.6);
@@ -1562,6 +1582,7 @@ mod tests {
     // ── AckFrame tests ────────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-011
+    /// Version: V1.0
     /// ACK_FRAME total wire length is 30 bytes (IDT header + payload + CRC32C)
     #[test]
     fn test_ack_frame_total_len() {
@@ -1569,6 +1590,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-012
+    /// Version: V1.0
     #[test]
     fn test_ack_frame_parse() {
         let bytes = make_ack_frame_bytes(1, 2, 99);
@@ -1579,6 +1601,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-013
+    /// Version: V1.0
     /// ACK_FRAME that is too short returns None
     #[test]
     fn test_ack_frame_too_short() {
@@ -1589,6 +1612,7 @@ mod tests {
     // ── NackFrame tests ───────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-014
+    /// Version: V1.0
     #[test]
     fn test_nack_frame_parse() {
         let seqs = [3u32, 7u32];
@@ -1602,6 +1626,7 @@ mod tests {
     // ── SubscribeReq tests ────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-015
+    /// Version: V1.0
     #[test]
     fn test_subscribe_req_parse_subscribe() {
         let items = [(1u8, 0x0101u16)]; // source=1, HR
@@ -1615,6 +1640,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-016
+    /// Version: V1.0
     #[test]
     fn test_subscribe_req_parse_unsubscribe() {
         let items = [(1u8, 0x0102u16)]; // source=1, SpO2
@@ -1627,6 +1653,7 @@ mod tests {
     // ── SubscribeRsp tests ────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-017
+    /// Version: V1.0
     #[test]
     fn test_subscribe_rsp_bytes() {
         let rsp = SubscribeRsp {
@@ -1652,6 +1679,7 @@ mod tests {
     // ── Catalog tests ─────────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-018
+    /// Version: V1.0
     #[test]
     fn test_catalog_default_medical() {
         let catalog = Catalog::default_medical_catalog();
@@ -1671,6 +1699,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-019
+    /// Version: V1.0
     #[test]
     fn test_catalog_to_ble_bytes() {
         let catalog = Catalog::default_medical_catalog();
@@ -1691,6 +1720,7 @@ mod tests {
     // ── InboundFrame dispatch tests ───────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-020
+    /// Version: V1.0
     /// IDT ACK_FRAME is routed to InboundFrame::Ack
     #[test]
     fn test_inbound_frame_dispatch_ack() {
@@ -1706,6 +1736,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-021
+    /// Version: V1.0
     #[test]
     fn test_inbound_frame_dispatch_nack() {
         let bytes = make_nack_frame_bytes(1, 1, 2, &[3, 5]);
@@ -1716,6 +1747,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-022
+    /// Version: V1.0
     #[test]
     fn test_inbound_frame_dispatch_subscribe_req() {
         let bytes = make_subscribe_req_bytes(1, 1, SUB_OP_SUBSCRIBE, &[(1, 0x0102)]);
@@ -1728,6 +1760,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-023
+    /// Version: V1.0
     #[test]
     fn test_inbound_frame_unknown_type() {
         // Build a buffer with valid magic but unknown msg_type at byte[3]
@@ -1740,6 +1773,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-024
+    /// Version: V1.0
     /// A buffer shorter than IdtHeader::SIZE returns None from InboundFrame
     #[test]
     fn test_inbound_frame_too_short_for_ack() {
@@ -1751,6 +1785,7 @@ mod tests {
     // ── AckFrame::is_acked tests ──────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-025
+    /// Version: V1.0
     /// is_acked returns true for seq ≤ ack_upto (cumulative path)
     #[test]
     fn test_ack_frame_is_acked_cumulative() {
@@ -1766,6 +1801,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-026
+    /// Version: V1.0
     /// is_acked returns true for seq covered by a set bitmap bit (selective ACK path)
     #[test]
     fn test_ack_frame_is_acked_bitmap() {
@@ -1784,6 +1820,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-027
+    /// Version: V1.0
     /// is_acked returns false for seq beyond the 64-bit bitmap window
     #[test]
     fn test_ack_frame_is_acked_beyond_window() {
@@ -1800,6 +1837,7 @@ mod tests {
     // ── AckFrame bitmap parsing ───────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-028
+    /// Version: V1.0
     /// AckFrame::from_ble_bytes correctly reads an 8-byte non-zero bitmap
     #[test]
     fn test_ack_frame_parse_with_bitmap() {
@@ -1821,6 +1859,7 @@ mod tests {
     // ── IdtHeader / DataFrame length guards ───────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-029
+    /// Version: V1.0
     /// IdtHeader::from_bytes returns None if buffer is shorter than 13 bytes
     #[test]
     fn test_idt_header_too_short() {
@@ -1829,6 +1868,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-030
+    /// Version: V1.0
     /// DataFrame::from_ble_bytes returns None if buffer is shorter than TOTAL_LEN (34) bytes
     #[test]
     fn test_data_frame_too_short() {
@@ -1839,6 +1879,7 @@ mod tests {
     // ── NackFrame CRC guard ───────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-031
+    /// Version: V1.0
     /// NackFrame::from_ble_bytes returns None when the CRC is corrupted
     #[test]
     fn test_nack_frame_bad_crc() {
@@ -1852,6 +1893,7 @@ mod tests {
     // ── Additional coverage tests ──────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-035
+    /// Version: V1.0
     /// InboundFrame::from_ble_bytes returns None for buffers shorter than IdtHeader::SIZE
     #[test]
     fn test_inbound_frame_single_byte_returns_none() {
@@ -1860,6 +1902,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-036
+    /// Version: V1.0
     /// InboundFrame returns None when IDT magic matches but buffer is shorter than IdtHeader::SIZE
     #[test]
     fn test_inbound_frame_idt_magic_too_short() {
@@ -1869,6 +1912,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-037
+    /// Version: V1.0
     /// SubscribeReq::from_ble_bytes with n=0 items parses successfully and returns empty items vec
     #[test]
     fn test_subscribe_req_parse_zero_items() {
@@ -1883,6 +1927,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-038
+    /// Version: V1.0
     /// SubscribeReq::from_ble_bytes returns None when CRC is corrupted (no valid stride found)
     #[test]
     fn test_subscribe_req_bad_crc_returns_none() {
@@ -1895,6 +1940,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-040
+    /// Version: V1.0
     /// NackFrame::from_ble_bytes with n=0 (empty seq_list) parses cleanly
     #[test]
     fn test_nack_frame_zero_seqs() {
@@ -1905,6 +1951,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-041
+    /// Version: V1.0
     /// AckFrame::is_acked correctly checks bitmap bits in bytes beyond byte 0 (offsets 8–15)
     #[test]
     fn test_ack_frame_is_acked_bitmap_high_bytes() {
@@ -1926,6 +1973,7 @@ mod tests {
     // ── DataFrame CRC32C tests ─────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-042
+    /// Version: V1.0
     /// to_ble_bytes() appends CRC32C of the first 30 bytes at positions [30..34]
     #[test]
     fn test_dataframe_crc_appended() {
@@ -1941,6 +1989,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-043
+    /// Version: V1.0
     /// verify_crc returns true for a valid frame and false after any byte is corrupted
     #[test]
     fn test_dataframe_verify_crc_pass_and_fail() {
@@ -1966,6 +2015,7 @@ mod tests {
     // ── has_idt_magic tests ────────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-044
+    /// Version: V1.0
     /// has_idt_magic returns true only for buffers starting with 0x7A 0xD1 (IDT_MAGIC LE)
     #[test]
     fn test_has_idt_magic() {
@@ -1983,6 +2033,7 @@ mod tests {
     // ── SignalRegistry tests ───────────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-045
+    /// Version: V1.0
     /// SignalRegistry::with_defaults registers exactly the three V1 medical signals
     #[test]
     fn test_signal_registry_default_has_three_signals() {
@@ -2003,6 +2054,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-046
+    /// Version: V1.0
     /// Registering an extra signal is reflected in all_signal_ids and build_catalog
     #[test]
     fn test_signal_registry_register_extra_signal() {
@@ -2025,6 +2077,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-047
+    /// Version: V1.0
     /// normalize_id resolves legacy 1/2/3 to IDT compound IDs and unknown IDs to None
     #[test]
     fn test_signal_registry_normalize_legacy_ids() {
@@ -2042,6 +2095,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-048
+    /// Version: V1.0
     /// build_catalog from registry matches Catalog::default_medical_catalog for the three defaults
     #[test]
     fn test_signal_registry_build_catalog_matches_default_medical() {
@@ -2058,6 +2112,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-049
+    /// Version: V1.0
     /// contains_normalized returns true for all resolvable IDs (canonical + legacy) and false
     /// for unknown/zero IDs
     #[test]
@@ -2091,6 +2146,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-050
+    /// Version: V1.0
     /// SignalRegistry::new() creates an empty registry; all lookups return None/false/empty
     #[test]
     fn test_signal_registry_new_is_empty() {
@@ -2124,6 +2180,7 @@ mod tests {
     // ── parse_tlv_subscribe_req ───────────────────────────────────────────────
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-020
+    /// Version: V1.0
     /// parse_tlv_subscribe_req parses the exact 89-byte payload captured from the Flutter app
     #[test]
     fn test_parse_tlv_subscribe_req_real_flutter_bytes() {
@@ -2150,6 +2207,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-021
+    /// Version: V1.0
     /// parse_tlv_subscribe_req returns None for wrong marker byte
     #[test]
     fn test_parse_tlv_subscribe_req_wrong_marker() {
@@ -2159,6 +2217,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-023
+    /// Version: V1.0
     /// parse_idt_wrapped_tlv_subscribe_req accepts a MyPredi TLV SUBSCRIBE_REQ wrapped in an IDT envelope.
     #[test]
     fn test_parse_idt_wrapped_tlv_subscribe_req() {
@@ -2184,6 +2243,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-022
+    /// Version: V1.0
     /// parse_tlv_subscribe_req returns None for a buffer that is too short
     #[test]
     fn test_parse_tlv_subscribe_req_too_short() {

@@ -284,6 +284,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-HEALTH-001
+    /// Version: V1.0
     /// HT-001 — valid health.json read and deserialized correctly.
     #[test]
     fn ht_001_valid_snapshot() {
@@ -297,6 +298,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-HEALTH-002
+    /// Version: V1.0
     /// HT-002 — absent file → all OS fields zeroed, no panic.
     #[test]
     fn ht_002_absent_file() {
@@ -309,6 +311,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-HEALTH-002B
+    /// Version: V1.0
     /// Malformed JSON → all OS fields zeroed, no panic.
     #[test]
     fn ht_002b_invalid_json() {
@@ -320,6 +323,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-HEALTH-003
+    /// Version: V1.0
     /// HT-003 — stale ts (120s old, threshold 60s) → all OS fields zeroed.
     #[test]
     fn ht_003_stale_snapshot() {
@@ -333,6 +337,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-HEALTH-004
+    /// Version: V1.0
     /// HT-004 — flow_ok() with last_processed_data = None → 0.
     #[test]
     fn ht_004_flow_none() {
@@ -340,6 +345,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-HEALTH-005
+    /// Version: V1.0
     /// HT-005 — flow_ok() with data 30s ago, timeout 60s → 1.
     #[test]
     fn ht_005_flow_within_timeout() {
@@ -352,6 +358,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-HEALTH-006
+    /// Version: V1.0
     /// HT-006 — flow_ok() with data 90s ago, timeout 60s → 0.
     ///
     /// Note: if sio has just transitioned to 0 (VR died), the payload may show
@@ -368,6 +375,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-HEALTH-007
+    /// Version: V1.0
     /// HT-007 — build_payload with all indicators = 1 → ok = 1, ver = 1.
     #[test]
     fn ht_007_build_payload_all_ok() {
@@ -385,6 +393,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-HEALTH-008
+    /// Version: V1.0
     /// HT-008 — build_payload with disk = 0 → ok = 0.
     #[test]
     fn ht_008_build_payload_disk_fail() {
@@ -395,6 +404,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-HEALTH-009
+    /// Version: V1.0
     /// Each individual failing indicator propagates ok = 0.
     #[test]
     fn ht_009_each_failing_indicator_clears_ok() {
@@ -417,6 +427,7 @@ mod tests {
     }
 
     /// ID SRS: SRS-TEST-HEALTH-010
+    /// Version: V1.0
     /// HT-010 — serialized JSON payload fits in a single BLE MTU (< 247 bytes).
     /// Soft target: < 120 bytes.
     #[test]
