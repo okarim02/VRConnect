@@ -116,9 +116,8 @@ mod tests {
     /// Version: V1.0
     #[test]
     fn test_decompressor_new() {
+        // Just verify it can be created without panicking
         let _decompressor = VitalDataDecompressor::new();
-        // Just verify it can be created
-        assert!(true);
     }
 
     /// ID SRS: SRS-TEST-DECOMP-002
@@ -358,7 +357,7 @@ mod tests {
     /// Version: V1.0
     #[test]
     fn test_decompressor_default() {
-        let decompressor = VitalDataDecompressor::default();
+        let decompressor = VitalDataDecompressor;
 
         // Verify it works the same as new()
         let data = b"Hello, World!";

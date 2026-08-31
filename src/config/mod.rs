@@ -243,8 +243,8 @@ impl Config {
             // Resolve relative file paths against the project root (parent of the config/ dir)
             // so that CWD at process startup does not affect file resolution.
             let project_root = cf
-                .parent()                  // <root>/config/
-                .and_then(|p| p.parent())  // <root>/
+                .parent() // <root>/config/
+                .and_then(|p| p.parent()) // <root>/
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
             let resolve = |raw: &str| -> String {
@@ -254,12 +254,12 @@ impl Config {
                     project_root.join(raw).to_string_lossy().into_owned()
                 }
             };
-            config.health_file             = resolve(&config.health_file);
-            config.wal_path                = resolve(&config.wal_path);
+            config.health_file = resolve(&config.health_file);
+            config.wal_path = resolve(&config.wal_path);
             config.history_checkpoint_path = resolve(&config.history_checkpoint_path);
-            config.debug_output_path       = resolve(&config.debug_output_path);
-            config.log_dir                 = resolve(&config.log_dir);
-            config.output_file_base_path   = resolve(&config.output_file_base_path);
+            config.debug_output_path = resolve(&config.debug_output_path);
+            config.log_dir = resolve(&config.log_dir);
+            config.output_file_base_path = resolve(&config.output_file_base_path);
         }
 
         // Validate
@@ -511,25 +511,6 @@ impl Config {
         }
 
         config
-    }
-
-    /// ID SRS: SRS-FN-CONFIG-002
-    /// Title: merge_with
-    ///
-    /// Description: VRConnect shall merge the current configuration with values
-    /// from a file-loaded configuration, with CLI arguments taking precedence.
-    ///
-    /// Version: V1.0
-    ///
-    /// # Arguments
-    /// * `file_config` - Configuration loaded from file
-    ///
-    /// # Returns
-    /// Merged configuration
-    fn merge_with(self, _file_config: Config) -> Self {
-        // CLI arguments already parsed, just return self
-        // File config is loaded via dotenvy before CLI parsing
-        self
     }
 
     /// ID SRS: SRS-FN-CONFIG-003
@@ -841,7 +822,7 @@ mod tests {
 
     #[test]
     fn test_config_with_missing_file() {
-        let config = Config::parse_from(&[
+        let config = Config::parse_from([
             "vrconnect",
             "--config-file",
             "/non/existent/path.env",
@@ -883,19 +864,8 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_with() {
-        let cli_config = create_test_config();
-        let file_config = create_test_config();
-
-        let merged = cli_config.merge_with(file_config);
-
-        assert_eq!(merged.socketio_host, "127.0.0.1");
-        assert_eq!(merged.socketio_port, 3000);
-    }
-
-    #[test]
     fn test_parse_with_valid_config() {
-        let config = Config::parse_from(&[
+        let config = Config::parse_from([
             "vrconnect",
             "--socketio-port",
             "5000",
@@ -918,7 +888,7 @@ mod tests {
         writeln!(temp_file, "LOG_LEVEL=INFO").unwrap();
         temp_file.flush().unwrap();
 
-        let config = Config::parse_from(&[
+        let config = Config::parse_from([
             "vrconnect",
             "--config-file",
             temp_file.path().to_str().unwrap(),
@@ -944,7 +914,7 @@ mod tests {
 
         std::env::set_var("TEST_CONFIG_FILE", temp_file.path().to_str().unwrap());
 
-        let config = Config::parse_from(&[
+        let config = Config::parse_from([
             "vrconnect",
             "--config-file",
             temp_file.path().to_str().unwrap(),

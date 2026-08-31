@@ -832,13 +832,13 @@ impl SubscribeRsp {
         let mut buf = Vec::with_capacity(13 + 4 + n * SubscribeRspItem::SIZE + 4);
 
         // 13-byte compact header
-        buf.extend_from_slice(&IDT_MAGIC.to_le_bytes());      // [0-1]  magic
-        buf.push(IDT_VERSION);                                 // [2]    version
-        buf.push(MSG_SUBSCRIBE_RSP);                           // [3]    msg_type = 0x02
-        buf.push(0u8);                                         // [4]    flags
+        buf.extend_from_slice(&IDT_MAGIC.to_le_bytes()); // [0-1]  magic
+        buf.push(IDT_VERSION); // [2]    version
+        buf.push(MSG_SUBSCRIBE_RSP); // [3]    msg_type = 0x02
+        buf.push(0u8); // [4]    flags
         buf.extend_from_slice(&self.session_id.to_le_bytes()); // [5-6]  session_id
-        buf.extend_from_slice(&0u16.to_le_bytes());            // [7-8]  stream_id = 0
-        buf.extend_from_slice(&0u32.to_le_bytes());            // [9-12] seq = 0
+        buf.extend_from_slice(&0u16.to_le_bytes()); // [7-8]  stream_id = 0
+        buf.extend_from_slice(&0u32.to_le_bytes()); // [9-12] seq = 0
 
         // Payload
         buf.extend_from_slice(&self.req_id.to_le_bytes());
@@ -907,17 +907,17 @@ impl SubscribeRsp {
 
         // 24-byte IDT header (identical layout to DATA_FRAME header)
         let mut buf: Vec<u8> = Vec::with_capacity(24 + payload.len() + 4);
-        buf.extend_from_slice(&IDT_MAGIC.to_le_bytes());          // [0-1]
-        buf.push(IDT_VERSION);                                     // [2]
-        buf.push(MSG_SUBSCRIBE_RSP);                               // [3] = 0x02
-        buf.push(0u8);                                             // [4]  flags
-        buf.extend_from_slice(&self.session_id.to_le_bytes());     // [5-6]
-        buf.extend_from_slice(&0u16.to_le_bytes());                // [7-8]  stream_id=0
-        buf.extend_from_slice(&0u32.to_le_bytes());                // [9-12] seq=0
-        buf.extend_from_slice(&0u64.to_le_bytes());                // [13-20] t0ms=0
-        buf.push(0u8);                                             // [21] count=0
-        buf.extend_from_slice(&payload_len.to_le_bytes());         // [22-23]
-        buf.extend_from_slice(&payload);                           // [24..24+payloadLen]
+        buf.extend_from_slice(&IDT_MAGIC.to_le_bytes()); // [0-1]
+        buf.push(IDT_VERSION); // [2]
+        buf.push(MSG_SUBSCRIBE_RSP); // [3] = 0x02
+        buf.push(0u8); // [4]  flags
+        buf.extend_from_slice(&self.session_id.to_le_bytes()); // [5-6]
+        buf.extend_from_slice(&0u16.to_le_bytes()); // [7-8]  stream_id=0
+        buf.extend_from_slice(&0u32.to_le_bytes()); // [9-12] seq=0
+        buf.extend_from_slice(&0u64.to_le_bytes()); // [13-20] t0ms=0
+        buf.push(0u8); // [21] count=0
+        buf.extend_from_slice(&payload_len.to_le_bytes()); // [22-23]
+        buf.extend_from_slice(&payload); // [24..24+payloadLen]
 
         // CRC32C of entire header+payload
         let crc = crc32c::crc32c(&buf);
@@ -1154,6 +1154,12 @@ pub struct SignalMeta {
 /// Version: V1.0
 pub struct SignalRegistry {
     signals: std::collections::HashMap<u16, SignalMeta>,
+}
+
+impl Default for SignalRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SignalRegistry {
@@ -1552,7 +1558,7 @@ mod tests {
 
         // CRC32C at [30..34] — [TODO-1 resolved]
         assert_eq!(bytes.len(), 34);
-        assert_eq!(DataFrame::verify_crc(&bytes), true);
+        assert!(DataFrame::verify_crc(&bytes));
     }
 
     /// ID SRS: SRS-TEST-BLEPROTOCOL-009
@@ -1712,7 +1718,10 @@ mod tests {
         assert_eq!(bytes[2], 0x01); // signal_id high byte
         assert_eq!(bytes[3], VALUE_TYPE_FLOAT32); // value_type = 3
         assert_eq!(bytes[4], UNIT_BPM); // unit_code = 1 (bpm)
-        assert_eq!(u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]), 1000); // period_ms
+        assert_eq!(
+            u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]),
+            1000
+        ); // period_ms
         let name_len = bytes[9] as usize;
         assert_eq!(&bytes[10..10 + name_len], b"HR");
     }

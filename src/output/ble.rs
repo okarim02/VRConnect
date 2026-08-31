@@ -380,8 +380,8 @@ mod tests {
             room_index: 0,
             room_name: "BED_01".to_string(),
             tracks: vec![
-                create_test_track("hr", 75.0, 0, "BED_01"),      // lowercase
-                create_test_track("SpO2", 98.0, 0, "BED_01"),    // mixed case
+                create_test_track("hr", 75.0, 0, "BED_01"),   // lowercase
+                create_test_track("SpO2", 98.0, 0, "BED_01"), // mixed case
                 create_test_track("NIBP_SYS", 120.0, 0, "BED_01"), // uppercase
             ],
         };
@@ -453,7 +453,7 @@ mod tests {
             "null".to_string(),
             100,
         )
-            .await;
+        .await;
 
         assert!(result.is_ok());
         let ble = result.unwrap();
@@ -478,7 +478,7 @@ mod tests {
             "null".to_string(),
             100,
         )
-            .await;
+        .await;
 
         assert!(result.is_err());
     }
@@ -498,7 +498,7 @@ mod tests {
             "null".to_string(),
             100,
         )
-            .await;
+        .await;
 
         assert!(result.is_err());
     }
@@ -518,8 +518,8 @@ mod tests {
             "null".to_string(),
             100,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let room = ProcessedRoom {
             room_index: 0,
@@ -554,8 +554,8 @@ mod tests {
             "null".to_string(),
             100,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         assert_eq!(ble.track_names.len(), 3);
         assert_eq!(ble.track_names[0], "HR");

@@ -5,6 +5,13 @@ edition = "2021"
 authors = ["UTBM Team"]
 description = "Medical middleware for real-time vital data processing"
 
+[lints.rust]
+# `tarpaulin_include`/`tarpaulin_exclude` are cfg names read by cargo-tarpaulin
+# (coverage tool), not the compiler — used throughout this codebase to mark
+# integration-only code excluded from coverage. Not a Cargo feature, so
+# check-cfg has no other way to know it's intentional.
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(tarpaulin_include)"] }
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }

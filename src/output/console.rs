@@ -205,11 +205,9 @@ mod tests {
     /// Version: V1.0
     #[test]
     fn test_console_output_new() {
+        // Just verify these can be created without panicking
         let _console = ConsoleOutput::new(false, false);
-        assert!(true); // Just verify it can be created
-
         let _console_verbose = ConsoleOutput::new(true, true);
-        assert!(true);
     }
 
     /// ID SRS: SRS-TEST-CONSOLE-002

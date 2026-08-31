@@ -109,9 +109,7 @@ impl SocketIOServer {
     #[cfg(not(tarpaulin_include))] // Requires real TCP server, integration test only
     pub async fn start(&self, tx: mpsc::UnboundedSender<ProcessedData>) -> Result<()> {
         let addr = format!("{}:{}", self.host, self.port);
-        let listener = TcpListener::bind(&addr)
-            .await
-            .map_err(|e| VitalError::Io(e))?;
+        let listener = TcpListener::bind(&addr).await.map_err(VitalError::Io)?;
 
         log::info!("Socket.IO v4 WebSocket server listening on {}", addr);
         log::info!("✓ Socket.IO server started");
@@ -183,6 +181,7 @@ impl SocketIOServer {
     /// # Returns
     /// Result indicating success or error
     #[cfg(not(tarpaulin_include))] // Requires real WebSocket connection, integration test only
+    #[allow(clippy::too_many_arguments)]
     async fn handle_connection(
         stream: TcpStream,
         addr: SocketAddr,
@@ -324,13 +323,11 @@ impl SocketIOServer {
                     } else if text.starts_with("40") {
                         // Socket.IO connect
                         log::debug!("Socket.IO namespace connected: {}", addr);
-                    } else if text.starts_with("42") {
+                    } else if let Some(event_data) = text.strip_prefix("42") {
                         // Socket.IO event
-                        let event_data = &text[2..];
-
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(event_data) {
                             if let Some(arr) = parsed.as_array() {
-                                if let Some(event_name) = arr.get(0).and_then(|v| v.as_str()) {
+                                if let Some(event_name) = arr.first().and_then(|v| v.as_str()) {
                                     log::info!("Event '{}' received from {}", event_name, addr);
 
                                     if event_name == "join_vr" {
@@ -341,9 +338,8 @@ impl SocketIOServer {
                                 }
                             }
                         }
-                    } else if text.starts_with("451-") {
+                    } else if let Some(placeholder_data) = text.strip_prefix("451-") {
                         // Binary event placeholder
-                        let placeholder_data = &text[4..];
                         log::debug!(
                             "Binary event placeholder from {}: {}",
                             addr,
@@ -556,7 +552,6 @@ impl SocketIOServer {
 mod tests {
     use super::*;
     use crate::domain::TrackType;
-    use std::io::Write as _;
     use tempfile::NamedTempFile;
 
     /// ID SRS: SRS-TEST-SOCKETIO-001

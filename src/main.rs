@@ -97,7 +97,10 @@ fn print_banner(config: &Config) {
         println!("    └─ Service UUID: {}", config.output_ble_service_uuid);
         println!("    └─ Tracks: {}", config.output_ble_values);
         println!("    └─ Empty Value: '{}'", config.output_ble_empty_value);
-        println!("    └─ Update Interval: {}ms", config.output_ble_update_interval_ms);
+        println!(
+            "    └─ Update Interval: {}ms",
+            config.output_ble_update_interval_ms
+        );
         println!("    └─ Data Source: Room 0 (BED_01)");
     }
 
@@ -154,17 +157,13 @@ fn print_banner(config: &Config) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_main_skeleton() {
         // TODO: Implement main initialization tests
-        assert!(true);
     }
 
     #[test]
     fn test_banner_display() {
         // TODO: Implement banner formatting tests
-        assert!(true);
     }
 }

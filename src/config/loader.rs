@@ -26,8 +26,8 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Config, String> {
     // so that CWD at process startup does not affect file resolution.
     let project_root: PathBuf = path
         .as_ref()
-        .parent()                          // <root>/config/
-        .and_then(|p| p.parent())          // <root>/
+        .parent() // <root>/config/
+        .and_then(|p| p.parent()) // <root>/
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let resolve_path = |raw: String| -> String {
@@ -79,8 +79,10 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Config, String> {
             .unwrap_or_else(|_| "false".to_string())
             .parse()
             .unwrap_or(false),
-        output_file_base_path: resolve_path(std::env::var("OUTPUT_FILE_BASE_PATH")
-            .unwrap_or_else(|_| "./data/vrconnect/recording".to_string())),
+        output_file_base_path: resolve_path(
+            std::env::var("OUTPUT_FILE_BASE_PATH")
+                .unwrap_or_else(|_| "./data/vrconnect/recording".to_string()),
+        ),
         output_file_max_size_mb: std::env::var("OUTPUT_FILE_MAX_SIZE_MB")
             .unwrap_or_else(|_| "500".to_string())
             .parse()
@@ -101,8 +103,9 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Config, String> {
             .unwrap_or_else(|_| "60".to_string())
             .parse()
             .unwrap_or(60),
-        health_file: resolve_path(std::env::var("HEALTH_FILE")
-            .unwrap_or_else(|_| "logs/health.json".to_string())),
+        health_file: resolve_path(
+            std::env::var("HEALTH_FILE").unwrap_or_else(|_| "logs/health.json".to_string()),
+        ),
         ble_grace_period_sec: std::env::var("BLE_GRACE_PERIOD_SEC")
             .unwrap_or_else(|_| "10".to_string())
             .parse()
@@ -119,8 +122,10 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Config, String> {
             .unwrap_or_else(|_| "21600".to_string())
             .parse()
             .unwrap_or(21600),
-        history_checkpoint_path: resolve_path(std::env::var("HISTORY_CHECKPOINT_PATH")
-            .unwrap_or_else(|_| "logs/history_checkpoint.bin".to_string())),
+        history_checkpoint_path: resolve_path(
+            std::env::var("HISTORY_CHECKPOINT_PATH")
+                .unwrap_or_else(|_| "logs/history_checkpoint.bin".to_string()),
+        ),
         history_retention_sec: std::env::var("HISTORY_RETENTION_SEC")
             .unwrap_or_else(|_| "21600".to_string())
             .parse()
@@ -129,7 +134,9 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Config, String> {
             .unwrap_or_else(|_| "false".to_string())
             .parse()
             .unwrap_or(false),
-        wal_path: resolve_path(std::env::var("WAL_PATH").unwrap_or_else(|_| "logs/history.wal".to_string())),
+        wal_path: resolve_path(
+            std::env::var("WAL_PATH").unwrap_or_else(|_| "logs/history.wal".to_string()),
+        ),
         wal_fsync_interval_sec: std::env::var("WAL_FSYNC_INTERVAL_SEC")
             .unwrap_or_else(|_| "2".to_string())
             .parse()
@@ -142,8 +149,9 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Config, String> {
             .unwrap_or_else(|_| "false".to_string())
             .parse()
             .unwrap_or(false),
-        debug_output_path: resolve_path(std::env::var("DEBUG_OUTPUT_PATH")
-            .unwrap_or_else(|_| "./logs/debug.log".to_string())),
+        debug_output_path: resolve_path(
+            std::env::var("DEBUG_OUTPUT_PATH").unwrap_or_else(|_| "./logs/debug.log".to_string()),
+        ),
         log_level: std::env::var("LOG_LEVEL").unwrap_or_else(|_| "INFO".to_string()),
         log_dir: resolve_path(std::env::var("LOG_DIR").unwrap_or_else(|_| "./logs".to_string())),
     };

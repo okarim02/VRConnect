@@ -64,8 +64,8 @@ impl FileOutput {
         let data_dir = base.join("data");
         let archive_dir = base.join("archive");
 
-        fs::create_dir_all(&data_dir).map_err(|e| VitalError::Io(e))?;
-        fs::create_dir_all(&archive_dir).map_err(|e| VitalError::Io(e))?;
+        fs::create_dir_all(&data_dir).map_err(VitalError::Io)?;
+        fs::create_dir_all(&archive_dir).map_err(VitalError::Io)?;
 
         log::info!("🗃️  File output initialized: {}", base.display());
         log::info!("  Data directory: {}", data_dir.display());
@@ -105,10 +105,10 @@ impl FileOutput {
             return Ok(());
         }
 
-        let entries = fs::read_dir(&data_dir).map_err(|e| VitalError::Io(e))?;
+        let entries = fs::read_dir(&data_dir).map_err(VitalError::Io)?;
 
         for entry in entries {
-            let entry = entry.map_err(|e| VitalError::Io(e))?;
+            let entry = entry.map_err(VitalError::Io)?;
             let path = entry.path();
 
             if path.is_dir() {
@@ -197,7 +197,7 @@ impl FileOutput {
             active
                 .handle
                 .write_all(line_bytes)
-                .map_err(|e| VitalError::Io(e))?;
+                .map_err(VitalError::Io)?;
             active.current_size += line_size;
         }
 
@@ -232,7 +232,7 @@ impl FileOutput {
             );
 
             let new_path = active.path.parent().unwrap().join(new_name);
-            fs::rename(&active.path, &new_path).map_err(|e| VitalError::Io(e))?;
+            fs::rename(&active.path, &new_path).map_err(VitalError::Io)?;
 
             log::info!(
                 "File rotation: {} → {}",
@@ -250,7 +250,7 @@ impl FileOutput {
         let time_str = now.format("%H%M%S").to_string();
         let daily_dir = self.base_path.join("data").join(&date_str);
 
-        fs::create_dir_all(&daily_dir).map_err(|e| VitalError::Io(e))?;
+        fs::create_dir_all(&daily_dir).map_err(VitalError::Io)?;
 
         let filename = format!("vrconnect_{}_{}_ongoing.json", date_str, time_str);
         let file_path = daily_dir.join(filename);
@@ -259,7 +259,7 @@ impl FileOutput {
             .create(true)
             .append(true)
             .open(&file_path)
-            .map_err(|e| VitalError::Io(e))?;
+            .map_err(VitalError::Io)?;
 
         log::info!(
             "New file started: {}",
@@ -367,16 +367,17 @@ impl FileOutput {
         let (first_time, last_time) = self.get_time_range(&files)?;
 
         let archive_name = format!(
-            "archive_{}_{}.zip",
+            "archive_{}_{}_{}.zip",
             date.format("%Y%m%d"),
-            format!("{}_{}", first_time, last_time)
+            first_time,
+            last_time
         );
 
         let archive_dir = self
             .base_path
             .join("archive")
             .join(date.format("%Y%m%d").to_string());
-        fs::create_dir_all(&archive_dir).map_err(|e| VitalError::Io(e))?;
+        fs::create_dir_all(&archive_dir).map_err(VitalError::Io)?;
 
         let archive_path = archive_dir.join(archive_name);
 
@@ -384,13 +385,13 @@ impl FileOutput {
 
         // Remove archived files
         for file in &files {
-            fs::remove_file(file).map_err(|e| VitalError::Io(e))?;
+            fs::remove_file(file).map_err(VitalError::Io)?;
         }
 
         // Remove daily directory if empty
         if let Ok(entries) = fs::read_dir(daily_dir) {
             if entries.count() == 0 {
-                fs::remove_dir(daily_dir).map_err(|e| VitalError::Io(e))?;
+                fs::remove_dir(daily_dir).map_err(VitalError::Io)?;
             }
         }
 
@@ -428,16 +429,17 @@ impl FileOutput {
         let (first_time, last_time) = self.get_time_range(&files)?;
 
         let archive_name = format!(
-            "archive_{}_{}.zip",
+            "archive_{}_{}_{}.zip",
             date.format("%Y%m%d"),
-            format!("{}_{}", first_time, last_time)
+            first_time,
+            last_time
         );
 
         let archive_dir = self
             .base_path
             .join("archive")
             .join(date.format("%Y%m%d").to_string());
-        fs::create_dir_all(&archive_dir).map_err(|e| VitalError::Io(e))?;
+        fs::create_dir_all(&archive_dir).map_err(VitalError::Io)?;
 
         let archive_path = archive_dir.join(archive_name);
 
@@ -451,7 +453,7 @@ impl FileOutput {
 
         // Remove archived files
         for file in &files {
-            fs::remove_file(file).map_err(|e| VitalError::Io(e))?;
+            fs::remove_file(file).map_err(VitalError::Io)?;
         }
 
         log::info!(
@@ -483,10 +485,10 @@ impl FileOutput {
             return Ok(files);
         }
 
-        let entries = fs::read_dir(dir).map_err(|e| VitalError::Io(e))?;
+        let entries = fs::read_dir(dir).map_err(VitalError::Io)?;
 
         for entry in entries {
-            let entry = entry.map_err(|e| VitalError::Io(e))?;
+            let entry = entry.map_err(VitalError::Io)?;
             let path = entry.path();
 
             if path.is_file() {
@@ -575,7 +577,7 @@ impl FileOutput {
     fn create_zip_archive(&self, archive_path: &Path, files: &[PathBuf]) -> Result<()> {
         use zip::write::FileOptions;
 
-        let file = File::create(archive_path).map_err(|e| VitalError::Io(e))?;
+        let file = File::create(archive_path).map_err(VitalError::Io)?;
 
         let mut zip = zip::ZipWriter::new(file);
         let options = FileOptions::default()
@@ -591,9 +593,9 @@ impl FileOutput {
             zip.start_file(name, options)
                 .map_err(|e| VitalError::Processing(format!("ZIP error: {}", e)))?;
 
-            let mut f = File::open(file_path).map_err(|e| VitalError::Io(e))?;
+            let mut f = File::open(file_path).map_err(VitalError::Io)?;
 
-            std::io::copy(&mut f, &mut zip).map_err(|e| VitalError::Io(e))?;
+            std::io::copy(&mut f, &mut zip).map_err(VitalError::Io)?;
         }
 
         zip.finish()
@@ -622,14 +624,14 @@ impl FileOutput {
             return Ok(0);
         }
 
-        let entries = fs::read_dir(dir).map_err(|e| VitalError::Io(e))?;
+        let entries = fs::read_dir(dir).map_err(VitalError::Io)?;
 
         for entry in entries {
-            let entry = entry.map_err(|e| VitalError::Io(e))?;
+            let entry = entry.map_err(VitalError::Io)?;
             let path = entry.path();
 
             if path.is_file() {
-                let metadata = fs::metadata(&path).map_err(|e| VitalError::Io(e))?;
+                let metadata = fs::metadata(&path).map_err(VitalError::Io)?;
                 total += metadata.len();
             }
         }
@@ -653,7 +655,7 @@ impl FileOutput {
         let mut total = 0u64;
 
         for file in files {
-            let metadata = fs::metadata(file).map_err(|e| VitalError::Io(e))?;
+            let metadata = fs::metadata(file).map_err(VitalError::Io)?;
             total += metadata.len();
         }
 
@@ -744,8 +746,8 @@ impl FileOutput {
 
         #[cfg(windows)]
         {
-            use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
             use windows::core::PCWSTR;
+            use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
             // Resolve drive root from path (e.g. "C:\some\path" → "C:\")
             let drive_root = {
@@ -756,11 +758,14 @@ impl FileOutput {
                     "C:\\".to_string()
                 }
             };
-            let wide: Vec<u16> = drive_root.encode_utf16().chain(std::iter::once(0)).collect();
+            let wide: Vec<u16> = drive_root
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
 
             let mut free_bytes_caller: u64 = 0;
-            let mut total_bytes:       u64 = 0;
-            let mut total_free_bytes:  u64 = 0;
+            let mut total_bytes: u64 = 0;
+            let mut total_free_bytes: u64 = 0;
 
             unsafe {
                 GetDiskFreeSpaceExW(
@@ -813,7 +818,7 @@ mod tests {
         let result = FileOutput::new(base_path.clone(), 500, 5, 100).await;
         assert!(result.is_ok());
 
-        let file_output = result.unwrap();
+        let _file_output = result.unwrap();
 
         // Check directories created
         assert!(temp_dir.path().join("data").exists());
@@ -878,7 +883,7 @@ mod tests {
                 .collect();
 
             // Should have created at least one file
-            assert!(entries.len() >= 1);
+            assert!(!entries.is_empty());
         }
     }
 
@@ -1003,7 +1008,7 @@ mod tests {
         File::create(old_dir.join("vrconnect_20250114_100000_110000.json")).unwrap();
 
         // Create FileOutput - should trigger archiving
-        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
+        let _file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
             .await
             .unwrap();
 
@@ -1018,7 +1023,7 @@ mod tests {
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .collect();
-            assert!(entries.len() > 0);
+            assert!(!entries.is_empty());
         }
     }
 
@@ -1357,10 +1362,10 @@ mod tests {
         let file2_path = test_dir.join("file2.txt");
 
         let mut file1 = File::create(&file1_path).unwrap();
-        file1.write_all(&vec![0u8; 100]).unwrap(); // 100 bytes
+        file1.write_all(&[0u8; 100]).unwrap(); // 100 bytes
 
         let mut file2 = File::create(&file2_path).unwrap();
-        file2.write_all(&vec![0u8; 200]).unwrap(); // 200 bytes
+        file2.write_all(&[0u8; 200]).unwrap(); // 200 bytes
 
         let files = vec![file1_path, file2_path];
         let total_size = file_output.calculate_files_size(&files).unwrap();
@@ -1447,7 +1452,7 @@ mod tests {
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .collect();
-            assert!(entries.len() >= 1);
+            assert!(!entries.is_empty());
         }
     }
 
@@ -1489,7 +1494,7 @@ mod tests {
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .collect();
-            assert!(archives.len() > 0);
+            assert!(!archives.is_empty());
         }
     }
 
@@ -1588,9 +1593,6 @@ mod tests {
     /// Version: V1.0
     #[tokio::test]
     async fn test_date_change_during_output() {
-        use std::sync::Arc;
-        use tokio::sync::RwLock;
-
         let temp_dir = TempDir::new().unwrap();
         let base_path = temp_dir.path().to_str().unwrap().to_string();
 
@@ -1654,7 +1656,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify archive directory was created for yesterday
-        let archive_dir = temp_dir.path().join("archive").join(&yesterday_str);
+        let _archive_dir = temp_dir.path().join("archive").join(&yesterday_str);
         // May or may not exist depending on if archiving completed
         // The important thing is no panic occurred
     }
@@ -1710,10 +1712,10 @@ mod tests {
                 .collect();
 
             // Should have at least one file
-            assert!(entries.len() >= 1);
+            assert!(!entries.is_empty());
 
             // Check if any file was renamed (doesn't end with _ongoing.json)
-            let has_completed = entries.iter().any(|e| {
+            let _has_completed = entries.iter().any(|e| {
                 let name = e.file_name();
                 let name_str = name.to_string_lossy();
                 name_str.starts_with("vrconnect_") && !name_str.ends_with("_ongoing.json")
@@ -1900,7 +1902,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Check archive was created with correct date format
-        let archive_dir = temp_dir.path().join("archive").join(date_str);
+        let _archive_dir = temp_dir.path().join("archive").join(date_str);
         // Directory should exist or be created
     }
 

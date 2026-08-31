@@ -714,7 +714,7 @@ mod tests {
     /// Version: V1.0
     #[test]
     fn test_transformer_default() {
-        let transformer = VitalDataTransformer::default();
+        let transformer = VitalDataTransformer;
 
         let vital_data = VitalData {
             vr_code: "VR-DEFAULT".to_string(),

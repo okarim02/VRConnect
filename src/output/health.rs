@@ -23,12 +23,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Version: V1.0
 #[derive(Debug, Deserialize, Default)]
 pub struct OsHealthSnapshot {
-    pub ts:           u64,
-    pub vr:           u8,
-    pub disk:         u8,
+    pub ts: u64,
+    pub vr: u8,
+    pub disk: u8,
     pub disk_free_gb: f32,
-    pub wd_vr:        u8,
-    pub wd_gate:      u8,
+    pub wd_vr: u8,
+    pub wd_gate: u8,
     // disk_used_pct and writer_ver are present in the file but not needed here.
 }
 
@@ -127,25 +127,25 @@ impl GateHealthState {
 #[derive(Debug, Serialize)]
 pub struct HealthPayload {
     /// Unix timestamp (seconds) at payload build time.
-    pub ts:      u64,
+    pub ts: u64,
     /// Schema version. Currently 1. Bump on breaking changes only.
-    pub ver:     u8,
+    pub ver: u8,
     /// Global health: 1 only if ALL indicators are 1.
-    pub ok:      u8,
+    pub ok: u8,
     /// GATE process alive (invariant: always 1 if payload is emitted).
-    pub gate:    u8,
+    pub gate: u8,
     /// Socket.IO connected to VitalRecorder.
-    pub sio:     u8,
+    pub sio: u8,
     /// At least one IDT signal stream active (reflects data flow, not link).
-    pub ble:     u8,
+    pub ble: u8,
     /// ProcessedData received within flow_timeout_sec seconds.
-    pub flow:    u8,
+    pub flow: u8,
     /// VitalRecorder process alive (from health.json).
-    pub vr:      u8,
+    pub vr: u8,
     /// Disk usage within thresholds (from health.json).
-    pub disk:    u8,
+    pub disk: u8,
     /// VitalRecorder watchdog task running (from health.json).
-    pub wd_vr:   u8,
+    pub wd_vr: u8,
     /// VRConnect watchdog task running (from health.json).
     pub wd_gate: u8,
 }
@@ -168,7 +168,7 @@ pub struct HealthPayload {
 /// Version: V1.0
 pub fn read_os_snapshot(path: &Path, stale_threshold_sec: u64) -> OsHealthSnapshot {
     let content = match std::fs::read_to_string(path) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(_) => return OsHealthSnapshot::default(),
     };
     // PS 5.1 Out-File / WriteAllText with Encoding::UTF8 prepends a UTF-8 BOM (EF BB BF).
@@ -176,7 +176,7 @@ pub fn read_os_snapshot(path: &Path, stale_threshold_sec: u64) -> OsHealthSnapsh
     let content = content.trim_start_matches('\u{FEFF}');
 
     let snapshot: OsHealthSnapshot = match serde_json::from_str(content) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(e) => {
             log::warn!("[health] Failed to parse {}: {}", path.display(), e);
             return OsHealthSnapshot::default();
@@ -215,23 +215,23 @@ pub fn build_payload(os: &OsHealthSnapshot, gate: &GateHealthState) -> HealthPay
         .as_secs();
 
     let g_gate: u8 = 1; // invariant: task running → GATE alive
-    let g_sio:  u8 = gate.sio_connected  as u8;
-    let g_ble:  u8 = gate.ble_subscriber as u8;
+    let g_sio: u8 = gate.sio_connected as u8;
+    let g_ble: u8 = gate.ble_subscriber as u8;
     let g_flow: u8 = gate.flow_ok();
 
     let ok = g_gate & g_sio & g_ble & g_flow & os.vr & os.disk & os.wd_vr & os.wd_gate;
 
     HealthPayload {
         ts,
-        ver:     1,
+        ver: 1,
         ok,
-        gate:    g_gate,
-        sio:     g_sio,
-        ble:     g_ble,
-        flow:    g_flow,
-        vr:      os.vr,
-        disk:    os.disk,
-        wd_vr:   os.wd_vr,
+        gate: g_gate,
+        sio: g_sio,
+        ble: g_ble,
+        flow: g_flow,
+        vr: os.vr,
+        disk: os.disk,
+        wd_vr: os.wd_vr,
         wd_gate: os.wd_gate,
     }
 }
@@ -279,7 +279,11 @@ mod tests {
     fn all_ok_os() -> OsHealthSnapshot {
         OsHealthSnapshot {
             ts: now_sec(),
-            vr: 1, disk: 1, disk_free_gb: 45.0, wd_vr: 1, wd_gate: 1,
+            vr: 1,
+            disk: 1,
+            disk_free_gb: 45.0,
+            wd_vr: 1,
+            wd_gate: 1,
         }
     }
 
@@ -380,16 +384,16 @@ mod tests {
     #[test]
     fn ht_007_build_payload_all_ok() {
         let p = build_payload(&all_ok_os(), &all_ok_gate());
-        assert_eq!(p.ok,   1);
+        assert_eq!(p.ok, 1);
         assert_eq!(p.gate, 1);
-        assert_eq!(p.sio,  1);
-        assert_eq!(p.ble,  1);
+        assert_eq!(p.sio, 1);
+        assert_eq!(p.ble, 1);
         assert_eq!(p.flow, 1);
-        assert_eq!(p.vr,   1);
+        assert_eq!(p.vr, 1);
         assert_eq!(p.disk, 1);
-        assert_eq!(p.wd_vr,   1);
+        assert_eq!(p.wd_vr, 1);
         assert_eq!(p.wd_gate, 1);
-        assert_eq!(p.ver,  1);
+        assert_eq!(p.ver, 1);
     }
 
     /// ID SRS: SRS-TEST-HEALTH-008
@@ -397,9 +401,12 @@ mod tests {
     /// HT-008 — build_payload with disk = 0 → ok = 0.
     #[test]
     fn ht_008_build_payload_disk_fail() {
-        let os = OsHealthSnapshot { disk: 0, ..all_ok_os() };
+        let os = OsHealthSnapshot {
+            disk: 0,
+            ..all_ok_os()
+        };
         let p = build_payload(&os, &all_ok_gate());
-        assert_eq!(p.ok,   0);
+        assert_eq!(p.ok, 0);
         assert_eq!(p.disk, 0);
     }
 
@@ -409,13 +416,27 @@ mod tests {
     #[test]
     fn ht_009_each_failing_indicator_clears_ok() {
         let cases: &[fn(&mut OsHealthSnapshot, &mut GateHealthState)] = &[
-            |os, _|  { os.vr = 0; },
-            |os, _|  { os.disk = 0; },
-            |os, _|  { os.wd_vr = 0; },
-            |os, _|  { os.wd_gate = 0; },
-            |_, g|   { g.sio_connected = false; },
-            |_, g|   { g.ble_subscriber = false; },
-            |_, g|   { g.last_processed_data = None; },
+            |os, _| {
+                os.vr = 0;
+            },
+            |os, _| {
+                os.disk = 0;
+            },
+            |os, _| {
+                os.wd_vr = 0;
+            },
+            |os, _| {
+                os.wd_gate = 0;
+            },
+            |_, g| {
+                g.sio_connected = false;
+            },
+            |_, g| {
+                g.ble_subscriber = false;
+            },
+            |_, g| {
+                g.last_processed_data = None;
+            },
         ];
         for mutate in cases {
             let mut os = all_ok_os();
@@ -435,7 +456,11 @@ mod tests {
         // Use worst-case values: max u64 ts, large float
         let os = OsHealthSnapshot {
             ts: 9_999_999_999,
-            vr: 1, disk: 1, disk_free_gb: 999.99, wd_vr: 1, wd_gate: 1,
+            vr: 1,
+            disk: 1,
+            disk_free_gb: 999.99,
+            wd_vr: 1,
+            wd_gate: 1,
         };
         let gate = all_ok_gate();
         let mut p = build_payload(&os, &gate);
@@ -444,12 +469,14 @@ mod tests {
         assert!(
             json.len() < 247,
             "Payload exceeds BLE MTU (247 bytes): {} bytes — `{}`",
-            json.len(), json
+            json.len(),
+            json
         );
         assert!(
             json.len() < 120,
             "Payload exceeds 120-byte soft target: {} bytes — `{}`",
-            json.len(), json
+            json.len(),
+            json
         );
     }
 }

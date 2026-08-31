@@ -26,7 +26,7 @@ pub enum VitalError {
     SocketIo(String),
 
     #[error("Bluetooth error: {0}")]
-    Bluetooth(String),  // CHANGED: Remove #[from] bluer::Error
+    Bluetooth(String), // CHANGED: Remove #[from] bluer::Error
 
     #[error("Configuration error: {0}")]
     Config(String),
@@ -35,7 +35,7 @@ pub enum VitalError {
     Processing(String),
 
     #[error("Regex error: {0}")]
-    Regex(#[from] fancy_regex::Error),
+    Regex(#[from] Box<fancy_regex::Error>),
 
     #[error("Logger error: {0}")]
     Logger(String),

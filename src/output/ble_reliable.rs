@@ -33,6 +33,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock};
 
+/// A single one-shot retry entry: `(frame_bytes, signal_id, stream_id, seq)`.
+type RetryEntry = (Vec<u8>, u16, u16, u32);
+
 /// ID SRS: SRS-MOD-BLERELIABLE-001
 /// Title: ReliableBleOutput
 ///
@@ -89,7 +92,7 @@ pub struct ReliableBleOutput {
     // Drained at the start of Phase 2 on the next call; frames that fail again are
     // discarded (they stay in tx_buffer and are NACK-recoverable by Flutter).
     // Capped at RETRY_QUEUE_CAP to bound memory; excess is dropped with a WARN.
-    retry_queue: tokio::sync::Mutex<Vec<(Vec<u8>, u16, u16, u32)>>,
+    retry_queue: tokio::sync::Mutex<Vec<RetryEntry>>,
 }
 
 // Maximum frames held for one-shot retry (optimistic fast-path; NACK covers persistent loss).
@@ -111,6 +114,7 @@ impl ReliableBleOutput {
     ///              the 6 standard GATT characteristics, and initialize session state.
     ///
     /// Version: V1.0
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         device_name: String,
         service_uuid_str: String,
@@ -416,8 +420,14 @@ impl ReliableBleOutput {
             let last_ack_time_sv = last_ack_time.clone();
             let timeout = self.ble_supervision_timeout_sec;
             tokio::spawn(async move {
-                Self::supervision_task(state, health_state, health_notify, last_ack_time_sv, timeout)
-                    .await;
+                Self::supervision_task(
+                    state,
+                    health_state,
+                    health_notify,
+                    last_ack_time_sv,
+                    timeout,
+                )
+                .await;
             });
             log::info!(
                 "Supervision task started (timeout={}s, check=5s)",
@@ -1260,6 +1270,7 @@ impl ReliableBleOutput {
     /// Handle a SUBSCRIBE_REQ IDT frame:
     ///   - op=1 (SUBSCRIBE):   allocate stream → send SUBSCRIBE_RSP on Data_OUT
     ///   - op=2 (UNSUBSCRIBE): remove stream, no RSP sent
+    ///
     /// Signal IDs are validated against `registry`; unknown IDs are rejected with a warning.
     async fn handle_subscribe_req(
         req: SubscribeReq,
@@ -1684,8 +1695,7 @@ impl ReliableBleOutput {
         let mut frames_to_send: Vec<(Vec<u8>, u16, u16, u32)> = Vec::new(); // (bytes, signal_id, stream_id, seq)
         {
             let mut state = self.state.write().await;
-            let mut seen: std::collections::HashSet<(u16, u64)> =
-                std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<(u16, u64)> = std::collections::HashSet::new();
 
             for track in &data.all_tracks {
                 // Only BED_01 (room_index = 0)
@@ -1783,8 +1793,7 @@ impl ReliableBleOutput {
 
         // Drain frames that failed in the previous output() call for a one-shot retry.
         // Sent before fresh frames so older data reaches the tablet first.
-        let to_retry: Vec<(Vec<u8>, u16, u16, u32)> =
-            self.retry_queue.lock().await.drain(..).collect();
+        let to_retry: Vec<RetryEntry> = self.retry_queue.lock().await.drain(..).collect();
 
         if !to_retry.is_empty() || !frames_to_send.is_empty() {
             let server = self.server.read().await;
@@ -1799,7 +1808,8 @@ impl ReliableBleOutput {
                 } else {
                     log::debug!(
                         "Data_OUT (retry ok): signal=0x{:04X}, seq={}",
-                        signal_id, seq
+                        signal_id,
+                        seq
                     );
                 }
             }
@@ -1814,20 +1824,27 @@ impl ReliableBleOutput {
                     if q.len() < RETRY_QUEUE_CAP {
                         log::warn!(
                             "BLE notify failed for signal 0x{:04X}: {} — queued for one-shot retry",
-                            signal_id, e
+                            signal_id,
+                            e
                         );
                         q.push((bytes, signal_id, stream_id, seq));
                     } else {
                         log::warn!(
                             "BLE notify failed for signal 0x{:04X} seq={}: {} — retry queue full \
                              (cap={}), NACK path will recover",
-                            signal_id, seq, e, RETRY_QUEUE_CAP
+                            signal_id,
+                            seq,
+                            e,
+                            RETRY_QUEUE_CAP
                         );
                     }
                 } else {
                     log::debug!(
                         "Data_OUT: signal=0x{:04X}, stream={}, seq={}, {} bytes",
-                        signal_id, stream_id, seq, bytes.len()
+                        signal_id,
+                        stream_id,
+                        seq,
+                        bytes.len()
                     );
                 }
             }
@@ -2954,7 +2971,11 @@ mod tests {
         let mut merged: Vec<(u64, u16)> = hr_frames
             .iter()
             .map(|f| (f.t0_ms, SignalId::HR.as_u16()))
-            .chain(spo2_frames.iter().map(|f| (f.t0_ms, SignalId::SpO2.as_u16())))
+            .chain(
+                spo2_frames
+                    .iter()
+                    .map(|f| (f.t0_ms, SignalId::SpO2.as_u16())),
+            )
             .collect();
         merged.sort_by_key(|(t0, _)| *t0);
 
@@ -3807,7 +3828,11 @@ mod tests {
             st.add_data(SignalId::HR.as_u16(), 72.0, 1_000_000);
             st.add_data(SignalId::HR.as_u16(), 73.0, 2_000_000);
         }
-        assert_eq!(state.read().await.total_pending(), 2, "pre: 2 frames pending");
+        assert_eq!(
+            state.read().await.total_pending(),
+            2,
+            "pre: 2 frames pending"
+        );
 
         // Spawn supervision task with a 10 s timeout.
         let state2 = state.clone();
@@ -3889,7 +3914,9 @@ mod tests {
         );
 
         // First output(): add_data returns Some(frame), notify fails → frame queued.
-        ble.output(&data).await.expect("output must not propagate notify errors");
+        ble.output(&data)
+            .await
+            .expect("output must not propagate notify errors");
         assert_eq!(
             ble.retry_queue_len().await,
             1,
@@ -3903,7 +3930,9 @@ mod tests {
 
         // Second output() with same data: record_history and add_data both dedup on t0_ms,
         // so frames_to_send is empty. Only to_retry is drained → retry fails → discarded.
-        ble.output(&data).await.expect("output must not propagate retry errors");
+        ble.output(&data)
+            .await
+            .expect("output must not propagate retry errors");
         assert_eq!(
             ble.retry_queue_len().await,
             0,

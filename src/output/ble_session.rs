@@ -483,7 +483,7 @@ impl BleSessionState {
     /// * `value`     - Measured float32 value
     /// * `t0_ms`     - Sample timestamp, milliseconds since Unix epoch
     pub fn record_history(&mut self, signal_id: u16, value: f32, t0_ms: u64) {
-        let buf = self.history.entry(signal_id).or_insert_with(VecDeque::new);
+        let buf = self.history.entry(signal_id).or_default();
         if let Some(&(last_ts, _)) = buf.back() {
             if t0_ms <= last_ts {
                 return;
@@ -495,7 +495,7 @@ impl BleSessionState {
         // don't accumulate entries spanning multiple days within the size limit.
         if self.max_history_age_ms > 0 {
             let cutoff = t0_ms.saturating_sub(self.max_history_age_ms);
-            while buf.front().map_or(false, |&(ts, _)| ts < cutoff) {
+            while buf.front().is_some_and(|&(ts, _)| ts < cutoff) {
                 buf.pop_front();
             }
         }
@@ -639,10 +639,8 @@ impl BleSessionState {
         let seq_start = entry.last_seq.wrapping_add(1);
         entry.is_replaying = true;
 
-        // We need to read from history (immutable borrow) but we just mutably borrowed entry.
-        // Use a separate lookup after releasing the mutable borrow.
-        drop(entry);
-
+        // `entry`'s mutable borrow ends here (NLL: last use was the line above) — no
+        // explicit drop needed before get_replay_frames() takes an immutable &self borrow.
         let frames =
             self.get_replay_frames(signal_id, start_time_ms, session_id, stream_id, seq_start);
 
@@ -1748,7 +1746,7 @@ mod tests {
         session.add_data(SignalId::HR.as_u16(), 76.0, 6000);
 
         assert!(
-            session.history.get(&SignalId::HR.as_u16()).is_none()
+            !session.history.contains_key(&SignalId::HR.as_u16())
                 || session.history[&SignalId::HR.as_u16()].is_empty(),
             "history must be empty before flush"
         );
@@ -1805,7 +1803,7 @@ mod tests {
         // Skip record_history to simulate a frame not yet in history
         session.add_data(SignalId::HR.as_u16(), 80.0, 9000);
         assert!(
-            session.history.get(&SignalId::HR.as_u16()).is_none()
+            !session.history.contains_key(&SignalId::HR.as_u16())
                 || session.history[&SignalId::HR.as_u16()].is_empty(),
             "history must be empty before on_disconnect"
         );
