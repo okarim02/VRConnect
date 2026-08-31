@@ -438,6 +438,20 @@ impl GattServer {
     }
 }
 
+/// Fallback teardown for when no caller explicitly calls `stop()` — e.g. the
+/// process exits with the GATT server still running (Ctrl+C shutdown doesn't
+/// currently propagate a signal into the spawned BLE task). Without this,
+/// the Windows GATT provider and BLE advertisement are never deregistered,
+/// and a fast supervised restart risks racing the OS's own cleanup of the
+/// previous advertisement under the same UUID.
+impl Drop for GattServer {
+    fn drop(&mut self) {
+        if self.running {
+            self.stop();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -477,6 +491,24 @@ mod tests {
         let server = GattServer::new("TestDevice".to_string(), uuid);
         assert!(!server.is_running());
         assert_eq!(server.device_name, "TestDevice");
+    }
+
+    #[test]
+    fn test_drop_tears_down_running_server_without_panicking() {
+        let uuid = uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap();
+        let mut server = GattServer::new("Test".to_string(), uuid);
+        // Simulate a started server without touching real Windows GATT APIs
+        // (`provider` stays None — the same shape `stop()` already handles).
+        server.running = true;
+        drop(server); // exercises the Drop fallback path added for stop()
+    }
+
+    #[test]
+    fn test_drop_is_harmless_when_never_started() {
+        let uuid = uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap();
+        let server = GattServer::new("Test".to_string(), uuid);
+        assert!(!server.is_running());
+        drop(server); // must not call stop()'s teardown a needless time
     }
 
     #[test]
