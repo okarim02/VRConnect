@@ -522,6 +522,57 @@ impl ReliableBleOutput {
         }
     }
 
+    /// ID SRS: SRS-FN-BLERELIABLE-012
+    /// Title: apply_ack_and_retransmit
+    ///
+    /// Description: VRConnect shall apply a parsed ACK (session_id/stream_id/ack_upto/bitmap —
+    /// already decoded from any of the three inbound wire formats: IDT, MyPredi, or legacy
+    /// Flutter) and dispatch any resulting retransmits. Factors out the retransmit-loop +
+    /// last_ack_time update that the three Data_IN ACK branches in `write_handler_loop` used
+    /// to duplicate independently. `verbose_retransmit_log` selects between the two distinct
+    /// retransmit-success log styles those branches used (IDT/MyPredi vs. Flutter) — preserved
+    /// as-is rather than unified, since changing operator-facing log output is a separate
+    /// decision from removing the duplication.
+    ///
+    /// Version: V1.0
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_ack_and_retransmit(
+        state: &Arc<RwLock<BleSessionState>>,
+        server: &Arc<RwLock<GattServer>>,
+        last_ack_time: &Arc<tokio::sync::Mutex<tokio::time::Instant>>,
+        session_id: u16,
+        stream_id: u16,
+        ack_upto: u32,
+        bitmap: &[u8; 8],
+        verbose_retransmit_log: bool,
+    ) {
+        let retransmits = {
+            let mut st = state.write().await;
+            st.handle_ack_with_bitmap(session_id, stream_id, ack_upto, bitmap)
+        };
+        if !retransmits.is_empty() {
+            let srv = server.read().await;
+            for frame in retransmits {
+                let bytes = frame.to_ble_bytes();
+                if let Err(e) = srv.notify("Data_OUT", &bytes).await {
+                    log::warn!("Retransmit failed for seq {}: {}", frame.header.seq, e);
+                } else if verbose_retransmit_log {
+                    log::info!(
+                        "--> RETRANSMITTED seq {} for stream {}",
+                        frame.header.seq,
+                        frame.header.stream_id
+                    );
+                } else {
+                    log::debug!(
+                        "Retransmitted seq {} (Flutter ACK-triggered)",
+                        frame.header.seq
+                    );
+                }
+            }
+        }
+        *last_ack_time.lock().await = tokio::time::Instant::now();
+    }
+
     /// Background task: reads write events from the GATT server and dispatches them.
     async fn write_handler_loop(
         mut rx: tokio::sync::mpsc::UnboundedReceiver<WriteEvent>,
@@ -548,35 +599,17 @@ impl ReliableBleOutput {
                                 ack.ack_upto,
                                 ack.bitmap
                             );
-                            let retransmits = {
-                                let mut st = state.write().await;
-                                st.handle_ack_with_bitmap(
-                                    ack.session_id,
-                                    ack.stream_id,
-                                    ack.ack_upto,
-                                    &ack.bitmap,
-                                )
-                            };
-                            if !retransmits.is_empty() {
-                                let srv = server.read().await;
-                                for frame in retransmits {
-                                    let bytes = frame.to_ble_bytes();
-                                    if let Err(e) = srv.notify("Data_OUT", &bytes).await {
-                                        log::warn!(
-                                            "Retransmit failed for seq {}: {}",
-                                            frame.header.seq,
-                                            e
-                                        );
-                                    } else {
-                                        log::info!(
-                                            "--> RETRANSMITTED seq {} for stream {}",
-                                            frame.header.seq,
-                                            frame.header.stream_id
-                                        );
-                                    }
-                                }
-                            }
-                            *last_ack_time.lock().await = tokio::time::Instant::now();
+                            Self::apply_ack_and_retransmit(
+                                &state,
+                                &server,
+                                &last_ack_time,
+                                ack.session_id,
+                                ack.stream_id,
+                                ack.ack_upto,
+                                &ack.bitmap,
+                                true,
+                            )
+                            .await;
                         }
                         Some(InboundFrame::Nack(nack)) => {
                             log::info!(
@@ -616,35 +649,17 @@ impl ReliableBleOutput {
                                     ack.ack_upto,
                                     ack.bitmap
                                 );
-                                let retransmits = {
-                                    let mut st = state.write().await;
-                                    st.handle_ack_with_bitmap(
-                                        ack.session_id,
-                                        ack.stream_id,
-                                        ack.ack_upto,
-                                        &ack.bitmap,
-                                    )
-                                };
-                                if !retransmits.is_empty() {
-                                    let srv = server.read().await;
-                                    for frame in retransmits {
-                                        let bytes = frame.to_ble_bytes();
-                                        if let Err(e) = srv.notify("Data_OUT", &bytes).await {
-                                            log::warn!(
-                                                "Retransmit failed for seq {}: {}",
-                                                frame.header.seq,
-                                                e
-                                            );
-                                        } else {
-                                            log::info!(
-                                                "--> RETRANSMITTED seq {} for stream {}",
-                                                frame.header.seq,
-                                                frame.header.stream_id
-                                            );
-                                        }
-                                    }
-                                }
-                                *last_ack_time.lock().await = tokio::time::Instant::now();
+                                Self::apply_ack_and_retransmit(
+                                    &state,
+                                    &server,
+                                    &last_ack_time,
+                                    ack.session_id,
+                                    ack.stream_id,
+                                    ack.ack_upto,
+                                    &ack.bitmap,
+                                    true,
+                                )
+                                .await;
                             } else if let Some(ack) = AckFrame::from_flutter_bytes(data) {
                                 log::debug!(
                                     "Flutter ACK: stream={}, ack_upto={}, bitmap={:02X?}",
@@ -652,34 +667,17 @@ impl ReliableBleOutput {
                                     ack.ack_upto,
                                     ack.bitmap
                                 );
-                                let retransmits = {
-                                    let mut st = state.write().await;
-                                    st.handle_ack_with_bitmap(
-                                        ack.session_id,
-                                        ack.stream_id,
-                                        ack.ack_upto,
-                                        &ack.bitmap,
-                                    )
-                                };
-                                if !retransmits.is_empty() {
-                                    let srv = server.read().await;
-                                    for frame in retransmits {
-                                        let bytes = frame.to_ble_bytes();
-                                        if let Err(e) = srv.notify("Data_OUT", &bytes).await {
-                                            log::warn!(
-                                                "Retransmit failed for seq {}: {}",
-                                                frame.header.seq,
-                                                e
-                                            );
-                                        } else {
-                                            log::debug!(
-                                                "Retransmitted seq {} (Flutter ACK-triggered)",
-                                                frame.header.seq
-                                            );
-                                        }
-                                    }
-                                }
-                                *last_ack_time.lock().await = tokio::time::Instant::now();
+                                Self::apply_ack_and_retransmit(
+                                    &state,
+                                    &server,
+                                    &last_ack_time,
+                                    ack.session_id,
+                                    ack.stream_id,
+                                    ack.ack_upto,
+                                    &ack.bitmap,
+                                    false,
+                                )
+                                .await;
                             } else {
                                 log::warn!(
                                     "Data_IN: unrecognized payload ({} bytes, byte[0]=0x{:02X}) — discarded",
