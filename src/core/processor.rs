@@ -217,15 +217,15 @@ impl VitalProcessor {
         let ble_output = self.create_ble_output().await?;
         let file_output = self.create_file_output().await?;
 
-        // Start BLE server if enabled (don't monitor this task)
-        if let Some(ref ble) = ble_output {
+        // Start BLE server if enabled
+        let ble_task = ble_output.as_ref().map(|ble| {
             let ble_clone = ble.clone();
             tokio::spawn(async move {
                 if let Err(e) = ble_clone.start().await {
                     log::error!("BLE server error: {}", e);
                 }
-            });
-        }
+            })
+        });
 
         // Start Socket.IO input server
         let mut socketio_server = SocketIOServer::new(
@@ -269,8 +269,17 @@ impl VitalProcessor {
             }
         });
 
+        // Both tasks run indefinitely in normal operation; awaiting them here
+        // just means a panic surfaces immediately instead of going unnoticed
+        // until the BLE health payload times out.
+        let ble_task_fut = async {
+            match ble_task {
+                Some(handle) => handle.await,
+                None => std::future::pending().await,
+            }
+        };
+
         // Wait for shutdown signal or task completion
-        // Note: We don't monitor BLE task because it should run indefinitely
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 log::info!("Shutdown signal received");
@@ -285,6 +294,12 @@ impl VitalProcessor {
                 match result {
                     Ok(_) => log::info!("Processing task stopped"),
                     Err(e) => log::error!("Processing task panicked: {}", e),
+                }
+            }
+            result = ble_task_fut => {
+                match result {
+                    Ok(_) => log::info!("BLE server task stopped"),
+                    Err(e) => log::error!("BLE server task panicked: {}", e),
                 }
             }
         }
