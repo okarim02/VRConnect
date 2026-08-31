@@ -564,6 +564,20 @@ impl Config {
             if self.output_ble_update_interval_ms == 0 {
                 return Err("BLE update interval must be greater than 0".to_string());
             }
+
+            // ble_supervision_timeout_sec == 0 means "disabled" (documented, not an error).
+            // When enabled, it must fire strictly after the grace-period reconnect window
+            // would have let a normal reconnect through — otherwise supervision_task can
+            // reset the session out from under a Central that reconnected in time.
+            if self.ble_supervision_timeout_sec != 0
+                && self.ble_supervision_timeout_sec <= self.ble_grace_period_sec
+            {
+                return Err(format!(
+                    "ble_supervision_timeout_sec ({}) must be greater than ble_grace_period_sec ({}) \
+                     when supervision is enabled",
+                    self.ble_supervision_timeout_sec, self.ble_grace_period_sec
+                ));
+            }
         }
 
         // Validate file output configuration
@@ -1069,6 +1083,34 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("BLE update interval"));
+    }
+
+    /// ID SRS: SRS-TEST-CFG-BLE-001
+    /// Version: V1.0
+    #[test]
+    fn test_validate_supervision_grace_ordering() {
+        let mut config = create_test_config();
+        config.output_ble_enabled = true;
+
+        // Equal — must fail, not just strictly less.
+        config.ble_grace_period_sec = 30;
+        config.ble_supervision_timeout_sec = 30;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("ble_supervision_timeout_sec"));
+
+        // Less than grace period — must fail.
+        config.ble_supervision_timeout_sec = 20;
+        assert!(config.validate().is_err());
+
+        // Strictly greater — ok.
+        config.ble_supervision_timeout_sec = 31;
+        assert!(config.validate().is_ok());
+
+        // 0 = supervision disabled — documented escape hatch, bypasses the ordering check
+        // even though 0 <= ble_grace_period_sec would otherwise fail it.
+        config.ble_supervision_timeout_sec = 0;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
