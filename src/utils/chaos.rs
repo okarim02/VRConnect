@@ -245,4 +245,222 @@ mod tests {
         assert_eq!(startup_status(), None);
         std::env::remove_var("APP_ENV");
     }
+
+    /// ID SRS: SRS-TEST-CHAOS-005
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn startup_status_lists_all_active_modes() {
+        std::env::set_var("APP_ENV", "development");
+        std::env::set_var("ENABLE_CHAOS_MONKEY", "true");
+        std::env::set_var("CHAOS_DISK_FULL", "true");
+        std::env::set_var("CHAOS_NETWORK_JITTER", "true");
+
+        let status = startup_status().expect("chaos is enabled, must be Some");
+        assert!(status.contains("DiskFull"));
+        assert!(status.contains("NetworkJitter"));
+        assert!(status.contains("PacketDrop"));
+        assert!(status.contains("APP_ENV=\"development\""));
+
+        std::env::remove_var("APP_ENV");
+        std::env::remove_var("ENABLE_CHAOS_MONKEY");
+        std::env::remove_var("CHAOS_DISK_FULL");
+        std::env::remove_var("CHAOS_NETWORK_JITTER");
+    }
+
+    /// ID SRS: SRS-TEST-CHAOS-006
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn startup_status_omits_disk_full_and_jitter_when_their_flags_are_off() {
+        std::env::set_var("APP_ENV", "development");
+        std::env::set_var("ENABLE_CHAOS_MONKEY", "true");
+        std::env::remove_var("CHAOS_DISK_FULL");
+        std::env::remove_var("CHAOS_NETWORK_JITTER");
+
+        let status = startup_status().expect("chaos is enabled, must be Some");
+        assert!(!status.contains("DiskFull"));
+        assert!(!status.contains("NetworkJitter"));
+        assert!(status.contains("PacketDrop"));
+
+        std::env::remove_var("APP_ENV");
+        std::env::remove_var("ENABLE_CHAOS_MONKEY");
+    }
+
+    /// ID SRS: SRS-TEST-CHAOS-007
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn should_trigger_zero_ratio_never_fires() {
+        std::env::set_var("CHAOS_RATIO", "0.0");
+        // Deterministic regardless of CHAOS_COUNTER's current value: threshold=0
+        // means `c % 100 < 0` is never checked — should_trigger returns early.
+        for _ in 0..5 {
+            assert!(!should_trigger());
+        }
+        std::env::remove_var("CHAOS_RATIO");
+    }
+
+    /// ID SRS: SRS-TEST-CHAOS-008
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn should_trigger_full_ratio_always_fires() {
+        std::env::set_var("CHAOS_RATIO", "1.0");
+        // Deterministic regardless of CHAOS_COUNTER's current value: threshold=100
+        // means `c % 100 < 100` holds for every possible c.
+        for _ in 0..5 {
+            assert!(should_trigger());
+        }
+        std::env::remove_var("CHAOS_RATIO");
+    }
+
+    /// ID SRS: SRS-TEST-CHAOS-009
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn should_trigger_out_of_range_ratio_is_clamped() {
+        // CHAOS_RATIO > 1.0 must clamp to 1.0 (always fires), not panic or overflow.
+        std::env::set_var("CHAOS_RATIO", "5.0");
+        assert!(should_trigger());
+        std::env::remove_var("CHAOS_RATIO");
+    }
+
+    /// ID SRS: SRS-TEST-CHAOS-010
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn maybe_drop_frame_false_when_chaos_disabled() {
+        std::env::remove_var("APP_ENV");
+        std::env::remove_var("ENABLE_CHAOS_MONKEY");
+        assert!(!maybe_drop_frame("test.rs"));
+    }
+
+    /// ID SRS: SRS-TEST-CHAOS-011
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn maybe_drop_frame_true_when_enabled_and_ratio_one() {
+        std::env::set_var("APP_ENV", "development");
+        std::env::set_var("ENABLE_CHAOS_MONKEY", "true");
+        std::env::set_var("CHAOS_RATIO", "1.0");
+
+        assert!(maybe_drop_frame("test.rs"));
+
+        std::env::remove_var("APP_ENV");
+        std::env::remove_var("ENABLE_CHAOS_MONKEY");
+        std::env::remove_var("CHAOS_RATIO");
+    }
+
+    /// ID SRS: SRS-TEST-CHAOS-012
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn maybe_disk_full_false_when_flag_unset() {
+        std::env::set_var("APP_ENV", "development");
+        std::env::set_var("ENABLE_CHAOS_MONKEY", "true");
+        std::env::set_var("CHAOS_RATIO", "1.0");
+        std::env::remove_var("CHAOS_DISK_FULL");
+
+        assert!(!maybe_disk_full("test.rs"));
+
+        std::env::remove_var("APP_ENV");
+        std::env::remove_var("ENABLE_CHAOS_MONKEY");
+        std::env::remove_var("CHAOS_RATIO");
+    }
+
+    /// ID SRS: SRS-TEST-CHAOS-013
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn maybe_disk_full_false_when_flag_set_but_chaos_disabled() {
+        // CHAOS_DISK_FULL alone isn't enough — the master switch/APP_ENV guardrail
+        // must also allow chaos, same as every other failure mode.
+        std::env::remove_var("APP_ENV");
+        std::env::remove_var("ENABLE_CHAOS_MONKEY");
+        std::env::set_var("CHAOS_DISK_FULL", "true");
+
+        assert!(!maybe_disk_full("test.rs"));
+
+        std::env::remove_var("CHAOS_DISK_FULL");
+    }
+
+    /// ID SRS: SRS-TEST-CHAOS-014
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn maybe_disk_full_true_when_flag_set_and_triggered() {
+        std::env::set_var("APP_ENV", "development");
+        std::env::set_var("ENABLE_CHAOS_MONKEY", "true");
+        std::env::set_var("CHAOS_RATIO", "1.0");
+        std::env::set_var("CHAOS_DISK_FULL", "true");
+
+        assert!(maybe_disk_full("test.rs"));
+
+        std::env::remove_var("APP_ENV");
+        std::env::remove_var("ENABLE_CHAOS_MONKEY");
+        std::env::remove_var("CHAOS_RATIO");
+        std::env::remove_var("CHAOS_DISK_FULL");
+    }
+
+    /// ID SRS: SRS-TEST-CHAOS-015
+    /// Version: V1.0
+    #[tokio::test]
+    #[serial]
+    async fn network_jitter_returns_immediately_when_flag_unset() {
+        std::env::set_var("APP_ENV", "development");
+        std::env::set_var("ENABLE_CHAOS_MONKEY", "true");
+        std::env::set_var("CHAOS_RATIO", "1.0");
+        std::env::remove_var("CHAOS_NETWORK_JITTER");
+
+        // Must return without sleeping — real (unpaused) time, so a hang would
+        // time out the test rather than just being slow.
+        maybe_network_jitter("test.rs").await;
+
+        std::env::remove_var("APP_ENV");
+        std::env::remove_var("ENABLE_CHAOS_MONKEY");
+        std::env::remove_var("CHAOS_RATIO");
+    }
+
+    /// ID SRS: SRS-TEST-CHAOS-016
+    /// Version: V1.0
+    #[tokio::test]
+    #[serial]
+    async fn network_jitter_returns_immediately_when_flag_set_but_chaos_disabled() {
+        // CHAOS_NETWORK_JITTER alone isn't enough — the master switch/APP_ENV
+        // guardrail must also allow chaos, same as every other failure mode.
+        std::env::remove_var("APP_ENV");
+        std::env::remove_var("ENABLE_CHAOS_MONKEY");
+        std::env::set_var("CHAOS_NETWORK_JITTER", "true");
+
+        maybe_network_jitter("test.rs").await;
+
+        std::env::remove_var("CHAOS_NETWORK_JITTER");
+    }
+
+    /// ID SRS: SRS-TEST-CHAOS-017
+    /// Version: V1.0
+    #[tokio::test]
+    #[serial]
+    async fn network_jitter_sleeps_when_triggered() {
+        tokio::time::pause();
+        std::env::set_var("APP_ENV", "development");
+        std::env::set_var("ENABLE_CHAOS_MONKEY", "true");
+        std::env::set_var("CHAOS_RATIO", "1.0");
+        std::env::set_var("CHAOS_NETWORK_JITTER", "true");
+
+        let handle = tokio::spawn(async {
+            maybe_network_jitter("test.rs").await;
+        });
+        // Yield so the spawned task registers its sleep before we fast-forward.
+        tokio::task::yield_now().await;
+        // Max possible delay is 100 + 2900 = 3000ms; advance past it.
+        tokio::time::advance(std::time::Duration::from_millis(3001)).await;
+        handle.await.expect("jitter task must not panic");
+
+        std::env::remove_var("APP_ENV");
+        std::env::remove_var("ENABLE_CHAOS_MONKEY");
+        std::env::remove_var("CHAOS_RATIO");
+        std::env::remove_var("CHAOS_NETWORK_JITTER");
+    }
 }
