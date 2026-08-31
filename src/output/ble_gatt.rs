@@ -403,20 +403,44 @@ impl GattServer {
             Err(e) => log::warn!("notify '{}': SubscribedClients() failed: {}", name, e),
         }
 
-        let writer =
-            DataWriter::new().map_err(|e| VitalError::Config(format!("DataWriter::new: {}", e)))?;
-        writer
-            .WriteBytes(data)
-            .map_err(|e| VitalError::Config(format!("WriteBytes: {}", e)))?;
-        let buffer = writer
-            .DetachBuffer()
-            .map_err(|e| VitalError::Config(format!("DetachBuffer: {}", e)))?;
+        // DataWriter/IBuffer aren't Send, so the whole buffer build + notify
+        // wait runs inside the blocking closure — only `local_char` (Send) and
+        // an owned copy of `data` cross into it. NotifyValueAsync(...).get()
+        // blocks the calling thread until the Central acks (or the driver
+        // times out) — observed as tens of ms under BLE congestion. Running it
+        // on the blocking-thread-pool instead of a tokio worker thread avoids
+        // stalling other tasks (ACK processing, health checks, retransmit
+        // logic) scheduled on that worker for the same duration.
+        let local_char = local_char.clone();
+        let data = data.to_vec();
+        // Closure returns a plain String error (small, Send) rather than
+        // VitalError — VitalError::Regex carries a fancy_regex::Error large
+        // enough to trip clippy::result_large_err on this closure boundary.
+        // Converted to VitalError once, after crossing back out of spawn_blocking.
+        let notify_result: std::result::Result<(), String> =
+            tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
+                let writer = DataWriter::new().map_err(|e| format!("DataWriter::new: {}", e))?;
+                writer
+                    .WriteBytes(&data)
+                    .map_err(|e| format!("WriteBytes: {}", e))?;
+                let buffer = writer
+                    .DetachBuffer()
+                    .map_err(|e| format!("DetachBuffer: {}", e))?;
 
-        local_char
-            .NotifyValueAsync(&buffer)
-            .map_err(|e| VitalError::Config(format!("NotifyValueAsync call: {}", e)))?
-            .get()
-            .map_err(|e| VitalError::Config(format!("NotifyValueAsync await: {}", e)))?;
+                // NotifyValueAsync's result (IVectorView<GattClientNotificationResult>,
+                // one entry per notified client) isn't Send either — discard it, only
+                // the Err path needs to cross back out.
+                local_char
+                    .NotifyValueAsync(&buffer)
+                    .map_err(|e| format!("NotifyValueAsync call: {}", e))?
+                    .get()
+                    .map_err(|e| format!("NotifyValueAsync await: {}", e))?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| format!("NotifyValueAsync blocking task panicked: {}", e))
+            .and_then(|inner| inner);
+        notify_result.map_err(VitalError::Config)?;
 
         Ok(())
     }
@@ -580,5 +604,18 @@ mod tests {
         assert_ne!(CharProperty::Read, CharProperty::Write);
         assert_ne!(CharProperty::Write, CharProperty::WriteWithoutResponse);
         assert_ne!(CharProperty::Notify, CharProperty::Read);
+    }
+}
+
+#[cfg(test)]
+mod send_check {
+    // GattServer must stay Send: it's shared via Arc<RwLock<GattServer>> across
+    // tokio::spawn'd tasks (see ReliableBleOutput). Notably, GattLocalCharacteristic
+    // is Send but IBuffer is not — that's why notify()'s spawn_blocking closure
+    // builds the IBuffer from raw bytes internally instead of receiving one.
+    fn assert_send<T: Send>() {}
+    #[test]
+    fn gatt_server_is_send() {
+        assert_send::<super::GattServer>();
     }
 }
