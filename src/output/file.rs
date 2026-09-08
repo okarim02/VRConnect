@@ -381,7 +381,7 @@ impl FileOutput {
 
         let archive_path = archive_dir.join(archive_name);
 
-        self.create_zip_archive(&archive_path, &files)?;
+        self.create_zip_archive(&archive_path, &files).await?;
 
         // Remove archived files
         for file in &files {
@@ -449,7 +449,7 @@ impl FileOutput {
             self.calculate_files_size(&files)? as f64 / (1024.0 * 1024.0 * 1024.0)
         );
 
-        self.create_zip_archive(&archive_path, &files)?;
+        self.create_zip_archive(&archive_path, &files).await?;
 
         // Remove archived files
         for file in &files {
@@ -563,8 +563,17 @@ impl FileOutput {
     /// ID SRS: SRS-FN-FILEOUTPUT-011
     /// Title: create_zip_archive
     ///
-    /// Description: VRConnect shall create ZIP archive containing
-    /// specified files with compression.
+    /// Description: VRConnect shall create ZIP archive containing specified files
+    /// with compression, running the blocking read + deflate work on the
+    /// blocking-thread-pool rather than on the caller's tokio task.
+    ///
+    /// The whole output pipeline is driven by a single task (`processing_task` in
+    /// `core/processor.rs`) which awaits console → BLE → file in sequence for every
+    /// sample, so a synchronous zip here halts BLE emission for its full duration.
+    /// Observed on the ~70 h soak of 2026-09-03/06: 20.7 s, then 24.5 s, then 40.6 s
+    /// of zero `Data_OUT` at midnight, growing with the number of files to compress
+    /// (138 frames pending on the third night). Same remedy as `notify()` in
+    /// `ble_gatt.rs`.
     ///
     /// Version: V1.0
     ///
@@ -574,7 +583,31 @@ impl FileOutput {
     ///
     /// # Returns
     /// Result indicating success or error
-    fn create_zip_archive(&self, archive_path: &Path, files: &[PathBuf]) -> Result<()> {
+    async fn create_zip_archive(&self, archive_path: &Path, files: &[PathBuf]) -> Result<()> {
+        let archive_path = archive_path.to_path_buf();
+        let files = files.to_vec();
+
+        tokio::task::spawn_blocking(move || Self::write_zip_archive(&archive_path, &files))
+            .await
+            .map_err(|e| VitalError::Processing(format!("ZIP blocking task panicked: {}", e)))?
+    }
+
+    /// ID SRS: SRS-FN-FILEOUTPUT-016
+    /// Title: write_zip_archive
+    ///
+    /// Description: VRConnect shall perform the synchronous read + deflate of an
+    /// archive. Always invoked from the blocking-thread-pool through
+    /// `create_zip_archive` — never called directly from an async task.
+    ///
+    /// Version: V1.0
+    ///
+    /// # Arguments
+    /// * `archive_path` - Output archive path
+    /// * `files` - Files to archive
+    ///
+    /// # Returns
+    /// Result indicating success or error
+    fn write_zip_archive(archive_path: &Path, files: &[PathBuf]) -> Result<()> {
         use zip::write::FileOptions;
 
         let file = File::create(archive_path).map_err(VitalError::Io)?;
@@ -1399,9 +1432,66 @@ mod tests {
         let archive_path = temp_dir.path().join("test_archive.zip");
         let files = vec![file1_path];
 
-        let result = file_output.create_zip_archive(&archive_path, &files);
+        let result = file_output.create_zip_archive(&archive_path, &files).await;
         assert!(result.is_ok());
         assert!(archive_path.exists());
+    }
+
+    /// ID SRS: SRS-TEST-FILEOUT-034
+    /// Title: Test create_zip_archive keeps the runtime schedulable (TC-BLE-PROTO-F14)
+    ///
+    /// Description: VRConnect shall keep the async runtime schedulable while an
+    /// archive is being compressed. Regression guard for F14, observed on the
+    /// ~70 h soak of 2026-09-03/06: a synchronous zip on the single
+    /// `processing_task` stopped BLE emission for up to 40.6 s at midnight.
+    ///
+    /// On the current-thread runtime used by `#[tokio::test]`, a spawned task can
+    /// only progress when the running task yields. A blocking zip never yields, so
+    /// `ticks` would stay at 0; routing it through `spawn_blocking` yields at the
+    /// await point and lets the co-scheduled task run.
+    ///
+    /// Version: V1.0
+    #[tokio::test]
+    async fn test_create_zip_archive_does_not_block_runtime() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().to_str().unwrap().to_string();
+
+        let file_output = FileOutput::new(base_path.clone(), 500, 5, 100)
+            .await
+            .unwrap();
+
+        let test_dir = temp_dir.path().join("test_files");
+        fs::create_dir_all(&test_dir).unwrap();
+
+        let file_path = test_dir.join("test1.json");
+        let mut f = File::create(&file_path).unwrap();
+        f.write_all(&vec![b'x'; 1024 * 1024]).unwrap();
+        drop(f);
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticks_task = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            for _ in 0..1000 {
+                ticks_task.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let archive_path = temp_dir.path().join("test_archive.zip");
+        file_output
+            .create_zip_archive(&archive_path, &[file_path])
+            .await
+            .unwrap();
+
+        assert!(
+            ticks.load(Ordering::SeqCst) > 0,
+            "co-scheduled task never ran — the zip blocked the runtime"
+        );
+        assert!(archive_path.exists());
+
+        ticker.abort();
     }
 
     /// ID SRS: SRS-TEST-FILEOUT-020

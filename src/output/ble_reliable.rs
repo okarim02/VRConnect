@@ -938,7 +938,8 @@ impl ReliableBleOutput {
                 }
                 Some(BleConnectionEvent::Disconnected) => {
                     log::info!(
-                        "[BLE] Central disconnected — starting grace period ({:?})",
+                        "[BLE] CCCD subscribers lost (Central gone OR local stack down) — \
+                         starting grace period ({:?})",
                         grace_period
                     );
 
@@ -1982,6 +1983,37 @@ impl ReliableBleOutput {
             let _ = tokio::time::timeout(interval, health_notify.notified()).await;
 
             let os = read_os_snapshot(Path::new(&health_file), stale_threshold);
+
+            // Re-read the GATT advertising status every heartbeat. Nothing else in
+            // GATE observes it: it is set once at startup and, if it dies afterwards
+            // (driver fault, machine sleep, stack reset), no log line reports it. This
+            // is what left the ~70 h soak of 2026-09-03/06 undiagnosable.
+            let adv_state = server.read().await.advertising_state();
+            match adv_state {
+                Some(state) if state.is_started() => {
+                    log::debug!("[health] GATT advertising status: {}", state);
+                }
+                Some(state) => {
+                    log::warn!(
+                        "[health] GATT advertising status: {} — expected Started. \
+                         The device is no longer discoverable; a Central that drops \
+                         will not be able to reconnect.",
+                        state
+                    );
+                }
+                None => {
+                    log::warn!(
+                        "[health] GATT advertising status unreadable (server not started \
+                         or WinRT read failed) — reporting adv=0"
+                    );
+                }
+            }
+
+            {
+                let mut gate = health_state.write().await;
+                gate.adv_started = adv_state.map(|s| s.is_started());
+            }
+
             let gate = health_state.read().await;
             let payload = build_payload(&os, &gate);
             drop(gate);
@@ -1996,10 +2028,10 @@ impl ReliableBleOutput {
                         );
                     } else {
                         log::debug!(
-                            "[health] Health payload sent ({} bytes, ok={} gate={} sio={} ble={} flow={} vr={} disk={} wd_vr={} wd_gate={})",
+                            "[health] Health payload sent ({} bytes, ok={} gate={} sio={} ble={} flow={} vr={} disk={} wd_vr={} wd_gate={} adv={})",
                             bytes.len(), payload.ok, payload.gate, payload.sio,
                             payload.ble, payload.flow, payload.vr, payload.disk,
-                            payload.wd_vr, payload.wd_gate
+                            payload.wd_vr, payload.wd_gate, payload.adv
                         );
                     }
                 }

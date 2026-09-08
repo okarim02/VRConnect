@@ -59,8 +59,90 @@ pub enum CharProperty {
 pub enum BleConnectionEvent {
     /// CCCD subscriber count rose from 0 → ≥ 1 (Central connected / reconnected).
     Connected,
-    /// CCCD subscriber count dropped to 0 (Central disconnected).
+    /// CCCD subscriber count dropped to 0. The cause is NOT observable here: the
+    /// Central may be gone, or the local Bluetooth stack may have collapsed.
     Disconnected,
+}
+
+/// ID SRS: SRS-MOD-BLEGATT-003
+/// Title: CCCD_SUBSCRIBERS_LOST_MSG
+///
+/// Description: Log line emitted when the CCCD subscriber count on Data_OUT
+/// drops to 0. Deliberately names BOTH possible causes and asserts neither —
+/// see the comment on `BleConnectionEvent::Disconnected` and on the
+/// `SubscribedClientsChanged` handler in `start()` for the full rationale.
+///
+/// Version: V1.0
+pub const CCCD_SUBSCRIBERS_LOST_MSG: &str =
+    "[BLE] Data_OUT: CCCD subscriber count → 0 (Central gone OR local stack down)";
+
+/// ID SRS: SRS-MOD-BLEGATT-002
+/// Title: AdvertisingState
+///
+/// Description: Local mirror of the WinRT `GattServiceProviderAdvertisementStatus`
+/// enum, so callers outside this module can reason about the advertising state
+/// without depending on the `windows` crate.
+///
+/// Values follow WinRT: Created = 0, Stopped = 1, Started = 2, Aborted = 3.
+/// Any future value is preserved verbatim in `Unknown` rather than being folded
+/// into an existing variant — an unrecognised status must not be reported as a
+/// healthy one.
+///
+/// Version: V1.0
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvertisingState {
+    /// Provider created but advertising never started.
+    Created,
+    /// Advertising explicitly stopped.
+    Stopped,
+    /// Advertising live — the only healthy value.
+    Started,
+    /// Advertising aborted by the system (resource exhaustion, radio off, driver fault).
+    Aborted,
+    /// Status value not covered by the WinRT enum at time of writing.
+    Unknown(i32),
+}
+
+impl AdvertisingState {
+    /// ID SRS: SRS-FN-BLEGATT-013
+    /// Title: from_winrt
+    ///
+    /// Description: VRConnect shall map a raw WinRT advertisement status value onto
+    /// `AdvertisingState`.
+    ///
+    /// Version: V1.0
+    pub fn from_winrt(value: i32) -> Self {
+        match value {
+            0 => Self::Created,
+            1 => Self::Stopped,
+            2 => Self::Started,
+            3 => Self::Aborted,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// ID SRS: SRS-FN-BLEGATT-014
+    /// Title: is_started
+    ///
+    /// Description: VRConnect shall report whether advertising is live. Only
+    /// `Started` is healthy; every other value, `Unknown` included, is not.
+    ///
+    /// Version: V1.0
+    pub fn is_started(&self) -> bool {
+        matches!(self, Self::Started)
+    }
+}
+
+impl std::fmt::Display for AdvertisingState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Created => write!(f, "Created"),
+            Self::Stopped => write!(f, "Stopped"),
+            Self::Started => write!(f, "Started"),
+            Self::Aborted => write!(f, "Aborted"),
+            Self::Unknown(v) => write!(f, "Unknown({})", v),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -348,8 +430,17 @@ impl GattServer {
                     })?;
             }
 
-            // Register SubscribedClientsChanged on Data_OUT to detect Central disconnection.
-            // Fires when the CCCD subscriber count changes; we act only when it drops to 0.
+            // Register SubscribedClientsChanged on Data_OUT to detect the loss of the
+            // Central. Fires when the CCCD subscriber count changes; we act only when it
+            // drops to 0.
+            //
+            // The handler only ever observes `SubscribedClients().Size()`. It cannot know
+            // WHY the count fell: a Central walking away and a local Bluetooth stack
+            // collapsing produce the exact same event, and the `unwrap_or(0)` below also
+            // maps a WinRT read failure onto "0 subscribers". The log line must therefore
+            // not name a cause — during the ~70 h soak of 2026-09-03/06 the previous
+            // wording ("Central disconnected") sent the first analysis after the phone
+            // while the operator was looking at an Intel driver failure on the PC.
             if cfg.name == "Data_OUT" {
                 let disc_tx = self.disconnect_tx.clone();
                 local_char
@@ -363,9 +454,7 @@ impl GattServer {
                                 .and_then(|c| c.Size())
                                 .unwrap_or(0); // conservative: WinRT error during teardown → treat as 0 subscribers
                             if n == 0 {
-                                log::info!(
-                                    "[BLE] Data_OUT: CCCD subscriber count → 0 (Central disconnected)"
-                                );
+                                log::info!("{}", CCCD_SUBSCRIBERS_LOST_MSG);
                                 let _ = disc_tx.send(BleConnectionEvent::Disconnected);
                             } else {
                                 log::info!(
@@ -418,6 +507,36 @@ impl GattServer {
         );
 
         Ok(())
+    }
+
+    /// ID SRS: SRS-FN-BLEGATT-012
+    /// Title: advertising_state
+    ///
+    /// Description: VRConnect shall report the live advertising state of the GATT
+    ///              service provider, so that an advertisement which dies silently
+    ///              (driver fault, machine sleep, Bluetooth stack reset) becomes
+    ///              visible instead of being invisible until a Central fails to find
+    ///              the device.
+    ///
+    ///              `StartAdvertisingWithParameters` is called exactly once in
+    ///              `start()`, and before this method existed nothing ever re-read
+    ///              the status. On the ~70 h soak of 2026-09-03/06 the session ended
+    ///              at 22:50:31 and 615 MB of logs held no trace of whether the
+    ///              advertisement was still alive — the run stayed undiagnosable.
+    ///
+    ///              Returns `None` when the server has not been started, or when the
+    ///              WinRT read itself fails.
+    ///
+    /// Version: V1.0
+    pub fn advertising_state(&self) -> Option<AdvertisingState> {
+        let provider = self.provider.as_ref()?;
+        match provider.AdvertisementStatus() {
+            Ok(status) => Some(AdvertisingState::from_winrt(status.0)),
+            Err(e) => {
+                log::warn!("[BLE] AdvertisementStatus() read failed: {}", e);
+                None
+            }
+        }
     }
 
     /// ID SRS: SRS-FN-BLEGATT-007
@@ -690,6 +809,83 @@ mod tests {
         assert_ne!(CharProperty::Read, CharProperty::Write);
         assert_ne!(CharProperty::Write, CharProperty::WriteWithoutResponse);
         assert_ne!(CharProperty::Notify, CharProperty::Read);
+    }
+
+    /// ID SRS: SRS-TEST-BLEGATT-011
+    /// Title: TC-BLE-PROTO-F11 — advertising status mapping
+    ///
+    /// Description: VRConnect shall map every WinRT advertisement status value onto
+    /// the matching `AdvertisingState`, and shall preserve an unrecognised value in
+    /// `Unknown` rather than folding it into a known variant.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn tc_ble_proto_f11_advertising_state_mapping() {
+        assert_eq!(AdvertisingState::from_winrt(0), AdvertisingState::Created);
+        assert_eq!(AdvertisingState::from_winrt(1), AdvertisingState::Stopped);
+        assert_eq!(AdvertisingState::from_winrt(2), AdvertisingState::Started);
+        assert_eq!(AdvertisingState::from_winrt(3), AdvertisingState::Aborted);
+        assert_eq!(
+            AdvertisingState::from_winrt(7),
+            AdvertisingState::Unknown(7)
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLEGATT-012
+    /// Title: TC-BLE-PROTO-F11 — only Started counts as healthy
+    ///
+    /// Description: VRConnect shall treat `Started` as the sole healthy advertising
+    /// state. `Aborted` in particular — the value a driver fault or a radio shutdown
+    /// produces — must never be reported as healthy, and neither must an unknown one.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn tc_ble_proto_f11_only_started_is_healthy() {
+        assert!(AdvertisingState::Started.is_started());
+        assert!(!AdvertisingState::Created.is_started());
+        assert!(!AdvertisingState::Stopped.is_started());
+        assert!(!AdvertisingState::Aborted.is_started());
+        assert!(!AdvertisingState::Unknown(42).is_started());
+    }
+
+    /// ID SRS: SRS-TEST-BLEGATT-013
+    /// Title: TC-BLE-PROTO-F11 — advertising status is unreadable before start()
+    ///
+    /// Description: VRConnect shall return `None` when the advertising status is
+    /// queried on a server that was never started, so the health task reports
+    /// `adv = 0` instead of a fabricated healthy value.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn tc_ble_proto_f11_status_none_before_start() {
+        let server = GattServer::new(
+            "TestDevice".to_string(),
+            uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap(),
+        );
+        assert_eq!(server.advertising_state(), None);
+    }
+
+    /// ID SRS: SRS-TEST-BLEGATT-014
+    /// Title: TC-BLE-PROTO-F12 — disconnect state names no cause
+    ///
+    /// Description: The CCCD handler observes only a subscriber count; it cannot tell
+    /// a departed Central from a collapsed local Bluetooth stack. This test pins the
+    /// content of `CCCD_SUBSCRIBERS_LOST_MSG` — the single source the handler logs
+    /// from — so the wording cannot be silently reverted to one that asserts a cause,
+    /// as it did on the ~70 h soak of 2026-09-03/06, sending the first analysis after
+    /// the phone while the fault was an Intel driver on the PC.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn tc_ble_proto_f12_disconnect_event_asserts_no_cause() {
+        assert!(
+            !CCCD_SUBSCRIBERS_LOST_MSG.contains("(Central disconnected)"),
+            "the log line must not assert a cause the CCCD handler cannot observe"
+        );
+        assert!(
+            CCCD_SUBSCRIBERS_LOST_MSG.contains("Central gone OR local stack down"),
+            "the neutral CCCD wording is missing"
+        );
     }
 }
 

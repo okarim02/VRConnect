@@ -7,7 +7,22 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Unix time (seconds) of the last emitted `health.json stale` log line, or 0 if
+/// none has been emitted yet. See `log_stale_snapshot`.
+static LAST_STALE_LOG_SEC: AtomicU64 = AtomicU64::new(0);
+
+/// Number of stale reads suppressed since the last emitted log line.
+static SUPPRESSED_STALE_READS: AtomicU64 = AtomicU64::new(0);
+
+/// Minimum spacing between two `health.json stale` log lines, after the first.
+const STALE_LOG_INTERVAL_SEC: u64 = 3600;
+
+/// Multiple of the stale threshold beyond which the condition is logged at ERROR
+/// rather than WARN: at this point HealthWriter is not late, it is gone.
+const STALE_ESCALATION_FACTOR: u64 = 10;
 
 // ──────────────────────────────────────────────
 // OS snapshot (from health.json)
@@ -66,6 +81,11 @@ pub struct GateHealthState {
     pub last_processed_data: Option<Instant>,
     /// flow = 0 if no ProcessedData received within this many seconds.
     pub flow_timeout_sec: u64,
+    /// GATT advertising live (`AdvertisementStatus == Started`), re-read by the
+    /// health task at every heartbeat. `None` until the first successful read, or
+    /// whenever the WinRT read fails — reported as `adv = 0` in the payload, since
+    /// "unknown" must never be published as healthy.
+    pub adv_started: Option<bool>,
 }
 
 impl Default for GateHealthState {
@@ -76,6 +96,7 @@ impl Default for GateHealthState {
             ble_subscriber: false,
             last_processed_data: None,
             flow_timeout_sec: 60,
+            adv_started: None,
         }
     }
 }
@@ -148,6 +169,13 @@ pub struct HealthPayload {
     pub wd_vr: u8,
     /// VRConnect watchdog task running (from health.json).
     pub wd_gate: u8,
+    /// GATT advertising live (`AdvertisementStatus == Started`). 0 also when the
+    /// status could not be read — unknown is never published as healthy.
+    ///
+    /// Deliberately NOT folded into `ok`: this indicator is new and its field
+    /// behaviour across Bluetooth stacks is not yet characterised, so it reports
+    /// without gating the global verdict. Revisit once a soak has run with it.
+    pub adv: u8,
 }
 
 // ──────────────────────────────────────────────
@@ -190,14 +218,66 @@ pub fn read_os_snapshot(path: &Path, stale_threshold_sec: u64) -> OsHealthSnapsh
 
     let age = now_sec.saturating_sub(snapshot.ts);
     if age > stale_threshold_sec {
-        log::warn!(
-            "[health] health.json stale (ts={}, age={}s > threshold={}s) — HealthWriter may be dead",
-            snapshot.ts, age, stale_threshold_sec
-        );
+        log_stale_snapshot(now_sec, snapshot.ts, age, stale_threshold_sec);
         return OsHealthSnapshot::default();
     }
 
     snapshot
+}
+
+/// ID SRS: SRS-FN-HEALTH-005
+/// Title: log_stale_snapshot
+///
+/// Description: VRConnect shall report a stale health.json at most once per
+/// `STALE_LOG_INTERVAL_SEC`, after an immediate first occurrence, and shall raise
+/// the level from WARN to ERROR once the file is older than
+/// `STALE_ESCALATION_FACTOR` × the stale threshold.
+///
+/// This is a logging concern only: the caller zeroes the snapshot on every stale
+/// read regardless of whether a line is emitted here. The fail-safe behaviour is
+/// deliberately untouched.
+///
+/// Rationale: on the ~70 h soak of 2026-09-03/06 HealthWriter.ps1 died after its
+/// very first write and GATE emitted 8 156 identical warnings — one every 30 s —
+/// which buried the condition instead of surfacing it. Each suppressed occurrence
+/// is counted and reported on the next emitted line, so nothing is lost.
+///
+/// Version: V1.0
+fn log_stale_snapshot(now_sec: u64, ts: u64, age: u64, stale_threshold_sec: u64) {
+    let last = LAST_STALE_LOG_SEC.load(Ordering::Relaxed);
+    let due = last == 0 || now_sec.saturating_sub(last) >= STALE_LOG_INTERVAL_SEC;
+
+    if !due {
+        SUPPRESSED_STALE_READS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    LAST_STALE_LOG_SEC.store(now_sec, Ordering::Relaxed);
+    let suppressed = SUPPRESSED_STALE_READS.swap(0, Ordering::Relaxed);
+
+    let escalate = age > stale_threshold_sec.saturating_mul(STALE_ESCALATION_FACTOR);
+
+    if escalate {
+        log::error!(
+            "[health] health.json stale for {}s (ts={}, threshold={}s) — HealthWriter.ps1 \
+             is not running; OS supervision (vr/disk/wd_vr/wd_gate) has been blind and \
+             ok=0 for that whole period. {} identical read(s) suppressed since the last \
+             line.",
+            age,
+            ts,
+            stale_threshold_sec,
+            suppressed
+        );
+    } else {
+        log::warn!(
+            "[health] health.json stale (ts={}, age={}s > threshold={}s) — HealthWriter \
+             may be dead. {} identical read(s) suppressed since the last line.",
+            ts,
+            age,
+            stale_threshold_sec,
+            suppressed
+        );
+    }
 }
 
 /// ID SRS: SRS-FN-HEALTH-003
@@ -233,6 +313,7 @@ pub fn build_payload(os: &OsHealthSnapshot, gate: &GateHealthState) -> HealthPay
         disk: os.disk,
         wd_vr: os.wd_vr,
         wd_gate: os.wd_gate,
+        adv: gate.adv_started.unwrap_or(false) as u8,
     }
 }
 
@@ -243,6 +324,7 @@ pub fn build_payload(os: &OsHealthSnapshot, gate: &GateHealthState) -> HealthPay
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -273,6 +355,7 @@ mod tests {
             ble_subscriber: true,
             last_processed_data: Some(Instant::now() - Duration::from_secs(5)),
             flow_timeout_sec: 60,
+            adv_started: Some(true),
         }
     }
 
@@ -329,7 +412,10 @@ mod tests {
     /// ID SRS: SRS-TEST-HEALTH-003
     /// Version: V1.0
     /// HT-003 — stale ts (120s old, threshold 60s) → all OS fields zeroed.
+    ///
+    /// `#[serial]`: a stale read touches the rate-limiter statics shared with HT-013.
     #[test]
+    #[serial]
     fn ht_003_stale_snapshot() {
         let old_ts = now_sec().saturating_sub(120);
         let f = write_temp(&fresh_json(old_ts));
@@ -477,6 +563,136 @@ mod tests {
             "Payload exceeds 120-byte soft target: {} bytes — `{}`",
             json.len(),
             json
+        );
+    }
+
+    /// ID SRS: SRS-TEST-HEALTH-011
+    /// Title: TC-BLE-PROTO-F11 — adv mirrors the advertising state
+    ///
+    /// Description: VRConnect shall report `adv = 1` only when advertising was read
+    /// and found live. An unread status (`None`) must report 0: a status nobody could
+    /// read is not evidence that the device is discoverable.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn ht_011_adv_reflects_advertising_state() {
+        let os = all_ok_os();
+
+        let mut gate = all_ok_gate();
+        gate.adv_started = Some(true);
+        assert_eq!(build_payload(&os, &gate).adv, 1);
+
+        gate.adv_started = Some(false);
+        assert_eq!(build_payload(&os, &gate).adv, 0);
+
+        gate.adv_started = None;
+        assert_eq!(
+            build_payload(&os, &gate).adv,
+            0,
+            "an unreadable advertising status must never be published as healthy"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-HEALTH-012
+    /// Title: adv does not gate ok
+    ///
+    /// Description: `adv` reports without taking part in the global verdict. This is
+    /// a deliberate choice for its first release — the indicator is new and its
+    /// behaviour across Bluetooth stacks is not yet characterised, so it must not be
+    /// able to turn `ok` to 0 on its own. This test pins that decision so a later
+    /// change to it is explicit rather than accidental.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn ht_012_adv_does_not_gate_ok() {
+        let os = all_ok_os();
+        let mut gate = all_ok_gate();
+        gate.adv_started = Some(false);
+
+        let p = build_payload(&os, &gate);
+        assert_eq!(p.adv, 0);
+        assert_eq!(
+            p.ok, 1,
+            "adv must not gate ok yet — see SRS-TEST-HEALTH-012"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-HEALTH-013
+    /// Title: TC-BLE-PROTO-F13 — stale health.json is logged at most hourly
+    ///
+    /// Description: VRConnect shall log the first stale read immediately, suppress
+    /// and count the repeats, then log again once `STALE_LOG_INTERVAL_SEC` has
+    /// elapsed, reporting how many were suppressed.
+    ///
+    /// Regression guard for F13: HealthWriter.ps1 died on the very first cycle of the
+    /// ~70 h soak of 2026-09-03/06 and GATE emitted 8 156 identical warnings, one
+    /// every 30 s, burying the condition instead of surfacing it.
+    ///
+    /// `#[serial]`: drives the module-level rate-limiter statics.
+    ///
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn ht_013_stale_log_is_rate_limited() {
+        LAST_STALE_LOG_SEC.store(0, Ordering::Relaxed);
+        SUPPRESSED_STALE_READS.store(0, Ordering::Relaxed);
+
+        let t0 = 1_000_000_u64;
+
+        // First stale read always produces a line.
+        log_stale_snapshot(t0, t0 - 100, 100, 60);
+        assert_eq!(LAST_STALE_LOG_SEC.load(Ordering::Relaxed), t0);
+        assert_eq!(SUPPRESSED_STALE_READS.load(Ordering::Relaxed), 0);
+
+        // The next 30 s-spaced reads are counted, not logged.
+        for i in 1..=5 {
+            log_stale_snapshot(t0 + i * 30, t0 - 100, 100, 60);
+        }
+        assert_eq!(SUPPRESSED_STALE_READS.load(Ordering::Relaxed), 5);
+        assert_eq!(
+            LAST_STALE_LOG_SEC.load(Ordering::Relaxed),
+            t0,
+            "no second line may be emitted inside the interval"
+        );
+
+        // Once the interval has elapsed, a line is emitted and the counter resets.
+        let t1 = t0 + STALE_LOG_INTERVAL_SEC;
+        log_stale_snapshot(t1, t0 - 100, 100, 60);
+        assert_eq!(LAST_STALE_LOG_SEC.load(Ordering::Relaxed), t1);
+        assert_eq!(SUPPRESSED_STALE_READS.load(Ordering::Relaxed), 0);
+    }
+
+    /// ID SRS: SRS-TEST-HEALTH-014
+    /// Title: TC-BLE-PROTO-F13 — rate limiting never weakens the fail-safe
+    ///
+    /// Description: Suppressing a log line shall not suppress the zeroing of the OS
+    /// snapshot. Every stale read returns zeroed fields, logged or not — the
+    /// fail-safe is a separate concern from the reporting frequency.
+    ///
+    /// `#[serial]`: drives the module-level rate-limiter statics.
+    ///
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn ht_014_rate_limit_preserves_failsafe() {
+        LAST_STALE_LOG_SEC.store(0, Ordering::Relaxed);
+        SUPPRESSED_STALE_READS.store(0, Ordering::Relaxed);
+
+        let stale_ts = now_sec().saturating_sub(120);
+        let f = write_temp(&fresh_json(stale_ts));
+
+        // Read repeatedly: only the first one can log, all must zero the snapshot.
+        for _ in 0..5 {
+            let snap = read_os_snapshot(f.path(), 60);
+            assert_eq!(snap.vr, 0);
+            assert_eq!(snap.disk, 0);
+            assert_eq!(snap.wd_vr, 0);
+            assert_eq!(snap.wd_gate, 0);
+        }
+
+        assert!(
+            SUPPRESSED_STALE_READS.load(Ordering::Relaxed) >= 4,
+            "repeat stale reads must be suppressed, not re-logged"
         );
     }
 }
