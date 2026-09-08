@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Unix time (seconds) of the last emitted `health.json stale` log line, or 0 if
@@ -16,6 +16,12 @@ static LAST_STALE_LOG_SEC: AtomicU64 = AtomicU64::new(0);
 
 /// Number of stale reads suppressed since the last emitted log line.
 static SUPPRESSED_STALE_READS: AtomicU64 = AtomicU64::new(0);
+
+/// True once a stale run has crossed `STALE_ESCALATION_FACTOR` × the threshold and
+/// been logged at ERROR. Reset to false the moment `read_os_snapshot` sees a fresh
+/// file again, so the next staleness incident starts unescalated. See
+/// `log_stale_snapshot` for why this exists separately from `LAST_STALE_LOG_SEC`.
+static ESCALATED: AtomicBool = AtomicBool::new(false);
 
 /// Minimum spacing between two `health.json stale` log lines, after the first.
 const STALE_LOG_INTERVAL_SEC: u64 = 3600;
@@ -222,6 +228,11 @@ pub fn read_os_snapshot(path: &Path, stale_threshold_sec: u64) -> OsHealthSnapsh
         return OsHealthSnapshot::default();
     }
 
+    // Recovered: the next staleness incident (if any) must start from "just went
+    // stale, not yet escalated" rather than inheriting ERROR-level state left over
+    // from a past, unrelated incident.
+    ESCALATED.store(false, Ordering::Relaxed);
+
     snapshot
 }
 
@@ -230,8 +241,8 @@ pub fn read_os_snapshot(path: &Path, stale_threshold_sec: u64) -> OsHealthSnapsh
 ///
 /// Description: VRConnect shall report a stale health.json at most once per
 /// `STALE_LOG_INTERVAL_SEC`, after an immediate first occurrence, and shall raise
-/// the level from WARN to ERROR once the file is older than
-/// `STALE_ESCALATION_FACTOR` × the stale threshold.
+/// the level from WARN to ERROR — **immediately**, not gated by the hourly window —
+/// the moment the file crosses `STALE_ESCALATION_FACTOR` × the stale threshold.
 ///
 /// This is a logging concern only: the caller zeroes the snapshot on every stale
 /// read regardless of whether a line is emitted here. The fail-safe behaviour is
@@ -242,20 +253,37 @@ pub fn read_os_snapshot(path: &Path, stale_threshold_sec: u64) -> OsHealthSnapsh
 /// which buried the condition instead of surfacing it. Each suppressed occurrence
 /// is counted and reported on the next emitted line, so nothing is lost.
 ///
+/// The escalation transition (WARN → ERROR) is intentionally exempt from the hourly
+/// suppression window: if it were not, an operator could wait up to
+/// `STALE_LOG_INTERVAL_SEC` after HealthWriter.ps1's death became certain (rather
+/// than merely late) before being told so at the severity that warrants attention —
+/// reproducing, at a smaller scale, the exact "condition buried instead of
+/// surfaced" failure this function exists to fix.
+///
+/// Uses `compare_exchange` rather than load-then-store on `LAST_STALE_LOG_SEC` —
+/// same pattern as the sibling rate-limiter
+/// `SocketIOServer::log_handshake_failure_throttled` — so two callers racing on the
+/// same due window cannot both win it and double-log while also both resetting
+/// `SUPPRESSED_STALE_READS`, which a plain load-then-store would allow.
+///
 /// Version: V1.0
 fn log_stale_snapshot(now_sec: u64, ts: u64, age: u64, stale_threshold_sec: u64) {
-    let last = LAST_STALE_LOG_SEC.load(Ordering::Relaxed);
-    let due = last == 0 || now_sec.saturating_sub(last) >= STALE_LOG_INTERVAL_SEC;
+    let escalate = age > stale_threshold_sec.saturating_mul(STALE_ESCALATION_FACTOR);
+    let just_escalated = escalate && !ESCALATED.swap(escalate, Ordering::Relaxed);
 
-    if !due {
+    let last = LAST_STALE_LOG_SEC.load(Ordering::Relaxed);
+    let due = just_escalated || last == 0 || now_sec.saturating_sub(last) >= STALE_LOG_INTERVAL_SEC;
+
+    if !due
+        || LAST_STALE_LOG_SEC
+            .compare_exchange(last, now_sec, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
         SUPPRESSED_STALE_READS.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
-    LAST_STALE_LOG_SEC.store(now_sec, Ordering::Relaxed);
     let suppressed = SUPPRESSED_STALE_READS.swap(0, Ordering::Relaxed);
-
-    let escalate = age > stale_threshold_sec.saturating_mul(STALE_ESCALATION_FACTOR);
 
     if escalate {
         log::error!(
@@ -636,6 +664,7 @@ mod tests {
     fn ht_013_stale_log_is_rate_limited() {
         LAST_STALE_LOG_SEC.store(0, Ordering::Relaxed);
         SUPPRESSED_STALE_READS.store(0, Ordering::Relaxed);
+        ESCALATED.store(false, Ordering::Relaxed);
 
         let t0 = 1_000_000_u64;
 
@@ -677,6 +706,7 @@ mod tests {
     fn ht_014_rate_limit_preserves_failsafe() {
         LAST_STALE_LOG_SEC.store(0, Ordering::Relaxed);
         SUPPRESSED_STALE_READS.store(0, Ordering::Relaxed);
+        ESCALATED.store(false, Ordering::Relaxed);
 
         let stale_ts = now_sec().saturating_sub(120);
         let f = write_temp(&fresh_json(stale_ts));
@@ -693,6 +723,90 @@ mod tests {
         assert!(
             SUPPRESSED_STALE_READS.load(Ordering::Relaxed) >= 4,
             "repeat stale reads must be suppressed, not re-logged"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-HEALTH-015
+    /// Title: TC-BLE-PROTO-F13 — escalation to ERROR is not gated by the hourly window
+    ///
+    /// Description: VRConnect shall emit the WARN→ERROR escalation line immediately
+    /// upon crossing `STALE_ESCALATION_FACTOR` × the threshold, even while still
+    /// inside the hourly suppression window opened by an earlier WARN. Without this,
+    /// an operator could wait up to `STALE_LOG_INTERVAL_SEC` after HealthWriter.ps1's
+    /// death became certain before being told at the right severity — the same
+    /// "buried, not surfaced" failure this whole mechanism exists to prevent, just
+    /// for the severity transition instead of the raw event count.
+    ///
+    /// `#[serial]`: drives the module-level rate-limiter statics.
+    ///
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn ht_015_escalation_is_not_gated_by_hourly_window() {
+        LAST_STALE_LOG_SEC.store(0, Ordering::Relaxed);
+        SUPPRESSED_STALE_READS.store(0, Ordering::Relaxed);
+        ESCALATED.store(false, Ordering::Relaxed);
+
+        let t0 = 2_000_000_u64;
+        let threshold = 60;
+
+        // First stale read, below the escalation factor: logs at WARN, opens the
+        // hourly window.
+        log_stale_snapshot(t0, t0 - 100, 100, threshold);
+        assert_eq!(LAST_STALE_LOG_SEC.load(Ordering::Relaxed), t0);
+        assert!(!ESCALATED.load(Ordering::Relaxed));
+
+        // Seconds later — deep inside the hourly window — the age crosses the
+        // escalation factor (10 * 60 = 600). This must log immediately rather than
+        // being swallowed as a routine suppressed repeat.
+        let t1 = t0 + 5;
+        log_stale_snapshot(t1, t0 - 700, 700, threshold);
+        assert!(
+            ESCALATED.load(Ordering::Relaxed),
+            "escalation flag must flip on the crossing read"
+        );
+        assert_eq!(
+            LAST_STALE_LOG_SEC.load(Ordering::Relaxed),
+            t1,
+            "the escalation crossing must log immediately, not wait for the hourly window"
+        );
+        assert_eq!(
+            SUPPRESSED_STALE_READS.load(Ordering::Relaxed),
+            0,
+            "the escalation line resets the suppressed counter like any emitted line"
+        );
+
+        // A further read, still escalated, still inside the hourly window from the
+        // escalation line itself: back to being suppressed like a routine repeat.
+        log_stale_snapshot(t1 + 5, t0 - 705, 705, threshold);
+        assert_eq!(SUPPRESSED_STALE_READS.load(Ordering::Relaxed), 1);
+    }
+
+    /// ID SRS: SRS-TEST-HEALTH-016
+    /// Title: TC-BLE-PROTO-F13 — escalation state resets once health.json recovers
+    ///
+    /// Description: VRConnect shall clear the escalation flag the moment
+    /// `read_os_snapshot` sees a fresh file again, so a later, unrelated staleness
+    /// incident starts at WARN rather than inheriting ERROR-level state left over
+    /// from a past, already-resolved incident.
+    ///
+    /// `#[serial]`: drives the module-level rate-limiter statics.
+    ///
+    /// Version: V1.0
+    #[test]
+    #[serial]
+    fn ht_016_escalation_resets_on_recovery() {
+        LAST_STALE_LOG_SEC.store(0, Ordering::Relaxed);
+        SUPPRESSED_STALE_READS.store(0, Ordering::Relaxed);
+        ESCALATED.store(true, Ordering::Relaxed); // simulate a past escalated incident
+
+        let f = write_temp(&fresh_json(now_sec()));
+        let snap = read_os_snapshot(f.path(), 60);
+
+        assert_eq!(snap.vr, 1, "a fresh read must return the real snapshot");
+        assert!(
+            !ESCALATED.load(Ordering::Relaxed),
+            "a fresh read must clear escalation state left over from a past incident"
         );
     }
 }

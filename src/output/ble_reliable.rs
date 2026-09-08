@@ -22,7 +22,9 @@ use crate::domain::ble_protocol::{
 };
 use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};
-use crate::output::ble_gatt::{BleConnectionEvent, CharProperty, GattServer, WriteEvent};
+use crate::output::ble_gatt::{
+    BleConnectionEvent, CharProperty, GattServer, WriteEvent, CCCD_SUBSCRIBERS_LOST_MSG,
+};
 use crate::output::ble_session::BleSessionState;
 use crate::output::health::{build_payload, read_os_snapshot, GateHealthState};
 use crate::output::wal::{self, WalEntry};
@@ -938,8 +940,7 @@ impl ReliableBleOutput {
                 }
                 Some(BleConnectionEvent::Disconnected) => {
                     log::info!(
-                        "[BLE] CCCD subscribers lost (Central gone OR local stack down) — \
-                         starting grace period ({:?})",
+                        "{CCCD_SUBSCRIBERS_LOST_MSG} — starting grace period ({:?})",
                         grace_period
                     );
 
@@ -1988,7 +1989,7 @@ impl ReliableBleOutput {
             // GATE observes it: it is set once at startup and, if it dies afterwards
             // (driver fault, machine sleep, stack reset), no log line reports it. This
             // is what left the ~70 h soak of 2026-09-03/06 undiagnosable.
-            let adv_state = server.read().await.advertising_state();
+            let adv_state = server.read().await.advertising_state().await;
             match adv_state {
                 Some(state) if state.is_started() => {
                     log::debug!("[health] GATT advertising status: {}", state);

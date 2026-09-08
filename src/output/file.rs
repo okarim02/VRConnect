@@ -188,8 +188,24 @@ impl FileOutput {
                 }
             }
 
-            // Close current file and create new one
-            self.rotate_file(&mut file_lock).await?;
+            // Close current file and create new one. `rotate_file` only swaps
+            // `*file_lock`'s contents — it does NOT archive; see the comment below on
+            // why that check is deliberately made outside the lock.
+            let archive_check_dir = self.rotate_file(&mut file_lock).await?;
+
+            // The date-change branch above already drops the lock before archiving
+            // (`archive_previous_day`). This threshold-triggered check must do the
+            // same: it can run for tens of seconds (the zip in `create_zip_archive`),
+            // and every other call to `output()` blocks on `self.current_file.write()`
+            // for as long as this guard is held — holding it here would stall every
+            // incoming sample, not just BLE emission, for the archive's full duration.
+            // Safe to check after the new file already exists in `daily_dir`: its name
+            // ends in `_ongoing.json`, which `get_completed_files()` always excludes.
+            if let Some(daily_dir) = archive_check_dir {
+                drop(file_lock);
+                self.check_and_archive_if_needed(&daily_dir).await?;
+                file_lock = self.current_file.write().await;
+            }
         }
 
         // Write to current file
@@ -210,15 +226,25 @@ impl FileOutput {
     /// Description: VRConnect shall rotate current file by closing it,
     /// renaming with end timestamp, and creating new file with start timestamp.
     ///
+    /// Deliberately does NOT call `check_and_archive_if_needed()` itself — it used
+    /// to, which meant the caller's `current_file` write lock stayed held for the
+    /// full duration of a same-day, size-triggered archive (the zip can take tens of
+    /// seconds; see F14). The date-changed rotation path in `output()` already drops
+    /// the lock before archiving; this function instead returns the directory that
+    /// needs checking, if any, so the caller can do the same for the size-triggered
+    /// path.
+    ///
     /// Version: V1.0
     ///
     /// # Arguments
     /// * `file_lock` - Mutable reference to current file lock
     ///
     /// # Returns
-    /// Result indicating success or error
-    async fn rotate_file(&self, file_lock: &mut Option<ActiveFile>) -> Result<()> {
+    /// The directory to pass to `check_and_archive_if_needed()` once the lock has
+    /// been dropped, or `None` if there was no prior file to close (nothing to check).
+    async fn rotate_file(&self, file_lock: &mut Option<ActiveFile>) -> Result<Option<PathBuf>> {
         let now = Local::now();
+        let mut archive_check_dir = None;
 
         // Close and rename current file if exists
         if let Some(active) = file_lock.take() {
@@ -240,9 +266,7 @@ impl FileOutput {
                 new_path.file_name().unwrap().to_string_lossy()
             );
 
-            // Check if we need to archive
-            let daily_dir = active.path.parent().unwrap();
-            self.check_and_archive_if_needed(daily_dir).await?;
+            archive_check_dir = Some(active.path.parent().unwrap().to_path_buf());
         }
 
         // Create new file
@@ -274,7 +298,7 @@ impl FileOutput {
             current_date: now.date_naive(),
         });
 
-        Ok(())
+        Ok(archive_check_dir)
     }
 
     /// ID SRS: SRS-FN-FILEOUTPUT-005

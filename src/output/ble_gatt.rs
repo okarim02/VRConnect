@@ -527,16 +527,29 @@ impl GattServer {
     ///              Returns `None` when the server has not been started, or when the
     ///              WinRT read itself fails.
     ///
+    ///              Runs the `AdvertisementStatus()` COM property read on the
+    ///              blocking-thread-pool rather than a tokio worker thread — same
+    ///              reasoning as `notify()`. This getter crosses into the Bluetooth
+    ///              service (bthserv) via RPC; it is called specifically to diagnose
+    ///              a collapsed or faulted local Bluetooth stack (F11), which is
+    ///              exactly the condition under which that RPC is most likely to
+    ///              hang rather than return quickly.
+    ///
     /// Version: V1.0
-    pub fn advertising_state(&self) -> Option<AdvertisingState> {
-        let provider = self.provider.as_ref()?;
-        match provider.AdvertisementStatus() {
+    pub async fn advertising_state(&self) -> Option<AdvertisingState> {
+        let provider = self.provider.clone()?;
+        tokio::task::spawn_blocking(move || match provider.AdvertisementStatus() {
             Ok(status) => Some(AdvertisingState::from_winrt(status.0)),
             Err(e) => {
                 log::warn!("[BLE] AdvertisementStatus() read failed: {}", e);
                 None
             }
-        }
+        })
+        .await
+        .unwrap_or_else(|e| {
+            log::warn!("[BLE] AdvertisementStatus() blocking task panicked: {}", e);
+            None
+        })
     }
 
     /// ID SRS: SRS-FN-BLEGATT-007
@@ -856,13 +869,13 @@ mod tests {
     /// `adv = 0` instead of a fabricated healthy value.
     ///
     /// Version: V1.0
-    #[test]
-    fn tc_ble_proto_f11_status_none_before_start() {
+    #[tokio::test]
+    async fn tc_ble_proto_f11_status_none_before_start() {
         let server = GattServer::new(
             "TestDevice".to_string(),
             uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap(),
         );
-        assert_eq!(server.advertising_state(), None);
+        assert_eq!(server.advertising_state().await, None);
     }
 
     /// ID SRS: SRS-TEST-BLEGATT-014
