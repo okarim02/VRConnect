@@ -17,8 +17,8 @@
 
 use crate::domain::ble_protocol::{
     has_idt_magic, parse_idt_wrapped_tlv_subscribe_req, parse_tlv_subscribe_req, AckFrame, Catalog,
-    InboundFrame, SignalId, SignalRegistry, SubscribeReq, SubscribeRsp, SubscribeRspItem,
-    MSG_SUBSCRIBE_REQ, SUB_OP_SUBSCRIBE, SUB_OP_UNSUBSCRIBE,
+    InboundFrame, SignalId, SignalRegistry, SubscribeReq, SubscribeReqEntry, SubscribeRsp,
+    SubscribeRspItem, MSG_SUBSCRIBE_REQ, SUB_OP_SUBSCRIBE, SUB_OP_UNSUBSCRIBE,
 };
 use crate::domain::ProcessedData;
 use crate::error::{Result, VitalError};
@@ -719,16 +719,16 @@ impl ReliableBleOutput {
                             {
                                 // IDT strict: 13-byte header + binary items
                                 Self::handle_subscribe_req(req, &state, &server, &registry).await;
-                            } else if let Some((req_id, signal_ids)) =
+                            } else if let Some((req_id, entries)) =
                                 parse_idt_wrapped_tlv_subscribe_req(data)
                             {
                                 log::info!(
                                     "Subscribe: MyPredi format wrapped in IDT envelope — req_id={}, signals={:?}",
                                     req_id,
-                                    signal_ids
+                                    entries
                                 );
                                 Self::handle_tlv_subscribe(
-                                    req_id, signal_ids, &state, &server, &registry,
+                                    req_id, entries, &state, &server, &registry,
                                 )
                                 .await;
                             } else {
@@ -743,15 +743,16 @@ impl ReliableBleOutput {
                                 data.get(3).copied().unwrap_or(0)
                             );
                         }
-                    } else if let Some((req_id, signal_ids)) = parse_tlv_subscribe_req(data) {
+                    } else if let Some((req_id, entries)) = parse_tlv_subscribe_req(data) {
                         // [DEV-3] Flutter central sends a custom TLV format (byte[0]=0x20)
                         // instead of an IDT-framed SUBSCRIBE_REQ. Accept as fallback.
+                        // [DEV-7] entries also carry an optional per-signal period_ms request.
                         log::info!(
                             "Subscribe: Flutter TLV format detected — req_id={}, signals={:?}",
                             req_id,
-                            signal_ids
+                            entries
                         );
-                        Self::handle_tlv_subscribe(req_id, signal_ids, &state, &server, &registry)
+                        Self::handle_tlv_subscribe(req_id, entries, &state, &server, &registry)
                             .await;
                     } else {
                         log::warn!(
@@ -1314,19 +1315,30 @@ impl ReliableBleOutput {
                         }
                         // Safety: normalize_id succeeded, so get() is guaranteed Some
                         let meta = registry.get(canonical_id).unwrap();
-                        let stream_id = st.subscribe(canonical_id);
+                        // item.period_ms == 0 means "not specified" on the wire (IDT strict
+                        // SubscribeItem has no separate optionality bit for this field).
+                        let requested_period_ms = (item.period_ms > 0).then_some(item.period_ms);
+                        let (effective_period_ms, gate_period_ms) =
+                            Self::negotiate_period_ms(requested_period_ms, meta.nominal_period_ms);
+                        let stream_id =
+                            st.subscribe_with_period(canonical_id, None, gate_period_ms);
                         rsp_items.push(SubscribeRspItem {
                             source_id: meta.source_id,
                             signal_id: canonical_id,
                             stream_id,
-                            effective_period_ms: meta.nominal_period_ms,
+                            effective_period_ms,
                             effective_batch_max: 1,
                         });
                         log::info!(
-                            "SUBSCRIBE: signal 0x{:04X} → stream {} (mode={})",
+                            "SUBSCRIBE: signal 0x{:04X} → stream {} (mode={}{})",
                             canonical_id,
                             stream_id,
-                            item.mode
+                            item.mode,
+                            if gate_period_ms > 0 {
+                                format!(", throttled to {} ms", effective_period_ms)
+                            } else {
+                                String::new()
+                            }
                         );
                         // FORCE_BACKLOG_REPLAY=true overrides Flutter mode=0 (LIVE) → mode=1
                         // (BACKLOG_THEN_LIVE) so historical replay triggers without a Flutter update.
@@ -1490,6 +1502,36 @@ impl ReliableBleOutput {
         }
     }
 
+    /// Negotiate the per-stream `period_ms` throttle for a SUBSCRIBE_REQ item.
+    ///
+    /// `nominal` (the signal's catalog rate) is a floor: a client cannot ask to go
+    /// faster than the nominal rate, but a slower rate is honored as requested.
+    /// Returns `(effective_period_ms, gate_period_ms)`:
+    /// - `effective_period_ms` is what SUBSCRIBE_RSP reports back to the client.
+    /// - `gate_period_ms` is what is stored on the `StreamEntry` throttle gate; it is
+    ///   `0` (gate inactive) whenever the client made no request at all — this is the
+    ///   case for every app deployed before this field existed, so their live
+    ///   throughput is completely unchanged. [DEV-7]
+    ///
+    /// This logic is factored out as a pure function because `handle_tlv_subscribe`
+    /// and `handle_subscribe_req` require a real `GattServer` and are never exercised
+    /// directly by unit tests (existing tests replicate their logic by hand — see the
+    /// note above `test_subscribe_op_replaces_prior_subscriptions_via_unsubscribe_all`).
+    /// A pure function keeps the one part of the negotiation that deserves coverage
+    /// testable without that hardware dependency.
+    ///
+    /// ID SRS: SRS-FN-BLERELIABLE-018
+    /// Version: V1.0
+    fn negotiate_period_ms(requested: Option<u32>, nominal: u32) -> (u32, u32) {
+        match requested {
+            Some(p) if p > 0 => {
+                let effective = p.max(nominal);
+                (effective, effective)
+            }
+            _ => (nominal, 0),
+        }
+    }
+
     /// Handle a Flutter TLV SUBSCRIBE_REQ (byte[0]=0x20, [DEV-3]).
     ///
     /// Normalizes legacy signal IDs (1/2/3) to IDT compound IDs via the registry,
@@ -1526,7 +1568,7 @@ impl ReliableBleOutput {
 
     async fn handle_tlv_subscribe(
         req_id: u16,
-        signal_ids: Vec<u16>,
+        entries: Vec<SubscribeReqEntry>,
         state: &Arc<RwLock<BleSessionState>>,
         server: &Arc<RwLock<GattServer>>,
         registry: &Arc<SignalRegistry>,
@@ -1537,7 +1579,7 @@ impl ReliableBleOutput {
         {
             let mut st = state.write().await;
             st.unsubscribe_all();
-            for raw_id in &signal_ids {
+            for (raw_id, requested_period_ms) in &entries {
                 let canonical_id = match registry.normalize_id(*raw_id) {
                     Some(id) => id,
                     None => {
@@ -1560,22 +1602,35 @@ impl ReliableBleOutput {
                 //   0x0101→1, 0x0102→2, 0x0103→3, 0x0201→4..6, 0x0301→8..10, 0x0401→11..12, 0x0501→7
                 // RSP and DATA_FRAMEs both use this mapping — they must be consistent.
                 let flutter_sid = Self::flutter_stream_id(canonical_id);
-                let stream_id = st.subscribe_with_stream_id(canonical_id, flutter_sid);
                 let meta = registry.get(canonical_id).unwrap();
+                let (effective_period_ms, gate_period_ms) =
+                    Self::negotiate_period_ms(*requested_period_ms, meta.nominal_period_ms);
+                let stream_id =
+                    st.subscribe_with_period(canonical_id, Some(flutter_sid), gate_period_ms);
                 // RSP stream_id encoded as-is (Flutter ignores SUBSCRIBE_RSP per DEV-4/FLUTTER_COMPAT §4).
                 // Future IDT-compliant clients will read it correctly in LE.
                 rsp_items.push(SubscribeRspItem {
                     source_id: meta.source_id,
                     signal_id: canonical_id,
                     stream_id,
-                    effective_period_ms: meta.nominal_period_ms,
+                    effective_period_ms,
                     effective_batch_max: 1,
                 });
-                log::info!(
-                    "TLV SUBSCRIBE: signal 0x{:04X} → stream {}",
-                    canonical_id,
-                    stream_id
-                );
+                if gate_period_ms > 0 {
+                    log::info!(
+                        "TLV SUBSCRIBE: signal 0x{:04X} → stream {} (throttled to {} ms, requested {:?})",
+                        canonical_id,
+                        stream_id,
+                        effective_period_ms,
+                        requested_period_ms
+                    );
+                } else {
+                    log::info!(
+                        "TLV SUBSCRIBE: signal 0x{:04X} → stream {}",
+                        canonical_id,
+                        stream_id
+                    );
+                }
             }
         }
 
@@ -4574,5 +4629,168 @@ mod tests {
 
         assert!(!handle.is_finished(), "health task must keep running");
         handle.abort();
+    }
+
+    // ── negotiate_period_ms ──────────────────────────────────────────────────
+    // handle_tlv_subscribe and handle_subscribe_req both delegate their period_ms
+    // negotiation to this pure function, so it is what actually gets unit-tested —
+    // the two async handlers themselves require a real GattServer (see the
+    // unsubscribe_all integration block above) and are never called directly here.
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-056
+    /// Title: negotiate_period_ms floors a too-fast request to the nominal rate
+    ///
+    /// Description: A client request FASTER than nominal (smaller period_ms) must be
+    ///              floored: the RSP reports the nominal, and the gate is armed at the
+    ///              nominal (throttling is still active, just not faster than the
+    ///              catalog allows).
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_negotiate_period_ms_floors_request_faster_than_nominal() {
+        let (effective, gate) = ReliableBleOutput::negotiate_period_ms(Some(200), 1_000);
+        assert_eq!(effective, 1_000);
+        assert_eq!(gate, 1_000);
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-057
+    /// Title: negotiate_period_ms honors a request slower than nominal
+    ///
+    /// Description: A client asking for a slower rate than the catalog nominal gets
+    ///              exactly what it asked for, both in the RSP and the gate.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_negotiate_period_ms_honors_request_slower_than_nominal() {
+        let (effective, gate) = ReliableBleOutput::negotiate_period_ms(Some(10_000), 1_000);
+        assert_eq!(effective, 10_000);
+        assert_eq!(gate, 10_000);
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-058
+    /// Title: negotiate_period_ms treats "no request" and "requested 0" identically —
+    ///        non-regression for every app deployed before this field existed
+    ///
+    /// Description: `None` (strict-IDT item.period_ms == 0) and `Some(0)` (Flutter TLV
+    ///              nested tag 0x04 == 0, what every deployed app sends today) must both
+    ///              yield the nominal for the RSP and gate=0 (throttling inactive) — the
+    ///              live BLE stream's behavior must be bit-for-bit what it was before
+    ///              this feature existed.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_negotiate_period_ms_no_request_is_non_regression() {
+        assert_eq!(
+            ReliableBleOutput::negotiate_period_ms(None, 1_000),
+            (1_000, 0)
+        );
+        assert_eq!(
+            ReliableBleOutput::negotiate_period_ms(Some(0), 1_000),
+            (1_000, 0)
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLERELIABLE-059
+    /// Title: end-to-end REQ→negotiation→RSP round trip on real captured Flutter bytes
+    ///
+    /// Description: Takes the same 89-byte Flutter TLV capture used in
+    ///              ble_protocol.rs's parser tests, patches the first item's period_ms
+    ///              to 5000 (a real throttle request), runs it through
+    ///              parse_tlv_subscribe_req -> negotiate_period_ms exactly as
+    ///              handle_tlv_subscribe does, and verifies the resulting
+    ///              SubscribeRspItem serializes tag 0x04 = 5000 for that stream while
+    ///              the other two (unrequested) streams keep the nominal. This is the
+    ///              proof that the wire format, the parser, and the RSP encoder agree
+    ///              end-to-end on real traffic, not just on each stage in isolation.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_period_ms_round_trip_on_real_flutter_capture() {
+        let mut bytes: Vec<u8> = vec![
+            0x20, 0x56, 0x00, 0x01, 0x02, 0x00, 0x2A, 0x00, // header (8b)
+            0x03, 0x18, 0x00, // item 1 tag+len
+            0x01, 0x01, 0x00, 0x01, // nested TLV: source_id=1
+            0x02, 0x02, 0x00, 0x01, 0x00, // nested TLV: signal_id=1 (HR)
+            0x03, 0x01, 0x00, 0x00, // nested TLV: mode=0
+            0x04, 0x04, 0x00, 0x00, 0x00, 0x00,
+            0x00, // nested TLV: period_ms=0 (patched below)
+            0x05, 0x01, 0x00, 0x01, // nested TLV: batch_max=1
+            0x03, 0x18, 0x00, // item 2 tag+len
+            0x01, 0x01, 0x00, 0x01, 0x02, 0x02, 0x00, 0x02, 0x00, // signal_id=2 (SpO2)
+            0x03, 0x01, 0x00, 0x00, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x00,
+            0x01, 0x03, 0x18, 0x00, // item 3 tag+len
+            0x01, 0x01, 0x00, 0x01, 0x02, 0x02, 0x00, 0x03, 0x00, // signal_id=3 (Temperature)
+            0x03, 0x01, 0x00, 0x00, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x00,
+            0x01,
+        ];
+        // period_ms value bytes for item 1 (HR) are at absolute offset 27..31.
+        bytes[27..31].copy_from_slice(&5_000u32.to_le_bytes());
+
+        let (req_id, entries) = parse_tlv_subscribe_req(&bytes).unwrap();
+        assert_eq!(
+            entries,
+            vec![(1u16, Some(5_000)), (2u16, None), (3u16, None)]
+        );
+
+        let registry = SignalRegistry::with_defaults();
+        let mut rsp_items = Vec::new();
+        for (i, (raw_id, requested_period_ms)) in entries.iter().enumerate() {
+            let canonical_id = registry.normalize_id(*raw_id).unwrap();
+            let meta = registry.get(canonical_id).unwrap();
+            let (effective_period_ms, _gate) = ReliableBleOutput::negotiate_period_ms(
+                *requested_period_ms,
+                meta.nominal_period_ms,
+            );
+            rsp_items.push(SubscribeRspItem {
+                source_id: meta.source_id,
+                signal_id: canonical_id,
+                stream_id: (i + 1) as u16,
+                effective_period_ms,
+                effective_batch_max: 1,
+            });
+        }
+
+        let rsp = SubscribeRsp {
+            session_id: 1,
+            req_id,
+            status: 0,
+            results: rsp_items,
+        };
+        let rsp_bytes = rsp.to_mypredi_ble_bytes();
+
+        // HR (nominal 1000 ms) requested 5000 -> effective 5000 -> tag 0x04 = 5000 LE.
+        let hr_period_tlv: Vec<u8> = [0x04u8, 0x04, 0x00]
+            .into_iter()
+            .chain(5_000u32.to_le_bytes())
+            .collect();
+        assert!(
+            rsp_bytes
+                .windows(hr_period_tlv.len())
+                .any(|w| w == hr_period_tlv.as_slice()),
+            "RSP must encode tag 0x04 = 5000 (LE) for the throttled HR stream"
+        );
+
+        // SpO2 (nominal 1000 ms) and Temperature (nominal 2000 ms) were not requested
+        // -> effective = their own nominal, not 5000.
+        let spo2_nominal_tlv: Vec<u8> = [0x04u8, 0x04, 0x00]
+            .into_iter()
+            .chain(1_000u32.to_le_bytes())
+            .collect();
+        let temp_nominal_tlv: Vec<u8> = [0x04u8, 0x04, 0x00]
+            .into_iter()
+            .chain(2_000u32.to_le_bytes())
+            .collect();
+        assert!(
+            rsp_bytes
+                .windows(spo2_nominal_tlv.len())
+                .any(|w| w == spo2_nominal_tlv.as_slice()),
+            "RSP must encode tag 0x04 = 1000 (LE) for the unthrottled SpO2 stream"
+        );
+        assert!(
+            rsp_bytes
+                .windows(temp_nominal_tlv.len())
+                .any(|w| w == temp_nominal_tlv.as_slice()),
+            "RSP must encode tag 0x04 = 2000 (LE) for the unthrottled Temperature stream"
+        );
     }
 }

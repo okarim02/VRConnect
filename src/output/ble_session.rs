@@ -42,6 +42,17 @@ pub struct StreamEntry {
     /// window and may re-send the same timestamp in consecutive Socket.IO messages.
     /// A new sample is only forwarded if t0_ms > last_t0_ms.
     pub last_t0_ms: Option<u64>,
+    /// Effective period_ms negotiated for this stream's live BLE output. `0` = the
+    /// client requested no throttling (every deployed app today) — the gate in
+    /// add_data() is inactive and live throughput is unchanged. Distinct from
+    /// `nominal_period_ms` in the signal catalog: this is the *gate* value, already
+    /// floored to the nominal when a client does request a slower rate.
+    pub period_ms: u32,
+    /// t0_ms of the last sample actually EMITTED on the live BLE stream (throttle
+    /// gate). Distinct from `last_t0_ms`, which advances on every sample accepted by
+    /// cross-message dedup: a sample can be dedup-accepted but throttled, in which
+    /// case `last_t0_ms` advances while `last_sent_t0_ms` does not.
+    pub last_sent_t0_ms: Option<u64>,
     /// Retransmit buffer: bounded VecDeque of sent-but-unacknowledged frames
     pub tx_buffer: VecDeque<DataFrame>,
     /// True while historical replay frames are being sent (BACKLOG_THEN_LIVE / BACKLOG_ONLY).
@@ -303,40 +314,84 @@ impl BleSessionState {
     /// # Returns
     /// Newly allocated or pre-existing stream_id for this signal
     pub fn subscribe(&mut self, signal_id: u16) -> u16 {
-        // Idempotent: return existing stream_id unchanged
-        if let Some(&existing) = self.signal_to_stream.get(&signal_id) {
-            return existing;
-        }
-        let stream_id = self.next_stream_id;
-        self.next_stream_id += 1;
-        self.insert_stream(StreamEntry {
-            stream_id,
-            signal_id,
-            source_id: 1,
-            last_seq: 0,
-            last_t0_ms: None,
-            tx_buffer: VecDeque::new(),
-            is_replaying: false,
-        });
-        stream_id
+        self.subscribe_with_period(signal_id, None, 0)
     }
 
-    /// Subscribe with a caller-chosen stream_id instead of auto-allocation.
-    /// Idempotent: if signal_id is already subscribed, the existing stream_id is returned.
+    /// ID SRS: SRS-FN-BLESESSION-023
+    /// Title: subscribe_with_stream_id
+    ///
+    /// Description: VRConnect shall subscribe with a caller-chosen stream_id instead of
+    ///              auto-allocation. Idempotent: if signal_id is already subscribed, the
+    ///              existing stream_id is returned unchanged.
+    ///
+    /// Version: V1.0
+    ///
+    /// # Arguments
+    /// * `signal_id` - IDT signal identifier to subscribe
+    /// * `preferred_stream_id` - stream_id to assign on first subscription
+    ///
+    /// # Returns
+    /// Newly allocated (= `preferred_stream_id`) or pre-existing stream_id for this signal
     pub fn subscribe_with_stream_id(&mut self, signal_id: u16, preferred_stream_id: u16) -> u16 {
+        self.subscribe_with_period(signal_id, Some(preferred_stream_id), 0)
+    }
+
+    /// ID SRS: SRS-FN-BLESESSION-025
+    /// Title: subscribe_with_period
+    ///
+    /// Description: VRConnect shall subscribe a signal_id with an explicit per-stream
+    ///              throttle gate (`period_ms`), optionally pinning a caller-chosen
+    ///              stream_id. Idempotent: if signal_id is already subscribed, the
+    ///              existing stream_id is returned and `period_ms` is updated in place
+    ///              on the existing StreamEntry (sequence/dedup/retransmit state is left
+    ///              untouched) — a re-subscribe must not silently drop a new throttle
+    ///              request. `period_ms = 0` means "no throttling requested": the gate
+    ///              in add_data() stays inactive and live throughput is unchanged, which
+    ///              is the case for every app deployed before this field existed.
+    ///
+    /// Version: V1.0
+    ///
+    /// # Arguments
+    /// * `signal_id` - IDT signal identifier to subscribe
+    /// * `preferred_stream_id` - `Some(id)` to pin the stream_id (as `subscribe_with_stream_id`
+    ///   does), `None` to auto-allocate (as `subscribe` does)
+    /// * `period_ms` - effective throttle gate for this stream's live BLE output; `0` = off
+    ///
+    /// # Returns
+    /// Newly allocated or pre-existing stream_id for this signal
+    pub fn subscribe_with_period(
+        &mut self,
+        signal_id: u16,
+        preferred_stream_id: Option<u16>,
+        period_ms: u32,
+    ) -> u16 {
         if let Some(&existing) = self.signal_to_stream.get(&signal_id) {
+            if let Some(entry) = self.streams.get_mut(&existing) {
+                entry.period_ms = period_ms;
+            }
             return existing;
         }
-        let stream_id = preferred_stream_id;
-        if self.next_stream_id <= stream_id {
-            self.next_stream_id = stream_id + 1;
-        }
+        let stream_id = match preferred_stream_id {
+            Some(preferred) => {
+                if self.next_stream_id <= preferred {
+                    self.next_stream_id = preferred + 1;
+                }
+                preferred
+            }
+            None => {
+                let id = self.next_stream_id;
+                self.next_stream_id += 1;
+                id
+            }
+        };
         self.insert_stream(StreamEntry {
             stream_id,
             signal_id,
             source_id: 1,
             last_seq: 0,
             last_t0_ms: None,
+            period_ms,
+            last_sent_t0_ms: None,
             tx_buffer: VecDeque::new(),
             is_replaying: false,
         });
@@ -410,8 +465,17 @@ impl BleSessionState {
     /// Description: VRConnect shall produce an IDT DataFrame for the given signal if
     ///              subscribed.  The per-stream sequence counter is incremented and the
     ///              frame is stored in the retransmit buffer (bounded by max_buffer_size).
+    ///              If a non-zero `period_ms` throttle was negotiated for this stream, a
+    ///              sample arriving before `last_sent_t0_ms + period_ms` is dropped
+    ///              *before* the seq counter advances and before it enters `tx_buffer` —
+    ///              a throttled sample must never create a gap the ACK/NACK machinery
+    ///              would have to recover. This only affects the live BLE stream: the
+    ///              caller (`output()` in ble_reliable.rs) always calls
+    ///              `record_history()` and journals to the WAL *before* `add_data()`, so
+    ///              throttling never reduces what is recorded or replayable — see
+    ///              `src/output/CLAUDE.local.md`.
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     ///
     /// # Arguments
     /// * `signal_id` - IDT signal identifier (e.g. 0x0101 = HR)
@@ -419,7 +483,8 @@ impl BleSessionState {
     /// * `t0_ms`     - Sample timestamp, milliseconds since Unix epoch
     ///
     /// # Returns
-    /// Some(DataFrame) ready to notify on Data_OUT, None if signal not subscribed
+    /// Some(DataFrame) ready to notify on Data_OUT, None if signal not subscribed,
+    /// deduplicated, or throttled by the stream's `period_ms` gate
     pub fn add_data(&mut self, signal_id: u16, value: f32, t0_ms: u64) -> Option<DataFrame> {
         let stream_id = *self.signal_to_stream.get(&signal_id)?;
         let entry = self.streams.get_mut(&stream_id)?;
@@ -439,6 +504,25 @@ impl BleSessionState {
             }
         }
         entry.last_t0_ms = Some(t0_ms);
+
+        // Per-stream throttle gate: inactive when period_ms == 0 (no request made —
+        // every deployed app today). Placed after the dedup commit above but before
+        // last_seq/tx_buffer so a throttled sample burns no sequence number.
+        if entry.period_ms > 0 {
+            if let Some(last_sent) = entry.last_sent_t0_ms {
+                if t0_ms.saturating_sub(last_sent) < entry.period_ms as u64 {
+                    log::debug!(
+                        "Throttled: signal=0x{:04X} t0_ms={} last_sent={} period_ms={}",
+                        signal_id,
+                        t0_ms,
+                        last_sent,
+                        entry.period_ms
+                    );
+                    return None;
+                }
+            }
+            entry.last_sent_t0_ms = Some(t0_ms);
+        }
 
         entry.last_seq += 1;
         let seq = entry.last_seq;
@@ -1052,6 +1136,169 @@ mod tests {
         assert_eq!(f1.header.seq, 1);
         assert_eq!(f2.header.seq, 2);
         assert_eq!(f3.header.seq, 3);
+    }
+
+    // ── throttle gate (period_ms) ────────────────────────────────────────────
+
+    /// ID SRS: SRS-TEST-BLESESSION-048
+    /// Title: add_data with period_ms=0 never throttles (non-regression)
+    ///
+    /// Description: subscribe_with_period(..., 0) must behave exactly like
+    ///              subscribe() — every strictly-increasing sample is emitted. This is
+    ///              the case for every app deployed before this field existed.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_add_data_period_ms_zero_never_throttles() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe_with_period(SignalId::HR.as_u16(), None, 0);
+
+        let f1 = session.add_data(SignalId::HR.as_u16(), 70.0, 0).unwrap();
+        let f2 = session.add_data(SignalId::HR.as_u16(), 71.0, 990).unwrap();
+        let f3 = session.add_data(SignalId::HR.as_u16(), 72.0, 1980).unwrap();
+
+        assert_eq!(f1.header.seq, 1);
+        assert_eq!(f2.header.seq, 2);
+        assert_eq!(f3.header.seq, 3);
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-049
+    /// Title: add_data throttles a sample arriving before period_ms has elapsed
+    ///
+    /// Description: With period_ms=5000, the first sample is always emitted; a second
+    ///              sample before the 5000 ms mark returns None and must NOT advance
+    ///              last_seq — a throttled sample must never burn a sequence number.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_add_data_throttled_sample_returns_none_and_does_not_advance_seq() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe_with_period(SignalId::HR.as_u16(), None, 5_000);
+
+        let f1 = session.add_data(SignalId::HR.as_u16(), 70.0, 0).unwrap();
+        assert_eq!(f1.header.seq, 1);
+
+        let throttled = session.add_data(SignalId::HR.as_u16(), 71.0, 4_000);
+        assert!(throttled.is_none());
+
+        let stream_id = session.get_stream_id(SignalId::HR.as_u16()).unwrap();
+        assert_eq!(
+            session.streams.get(&stream_id).unwrap().last_seq,
+            1,
+            "a throttled sample must not consume a sequence number"
+        );
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-050
+    /// Title: add_data emits again once period_ms has elapsed, and updates last_sent_t0_ms
+    ///
+    /// Description: A sample at or after last_sent_t0_ms + period_ms is emitted; the
+    ///              throttle gate then re-arms from that new t0_ms.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_add_data_emits_at_period_boundary_and_updates_last_sent() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe_with_period(SignalId::HR.as_u16(), None, 5_000);
+
+        session.add_data(SignalId::HR.as_u16(), 70.0, 0).unwrap();
+        assert!(session
+            .add_data(SignalId::HR.as_u16(), 71.0, 4_999)
+            .is_none());
+
+        let f2 = session
+            .add_data(SignalId::HR.as_u16(), 72.0, 5_000)
+            .unwrap();
+        assert_eq!(f2.header.seq, 2);
+
+        let stream_id = session.get_stream_id(SignalId::HR.as_u16()).unwrap();
+        assert_eq!(
+            session.streams.get(&stream_id).unwrap().last_sent_t0_ms,
+            Some(5_000)
+        );
+
+        // Gate re-arms from the new last_sent_t0_ms: 9_999 is still too soon.
+        assert!(session
+            .add_data(SignalId::HR.as_u16(), 73.0, 9_999)
+            .is_none());
+        let f3 = session
+            .add_data(SignalId::HR.as_u16(), 74.0, 10_000)
+            .unwrap();
+        assert_eq!(f3.header.seq, 3);
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-051
+    /// Title: cross-message dedup (last_t0_ms) still works independently of the throttle gate
+    ///
+    /// Description: A duplicate/old t0_ms is rejected by the existing dedup check before
+    ///              the throttle gate is even evaluated, whether or not period_ms is set.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_add_data_dedup_independent_of_throttle_gate() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe_with_period(SignalId::HR.as_u16(), None, 5_000);
+
+        session
+            .add_data(SignalId::HR.as_u16(), 70.0, 10_000)
+            .unwrap();
+        // Same timestamp resent (VitalRecorder sliding-window behavior) — dedup, not throttle.
+        assert!(session
+            .add_data(SignalId::HR.as_u16(), 70.0, 10_000)
+            .is_none());
+        // Older timestamp — also dedup.
+        assert!(session
+            .add_data(SignalId::HR.as_u16(), 70.0, 9_000)
+            .is_none());
+    }
+
+    /// ID SRS: SRS-TEST-BLESESSION-052
+    /// Title: record_history() keeps full resolution regardless of live BLE throttling
+    ///
+    /// Description: This is the data-integrity guarantee behind the whole feature: only
+    ///              the live BLE stream (add_data) is reduced by period_ms. Six samples
+    ///              recorded to history (as output() always does, before add_data()) at
+    ///              1000 ms spacing, with a 5000 ms live throttle, must yield exactly 2
+    ///              live frames but the full 6-sample backlog via get_replay_frames() —
+    ///              proving a throttled sample stays completely recoverable.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_throttled_stream_keeps_full_resolution_in_history_and_replay() {
+        let mut session = BleSessionState::new(1);
+        session.subscribe_with_period(SignalId::HR.as_u16(), Some(1), 5_000);
+
+        let mut emitted = 0;
+        for i in 0u64..=5 {
+            let t0_ms = i * 1000;
+            // Mirrors output(): record_history() unconditionally, then add_data().
+            session.record_history(SignalId::HR.as_u16(), 70.0 + i as f32, t0_ms);
+            if session
+                .add_data(SignalId::HR.as_u16(), 70.0 + i as f32, t0_ms)
+                .is_some()
+            {
+                emitted += 1;
+            }
+        }
+
+        assert_eq!(
+            emitted, 2,
+            "live BLE stream: only t0=0 and t0=5000 pass the gate"
+        );
+
+        let replay = session.get_replay_frames(SignalId::HR.as_u16(), 0, 1, 1, 1);
+        assert_eq!(
+            replay.len(),
+            6,
+            "history/backlog must retain all 6 samples regardless of live throttling"
+        );
+
+        let stream_id = session.get_stream_id(SignalId::HR.as_u16()).unwrap();
+        assert_eq!(
+            session.streams.get(&stream_id).unwrap().last_seq,
+            2,
+            "no sequence number was burned by a throttled sample"
+        );
     }
 
     // ── handle_ack ────────────────────────────────────────────────────────────

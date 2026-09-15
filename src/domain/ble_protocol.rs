@@ -1260,27 +1260,43 @@ impl SignalRegistry {
 // parse_tlv_subscribe_req — Flutter TLV SUBSCRIBE_REQ fallback parser
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// One parsed SUBSCRIBE_REQ item: `(signal_id, requested_period_ms)`. `None` for the
+/// period means "not requested" (absent nested TLV, or the sentinel value `0` that
+/// every app deployed before [DEV-7] sends).
+pub type SubscribeReqEntry = (u16, Option<u32>);
+
 /// Parse a Flutter-custom TLV SUBSCRIBE_REQ (byte[0]=0x20, no IDT magic).
 ///
 /// Flutter sends this format instead of an IDT-framed SUBSCRIBE_REQ:
 /// ```text
-/// [marker=0x20(1b)] [total_len(2b LE)] [version(1b)] [flags/op(2b)] [req_id(2b LE)] [n(1b)]
-/// [items: n × { tag=0x03(1b) len=24(2b LE) [nested TLVs] }]
+/// [marker=0x20(1b)] [total_len(2b LE)] [version(1b)] [flags/op(2b)] [req_id(2b LE)]
+/// [items: n × { tag=0x03(1b) len(2b LE) [nested TLVs] }]
 /// ```
-/// Each item contains a 2-byte LE signal_id at item_base+10 (inside the nested TLV).
+/// Item scanning is **length-driven**: each item's `len` field is read and the cursor
+/// advances by `3 + len`, rather than assuming a fixed 24-byte value. Deployed apps send
+/// `len=24`; this also tolerates a future item carrying additional nested TLVs.
 ///
-/// Returns `Some((req_id, signal_ids))` on success, `None` if the frame is not a valid
+/// Each item's value is itself a sequence of nested TLVs `[tag(1b)][len(2b LE)][value]`.
+/// Two are read: tag `0x02` (2 bytes) → `signal_id` (u16 LE), tag `0x04` (4 bytes) →
+/// `period_ms` (u32 LE). `period_ms == 0` (what every deployed app sends today — see
+/// [DEV-7]) is normalized to `None` here so callers only ever see "requested" or "not
+/// requested".
+///
+/// Returns `Some((req_id, entries))` on success, `None` if the frame is not a valid
 /// Flutter TLV subscribe (wrong marker, too short, or all signal_ids are zero).
 ///
 /// [DEV-3] cross-reference: Flutter sends this format; IDT spec requires a full
 /// IDT-framed SUBSCRIBE_REQ. Both are accepted; TLV is tried as fallback.
+/// [DEV-7] cross-reference: tag `0x04` (period_ms) was already on the wire but discarded;
+/// it is now read and honored as a per-stream throttle request. See
+/// `src/domain/CLAUDE.local.md`.
 ///
 /// ID SRS: SRS-FN-BLEPROTOCOL-013
-/// Version: V1.0
-pub fn parse_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<u16>)> {
-    // Byte[0] must be 0x20 (TLV SUBSCRIBE_CMD marker); minimum: 9-byte header + 1 item (27b)
-    // Minimum: 8-byte header + at least one 27-byte item
-    if data.len() < 8 + 27 || data[0] != 0x20 {
+/// Version: V2.0
+pub fn parse_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<SubscribeReqEntry>)> {
+    // Byte[0] must be 0x20 (TLV SUBSCRIBE_CMD marker); minimum: 8-byte header + 1 item.
+    // The smallest legal item is tag(1)+len(2) with len=0, i.e. 3 bytes.
+    if data.len() < 8 + 3 || data[0] != 0x20 {
         return None;
     }
 
@@ -1289,26 +1305,68 @@ pub fn parse_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<u16>)> {
     // Items start immediately after the 8-byte header:
     // marker(1) + total_len(2) + version(1) + flags(2) + req_id(2) = 8 bytes
     let mut pos = 8;
-    let mut signal_ids = Vec::new();
+    let mut entries = Vec::new();
 
-    while pos + 27 <= data.len() {
-        // Each item: tag=0x03, len_u16_le=24 (0x18 0x00)
-        if data[pos] == 0x03 && data[pos + 1] == 0x18 && data[pos + 2] == 0x00 {
-            // signal_id (LE u16) is at item_base + 10 (inside nested TLV tag=2, len=2)
-            let signal_id = u16::from_le_bytes([data[pos + 10], data[pos + 11]]);
-            if signal_id > 0 {
-                signal_ids.push(signal_id);
-            }
-            pos += 27; // 3 (item tag+len) + 24 (item value)
-        } else {
+    while pos + 3 <= data.len() {
+        // Each item: tag=0x03, len_u16_le = length of the nested-TLV value that follows.
+        if data[pos] != 0x03 {
             break;
         }
+        let item_len = u16::from_le_bytes([data[pos + 1], data[pos + 2]]) as usize;
+        let value_start = pos + 3;
+        let value_end = match value_start.checked_add(item_len) {
+            Some(end) if end <= data.len() => end,
+            _ => break,
+        };
+
+        let mut signal_id: Option<u16> = None;
+        let mut period_ms: Option<u32> = None;
+
+        // Walk the nested TLVs inside [value_start..value_end).
+        let mut npos = value_start;
+        while npos + 3 <= value_end {
+            let tag = data[npos];
+            let nlen = u16::from_le_bytes([data[npos + 1], data[npos + 2]]) as usize;
+            let nvalue_start = npos + 3;
+            let nvalue_end = match nvalue_start.checked_add(nlen) {
+                Some(end) if end <= value_end => end,
+                _ => break,
+            };
+            match tag {
+                0x02 if nlen == 2 => {
+                    signal_id = Some(u16::from_le_bytes([
+                        data[nvalue_start],
+                        data[nvalue_start + 1],
+                    ]));
+                }
+                0x04 if nlen == 4 => {
+                    period_ms = Some(u32::from_le_bytes([
+                        data[nvalue_start],
+                        data[nvalue_start + 1],
+                        data[nvalue_start + 2],
+                        data[nvalue_start + 3],
+                    ]));
+                }
+                _ => {}
+            }
+            npos = nvalue_end;
+        }
+
+        if let Some(sid) = signal_id {
+            if sid > 0 {
+                // 0 = "not requested" sentinel (matches every deployed app today).
+                let requested_period = period_ms.filter(|&p| p > 0);
+                entries.push((sid, requested_period));
+            }
+        }
+
+        pos = value_end;
     }
 
-    if signal_ids.is_empty() {
+    if entries.is_empty() {
         None
     } else {
-        Some((req_id, signal_ids))
+        Some((req_id, entries))
     }
 }
 
@@ -1317,8 +1375,8 @@ pub fn parse_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<u16>)> {
 /// Some legacy Flutter/MyPredi centrals send an IDT-like envelope with
 /// `IDT_MAGIC` and `MSG_SUBSCRIBE_REQ` before the actual TLV payload.
 /// The real TLV section begins at offset 24 and ends 4 bytes before the end.
-/// Returns `Some((req_id, signal_ids))` if the embedded TLV payload is valid.
-pub fn parse_idt_wrapped_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<u16>)> {
+/// Returns `Some((req_id, entries))` if the embedded TLV payload is valid.
+pub fn parse_idt_wrapped_tlv_subscribe_req(data: &[u8]) -> Option<(u16, Vec<SubscribeReqEntry>)> {
     if data.get(3).copied() != Some(MSG_SUBSCRIBE_REQ) || data.len() <= 28 {
         return None;
     }
@@ -2187,10 +2245,18 @@ mod tests {
     }
 
     // ── parse_tlv_subscribe_req ───────────────────────────────────────────────
+    // SRS-TEST-BLEPROTOCOL-020/021/022/023 were reused (collided with the InboundFrame
+    // dispatch block); this block was renumbered into the free 051+ range in the same
+    // change that made period_ms length-driven and readable (V2.0, [DEV-7]).
 
-    /// ID SRS: SRS-TEST-BLEPROTOCOL-020
-    /// Version: V1.0
-    /// parse_tlv_subscribe_req parses the exact 89-byte payload captured from the Flutter app
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-051
+    /// Title: parse_tlv_subscribe_req parses the real 89-byte Flutter payload
+    ///
+    /// Description: The captured payload carries period_ms=0 in every item (what every
+    ///              deployed app sends today) — each entry's requested period must
+    ///              normalize to None, not Some(0).
+    ///
+    /// Version: V2.0
     #[test]
     fn test_parse_tlv_subscribe_req_real_flutter_bytes() {
         let bytes: Vec<u8> = vec![
@@ -2210,14 +2276,17 @@ mod tests {
             0x01,
         ];
         assert_eq!(bytes.len(), 89);
-        let (req_id, signal_ids) = parse_tlv_subscribe_req(&bytes).unwrap();
+        let (req_id, entries) = parse_tlv_subscribe_req(&bytes).unwrap();
         assert_eq!(req_id, 42);
-        assert_eq!(signal_ids, vec![1u16, 2u16, 3u16]);
+        assert_eq!(entries, vec![(1u16, None), (2u16, None), (3u16, None)]);
     }
 
-    /// ID SRS: SRS-TEST-BLEPROTOCOL-021
-    /// Version: V1.0
-    /// parse_tlv_subscribe_req returns None for wrong marker byte
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-052
+    /// Title: parse_tlv_subscribe_req returns None for wrong marker byte
+    ///
+    /// Description: byte[0] must be 0x20; any other value is rejected outright.
+    ///
+    /// Version: V2.0
     #[test]
     fn test_parse_tlv_subscribe_req_wrong_marker() {
         let mut bytes = vec![0u8; 8 + 27];
@@ -2225,9 +2294,14 @@ mod tests {
         assert!(parse_tlv_subscribe_req(&bytes).is_none());
     }
 
-    /// ID SRS: SRS-TEST-BLEPROTOCOL-023
-    /// Version: V1.0
-    /// parse_idt_wrapped_tlv_subscribe_req accepts a MyPredi TLV SUBSCRIBE_REQ wrapped in an IDT envelope.
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-053
+    /// Title: parse_idt_wrapped_tlv_subscribe_req accepts a MyPredi TLV SUBSCRIBE_REQ
+    ///        wrapped in an IDT envelope
+    ///
+    /// Description: Delegates to parse_tlv_subscribe_req on the unwrapped payload; the
+    ///              return type carries (signal_id, requested_period_ms) pairs.
+    ///
+    /// Version: V2.0
     #[test]
     fn test_parse_idt_wrapped_tlv_subscribe_req() {
         let mut bytes = vec![0u8; 24];
@@ -2247,16 +2321,119 @@ mod tests {
 
         assert_eq!(
             parse_idt_wrapped_tlv_subscribe_req(&bytes),
-            Some((0x002A, vec![1u16, 2u16, 3u16]))
+            Some((0x002A, vec![(1u16, None), (2u16, None), (3u16, None)]))
         );
     }
 
-    /// ID SRS: SRS-TEST-BLEPROTOCOL-022
-    /// Version: V1.0
-    /// parse_tlv_subscribe_req returns None for a buffer that is too short
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-054
+    /// Title: parse_tlv_subscribe_req returns None for a buffer that is too short
+    ///
+    /// Description: A buffer shorter than an 8-byte header + a minimal 3-byte item
+    ///              (tag+len, len=0) is rejected before any item scanning starts.
+    ///
+    /// Version: V2.0
     #[test]
     fn test_parse_tlv_subscribe_req_too_short() {
-        let bytes = vec![0x20u8; 30]; // 8 + 22 < 8 + 27
+        let bytes = vec![0x20u8; 30];
+        // All bytes after the header are 0x20 too, so the first item-tag check
+        // (data[pos] == 0x03) fails immediately and no entries are collected.
         assert!(parse_tlv_subscribe_req(&bytes).is_none());
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-055
+    /// Title: parse_tlv_subscribe_req reads a non-zero period_ms as a throttle request
+    ///
+    /// Description: Patching the real Flutter capture's first-item period_ms bytes
+    ///              (offset item_base+16..+20, value 0 -> 5000 LE) must surface
+    ///              Some(5000) for that entry while the other two (still period_ms=0)
+    ///              stay None.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_parse_tlv_subscribe_req_period_ms_requested() {
+        let mut bytes: Vec<u8> = vec![
+            0x20, 0x56, 0x00, 0x01, 0x02, 0x00, 0x2A, 0x00, // header (8b)
+            0x03, 0x18, 0x00, // item 1 tag+len
+            0x01, 0x01, 0x00, 0x01, // nested TLV: source_id=1
+            0x02, 0x02, 0x00, 0x01, 0x00, // nested TLV: signal_id=1 (HR)
+            0x03, 0x01, 0x00, 0x00, // nested TLV: mode=0
+            0x04, 0x04, 0x00, 0x00, 0x00, 0x00,
+            0x00, // nested TLV: period_ms=0 (patched below)
+            0x05, 0x01, 0x00, 0x01, // nested TLV: batch_max=1
+            0x03, 0x18, 0x00, // item 2 tag+len
+            0x01, 0x01, 0x00, 0x01, 0x02, 0x02, 0x00, 0x02, 0x00, // signal_id=2 (SpO2)
+            0x03, 0x01, 0x00, 0x00, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x00,
+            0x01,
+        ];
+        // period_ms value bytes for item 1 are at absolute offset 27..31.
+        assert_eq!(
+            &bytes[24..27],
+            &[0x04, 0x04, 0x00],
+            "sanity: tag+len of nested 0x04"
+        );
+        bytes[27..31].copy_from_slice(&5_000u32.to_le_bytes());
+
+        let (req_id, entries) = parse_tlv_subscribe_req(&bytes).unwrap();
+        assert_eq!(req_id, 42);
+        assert_eq!(entries, vec![(1u16, Some(5_000)), (2u16, None)]);
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-056
+    /// Title: parse_tlv_subscribe_req is length-driven, not fixed to a 24-byte item
+    ///
+    /// Description: An item carrying only a signal_id nested TLV (item len=5, not the
+    ///              usual 24) must still parse correctly — proves the cursor advances by
+    ///              `3 + len` rather than a hardcoded stride.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_parse_tlv_subscribe_req_variable_item_length() {
+        let bytes: Vec<u8> = vec![
+            0x20, 0x00, 0x00, 0x01, 0x00, 0x00, 0x0A, 0x00, // header (8b), req_id=10
+            0x03, 0x05, 0x00, // item tag=0x03, len=5 (not 24)
+            0x02, 0x02, 0x00, 0x07, 0x00, // nested TLV: signal_id=7, no other fields
+        ];
+        let (req_id, entries) = parse_tlv_subscribe_req(&bytes).unwrap();
+        assert_eq!(req_id, 10);
+        assert_eq!(entries, vec![(7u16, None)]);
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-057
+    /// Title: parse_tlv_subscribe_req rejects a truncated nested TLV without panicking
+    ///
+    /// Description: A nested TLV whose declared length overruns the enclosing item's
+    ///              value bounds must be dropped cleanly (no signal_id captured for that
+    ///              item), never panic or read out of bounds.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_parse_tlv_subscribe_req_truncated_nested_tlv() {
+        let bytes: Vec<u8> = vec![
+            0x20, 0x00, 0x00, 0x01, 0x00, 0x00, 0x63, 0x00, // header (8b), req_id=99
+            0x03, 0x04, 0x00, // item tag=0x03, len=4
+            0x02, 0x02, 0x00, 0x01, // nested TLV claims len=2 but only 1 byte remains
+        ];
+        assert!(parse_tlv_subscribe_req(&bytes).is_none());
+    }
+
+    /// ID SRS: SRS-TEST-BLEPROTOCOL-058
+    /// Title: parse_tlv_subscribe_req keeps already-parsed entries when a later item is truncated
+    ///
+    /// Description: A well-formed first item followed by a second item whose declared
+    ///              length overruns the buffer must stop the scan (break) but still
+    ///              return the entries collected before the truncation.
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_parse_tlv_subscribe_req_truncated_item_keeps_prior_entries() {
+        let bytes: Vec<u8> = vec![
+            0x20, 0x00, 0x00, 0x01, 0x00, 0x00, 0x37, 0x00, // header (8b), req_id=55
+            0x03, 0x05, 0x00, // item 1: tag=0x03, len=5
+            0x02, 0x02, 0x00, 0x01, 0x00, // nested TLV: signal_id=1
+            0x03, 0x18, 0x00, // item 2: tag=0x03, len=24 — but no bytes follow
+        ];
+        let (req_id, entries) = parse_tlv_subscribe_req(&bytes).unwrap();
+        assert_eq!(req_id, 55);
+        assert_eq!(entries, vec![(1u16, None)]);
     }
 }
