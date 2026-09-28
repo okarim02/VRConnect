@@ -438,9 +438,8 @@ impl GattServer {
             // WHY the count fell: a Central walking away and a local Bluetooth stack
             // collapsing produce the exact same event, and the `unwrap_or(0)` below also
             // maps a WinRT read failure onto "0 subscribers". The log line must therefore
-            // not name a cause — during the ~70 h soak of 2026-09-03/06 the previous
-            // wording ("Central disconnected") sent the first analysis after the phone
-            // while the operator was looking at an Intel driver failure on the PC.
+            // not name a cause: blaming the Central points the analysis at the phone
+            // when the fault may be the PC's Bluetooth driver.
             if cfg.name == "Data_OUT" {
                 let disc_tx = self.disconnect_tx.clone();
                 local_char
@@ -519,10 +518,7 @@ impl GattServer {
     ///              the device.
     ///
     ///              `StartAdvertisingWithParameters` is called exactly once in
-    ///              `start()`, and before this method existed nothing ever re-read
-    ///              the status. On the ~70 h soak of 2026-09-03/06 the session ended
-    ///              at 22:50:31 and 615 MB of logs held no trace of whether the
-    ///              advertisement was still alive — the run stayed undiagnosable.
+    ///              `start()`; this is the only place that re-reads the status.
     ///
     ///              Returns `None` when the server has not been started, or when the
     ///              WinRT read itself fails.
@@ -884,9 +880,7 @@ mod tests {
     /// Description: The CCCD handler observes only a subscriber count; it cannot tell
     /// a departed Central from a collapsed local Bluetooth stack. This test pins the
     /// content of `CCCD_SUBSCRIBERS_LOST_MSG` — the single source the handler logs
-    /// from — so the wording cannot be silently reverted to one that asserts a cause,
-    /// as it did on the ~70 h soak of 2026-09-03/06, sending the first analysis after
-    /// the phone while the fault was an Intel driver on the PC.
+    /// from — so the wording cannot be silently reverted to one that asserts a cause.
     ///
     /// Version: V1.0
     #[test]

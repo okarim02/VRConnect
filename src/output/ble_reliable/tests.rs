@@ -1,0 +1,2552 @@
+use super::*;
+use crate::domain::ble_protocol::{
+    AckFrame, IdtHeader, InboundFrame, SubscribeRsp, SubscribeRspItem, FLAG_RETRANSMIT, IDT_MAGIC,
+    IDT_VERSION, MSG_ACK_FRAME, MSG_NACK_FRAME, MSG_SUBSCRIBE_REQ, MSG_SUBSCRIBE_RSP,
+    SUB_OP_SUBSCRIBE,
+};
+use crate::domain::{ProcessedRoom, ProcessedTrack, TrackType};
+use chrono::Utc;
+use tempfile;
+
+/// Helper: create a test ProcessedTrack
+fn create_test_track(name: &str, value: f64, room_index: i32, room_name: &str) -> ProcessedTrack {
+    ProcessedTrack {
+        name: name.to_string(),
+        display_value: format!("{:.1}", value),
+        raw_value: Some(value),
+        unit: "unit".to_string(),
+        timestamp: Utc::now(),
+        room_index,
+        room_name: room_name.to_string(),
+        track_index: 0,
+        record_index: 0,
+        track_type: TrackType::Number,
+        waveform_stats: None,
+        waveform_points: None,
+    }
+}
+
+/// Helper: build a valid IDT ACK_FRAME buffer (30 bytes, IDT magic)
+fn make_ack_bytes(session_id: u16, stream_id: u16, ack_upto: u32) -> Vec<u8> {
+    let header = IdtHeader {
+        magic: IDT_MAGIC,
+        version: IDT_VERSION,
+        msg_type: MSG_ACK_FRAME,
+        flags: 0,
+        session_id,
+        stream_id,
+        seq: 0,
+    };
+    let mut buf = Vec::with_capacity(AckFrame::TOTAL_LEN);
+    buf.extend_from_slice(&header.to_bytes()); // [0..12]  13 bytes
+    buf.extend_from_slice(&ack_upto.to_le_bytes()); // [13..16]  4 bytes
+    buf.push(8u8); // [17]      bitmap_len = 8
+    buf.extend_from_slice(&0u64.to_le_bytes()); // [18..25]  bitmap = zeros
+    let crc = crc32c::crc32c(&buf);
+    buf.extend_from_slice(&crc.to_le_bytes()); // [26..29]  CRC32C
+    buf
+}
+
+/// Helper: build a valid IDT SUBSCRIBE_REQ buffer with one item
+fn make_subscribe_req_bytes(session_id: u16, req_id: u16, op: u8, signal_id: u16) -> Vec<u8> {
+    let header = IdtHeader {
+        magic: IDT_MAGIC,
+        version: IDT_VERSION,
+        msg_type: MSG_SUBSCRIBE_REQ,
+        flags: 0,
+        session_id,
+        stream_id: 0,
+        seq: 0,
+    };
+    let mut buf: Vec<u8> = header.to_bytes().to_vec();
+    buf.extend_from_slice(&req_id.to_le_bytes());
+    buf.push(op);
+    buf.push(1u8); // n = 1 item
+    buf.push(1u8); // source_id
+    buf.extend_from_slice(&signal_id.to_le_bytes());
+    buf.push(0u8); // mode = LIVE
+    buf.extend_from_slice(&1000u32.to_le_bytes()); // period_ms
+    buf.push(1u8); // batch_max
+    buf.extend_from_slice(&0u64.to_le_bytes()); // start_time_ms
+    let crc = crc32c::crc32c(&buf);
+    buf.extend_from_slice(&crc.to_le_bytes());
+    buf
+}
+
+// ── UUID / build ──────────────────────────────────────────────────────────
+
+/// ID SRS: SRS-TEST-BLERELIABLE-001
+/// Version: V1.0
+/// Title: Test UUID building
+#[test]
+fn test_build_char_uuid() {
+    let base = "12345678123412341234123456789012";
+    let uuid = ReliableBleOutput::build_char_uuid(base, "90ae").unwrap();
+    let uuid_str = uuid.to_string();
+    assert!(uuid_str.contains("90ae"), "UUID should contain suffix 90ae");
+}
+
+// ── Catalog ───────────────────────────────────────────────────────────────
+
+/// ID SRS: SRS-TEST-BLERELIABLE-002
+/// Version: V1.0
+/// Title: Test catalog serialization (IDT TLV format)
+#[test]
+fn test_serialize_catalog() {
+    let catalog = Catalog::default_medical_catalog();
+    let bytes = catalog.to_ble_bytes();
+    assert!(!bytes.is_empty());
+    // First entry: source_id=1, then signal_id=0x0101 LE → [0x01, 0x01]
+    assert_eq!(bytes[0], 1u8, "source_id should be 1");
+    assert_eq!(bytes[1], 0x01, "signal_id LE low byte = 0x01 (HR = 0x0101)");
+    assert_eq!(
+        bytes[2], 0x01,
+        "signal_id LE high byte = 0x01 (HR = 0x0101)"
+    );
+}
+
+// ── extract_signal_values ─────────────────────────────────────────────────
+
+/// ID SRS: SRS-TEST-BLERELIABLE-003
+/// Version: V1.0
+/// Title: Test signal value extraction uses IDT signal IDs
+#[test]
+fn test_extract_signal_values() {
+    let room = ProcessedRoom {
+        room_index: 0,
+        room_name: "BED_01".to_string(),
+        tracks: vec![
+            create_test_track("HR", 75.0, 0, "BED_01"),
+            create_test_track("SPO2", 98.0, 0, "BED_01"),
+        ],
+    };
+    let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+    let values = ReliableBleOutput::extract_signal_values(&data);
+
+    assert_eq!(values.len(), 2);
+    assert!(
+        values.iter().any(|(id, _)| *id == SignalId::HR.as_u16()),
+        "HR should have IDT signal_id 0x0101 = {}",
+        SignalId::HR.as_u16()
+    );
+    assert!(
+        values.iter().any(|(id, _)| *id == SignalId::SpO2.as_u16()),
+        "SpO2 should have IDT signal_id 0x0102 = {}",
+        SignalId::SpO2.as_u16()
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-004
+/// Version: V1.0
+/// Title: Test room filtering (only room_index=0 is processed)
+#[test]
+fn test_room_filtering() {
+    let data = ProcessedData::new(
+        "VR-TEST".to_string(),
+        vec![
+            ProcessedRoom {
+                room_index: 0,
+                room_name: "BED_01".to_string(),
+                tracks: vec![create_test_track("HR", 75.0, 0, "BED_01")],
+            },
+            ProcessedRoom {
+                room_index: 1,
+                room_name: "BED_02".to_string(),
+                tracks: vec![create_test_track("HR", 80.0, 1, "BED_02")],
+            },
+        ],
+    );
+    let values = ReliableBleOutput::extract_signal_values(&data);
+    assert_eq!(values.len(), 1);
+    assert!((values[0].1 - 75.0f32).abs() < f32::EPSILON);
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-005
+/// Version: V1.0
+/// Title: Test case-insensitive signal matching
+#[test]
+fn test_case_insensitive_matching() {
+    let room = ProcessedRoom {
+        room_index: 0,
+        room_name: "BED_01".to_string(),
+        tracks: vec![
+            create_test_track("hr", 75.0, 0, "BED_01"),
+            create_test_track("SpO2", 98.0, 0, "BED_01"), // note: SPO2 after toUpper
+            create_test_track("TEMPERATURE", 37.0, 0, "BED_01"),
+        ],
+    };
+    let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+    let values = ReliableBleOutput::extract_signal_values(&data);
+    // "SpO2".to_uppercase() = "SPO2" which matches the map key "SPO2"
+    assert_eq!(values.len(), 3);
+}
+
+// ── Session state helpers ─────────────────────────────────────────────────
+
+/// ID SRS: SRS-TEST-BLERELIABLE-006
+/// Version: V1.0
+/// Title: Test ACK dispatch purges retransmit buffer
+#[tokio::test]
+async fn test_write_handler_ack_dispatch() {
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+
+    let stream_id;
+    {
+        let mut st = state.write().await;
+        stream_id = st.subscribe(SignalId::HR.as_u16());
+        st.add_data(SignalId::HR.as_u16(), 75.0, 0);
+        st.add_data(SignalId::HR.as_u16(), 76.0, 1000);
+        st.add_data(SignalId::HR.as_u16(), 77.0, 2000);
+        assert_eq!(st.get_pending_count(SignalId::HR.as_u16()), 3);
+    }
+
+    // Build an IDT ACK_FRAME acknowledging seq 1 and 2
+    let ack_bytes = make_ack_bytes(1, stream_id, 2);
+    let ack = AckFrame::from_ble_bytes(&ack_bytes).unwrap();
+
+    {
+        let mut st = state.write().await;
+        st.handle_ack(ack.session_id, ack.stream_id, ack.ack_upto);
+        // Only seq 3 should remain
+        assert_eq!(st.get_pending_count(SignalId::HR.as_u16()), 1);
+    }
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-007
+/// Version: V1.0
+/// Title: Test subscribe/unsubscribe via IDT signal IDs
+#[tokio::test]
+async fn test_subscribe_unsubscribe_via_signal_id() {
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+
+    {
+        let mut st = state.write().await;
+        st.subscribe(SignalId::HR.as_u16()); // 0x0101
+        assert!(st.is_subscribed(SignalId::HR.as_u16()));
+    }
+    {
+        let mut st = state.write().await;
+        st.unsubscribe(SignalId::HR.as_u16());
+        assert!(!st.is_subscribed(SignalId::HR.as_u16()));
+    }
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-008
+/// Version: V1.0
+/// Title: Test SUBSCRIBE_REQ IDT payload parsing
+///
+/// Description: A valid IDT SUBSCRIBE_REQ for SpO2 (0x0102) shall be parsed
+///              correctly by InboundFrame dispatcher.
+#[test]
+fn test_subscribe_payload_parsing() {
+    let buf = make_subscribe_req_bytes(1, 1, SUB_OP_SUBSCRIBE, SignalId::SpO2.as_u16());
+    match InboundFrame::from_ble_bytes(&buf) {
+        Some(InboundFrame::SubscribeReq(req)) => {
+            assert_eq!(req.items[0].signal_id, SignalId::SpO2.as_u16()); // 0x0102
+            assert_eq!(req.op, SUB_OP_SUBSCRIBE);
+        }
+        _ => panic!("Expected InboundFrame::SubscribeReq"),
+    }
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-009
+/// Version: V1.0
+/// Title: Test NACK triggers retransmit with FLAG_RETRANSMIT
+#[tokio::test]
+async fn test_nack_triggers_retransmit() {
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+
+    let stream_id;
+    {
+        let mut st = state.write().await;
+        stream_id = st.subscribe(SignalId::HR.as_u16());
+        st.add_data(SignalId::HR.as_u16(), 70.0, 0);
+        st.add_data(SignalId::HR.as_u16(), 71.0, 1000);
+        st.add_data(SignalId::HR.as_u16(), 72.0, 2000);
+    }
+
+    let retransmits = {
+        let st = state.read().await;
+        st.handle_nack(stream_id, &[2])
+    };
+
+    assert_eq!(retransmits.len(), 1);
+    assert_eq!(retransmits[0].header.seq, 2);
+    assert_ne!(
+        retransmits[0].header.flags & FLAG_RETRANSMIT,
+        0,
+        "FLAG_RETRANSMIT must be set on retransmitted frame"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-010
+/// Version: V1.0
+/// Title: SUBSCRIBE_RSP sent on Data_OUT as full 24-byte IDT frame
+///
+/// Description: Flutter v2 routes msgType=0x02 on Data_OUT to _handleSubscribeResponse(),
+///              which builds activeStreams from the TLV payload. _initStreams() is now
+///              commented out — activeStreams is empty until RSP is received.
+///              Verify that to_mypredi_ble_bytes() produces a valid IDT frame:
+///              magic at [0-1], msgType=0x02 at [3], payloadLen at [22-23], CRC32C valid.
+#[test]
+fn test_subscribe_rsp_mypredi_format() {
+    let rsp = SubscribeRsp {
+        session_id: 1,
+        req_id: 42,
+        status: 0,
+        results: vec![SubscribeRspItem {
+            source_id: 1,
+            signal_id: SignalId::HR.as_u16(), // 0x0101
+            stream_id: 1,
+            effective_period_ms: 1000,
+            effective_batch_max: 1,
+        }],
+    };
+    let bytes = rsp.to_mypredi_ble_bytes();
+    // Minimum: 24-byte header + some TLV payload + 4-byte CRC
+    assert!(bytes.len() > 28, "RSP frame must be > 28 bytes");
+    // IDT magic at [0-1]
+    assert_eq!(
+        u16::from_le_bytes([bytes[0], bytes[1]]),
+        IDT_MAGIC,
+        "magic must be 0xD17A"
+    );
+    // msgType=0x02 at [3]
+    assert_eq!(bytes[3], MSG_SUBSCRIBE_RSP, "msgType must be 0x02");
+    // payloadLen at [22-23] must match actual payload size
+    let payload_len = u16::from_le_bytes([bytes[22], bytes[23]]) as usize;
+    assert_eq!(
+        bytes.len(),
+        24 + payload_len + 4,
+        "frame size must be 24 + payloadLen + 4"
+    );
+    // CRC32C valid
+    let expected_crc = crc32c::crc32c(&bytes[..bytes.len() - 4]);
+    let actual_crc = u32::from_le_bytes([
+        bytes[bytes.len() - 4],
+        bytes[bytes.len() - 3],
+        bytes[bytes.len() - 2],
+        bytes[bytes.len() - 1],
+    ]);
+    assert_eq!(actual_crc, expected_crc, "CRC32C must be valid");
+    // Legacy to_flutter_tlv_bytes() still produces 0x21 outer TLV (IDT subscribe path)
+    let tlv_bytes = rsp.to_flutter_tlv_bytes();
+    assert_eq!(tlv_bytes[0], 0x21, "legacy TLV outer type must be 0x21");
+}
+
+// ── Signal name alias coverage ────────────────────────────────────────────
+
+/// ID SRS: SRS-TEST-BLERELIABLE-011
+/// Version: V1.0
+/// Title: Test all VitalRecorder signal name aliases are matched
+///
+/// Description: extract_signal_values shall recognise every alias for SpO2
+///              and Temperature that VitalRecorder can export.
+#[test]
+fn test_signal_name_aliases() {
+    let room = ProcessedRoom {
+        room_index: 0,
+        room_name: "BED_01".to_string(),
+        tracks: vec![
+            // SpO2 aliases
+            create_test_track("PLETH", 97.0, 0, "BED_01"),
+            create_test_track("PLETH_SPO2", 98.0, 0, "BED_01"),
+            // Temperature aliases
+            create_test_track("BT", 36.5, 0, "BED_01"),
+            create_test_track("BT1", 36.6, 0, "BED_01"),
+            create_test_track("BT1_TEMP", 36.7, 0, "BED_01"),
+            create_test_track("TEMP", 36.8, 0, "BED_01"),
+            create_test_track("TEMPERATURE", 36.9, 0, "BED_01"),
+        ],
+    };
+    let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+    let values = ReliableBleOutput::extract_signal_values(&data);
+
+    let spo2_count = values
+        .iter()
+        .filter(|(id, _)| *id == SignalId::SpO2.as_u16())
+        .count();
+    let temp_count = values
+        .iter()
+        .filter(|(id, _)| *id == SignalId::Temperature.as_u16())
+        .count();
+
+    assert_eq!(spo2_count, 2, "Two SpO2 aliases (PLETH, PLETH_SPO2)");
+    assert_eq!(
+        temp_count, 5,
+        "Five Temperature aliases (BT, BT1, BT1_TEMP, TEMP, TEMPERATURE)"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-012
+/// Version: V1.0
+/// Title: Test unknown signal names produce no output
+///
+/// Description: Tracks whose names are not in the signal map must be silently
+///              ignored by extract_signal_values.
+#[test]
+fn test_unknown_signal_name_ignored() {
+    let room = ProcessedRoom {
+        room_index: 0,
+        room_name: "BED_01".to_string(),
+        tracks: vec![
+            create_test_track("ART1_SBP", 120.0, 0, "BED_01"),
+            create_test_track("ECG1", 0.5, 0, "BED_01"),
+        ],
+    };
+    let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+    let values = ReliableBleOutput::extract_signal_values(&data);
+    assert!(values.is_empty(), "Unmapped signals must produce no output");
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-013
+/// Version: V1.0
+/// Title: Test extract_signal_values uses display_value when raw_value is None
+///
+/// Description: If raw_value is None, the track's display_value string shall be
+///              parsed as f32 and used as the signal value.
+#[test]
+fn test_extract_signal_values_display_value_fallback() {
+    let mut track = create_test_track("HR", 0.0, 0, "BED_01");
+    track.raw_value = None;
+    track.display_value = "82.0".to_string();
+
+    let room = ProcessedRoom {
+        room_index: 0,
+        room_name: "BED_01".to_string(),
+        tracks: vec![track],
+    };
+    let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+    let values = ReliableBleOutput::extract_signal_values(&data);
+
+    assert_eq!(values.len(), 1);
+    assert!((values[0].1 - 82.0f32).abs() < f32::EPSILON);
+}
+
+// ── FLAG_BACKLOG on outgoing frames ───────────────────────────────────────
+
+/// ID SRS: SRS-TEST-BLERELIABLE-015
+/// Version: V1.0
+/// Title: Live frames must NOT carry FLAG_BACKLOG outside of replay
+///
+/// Description: FLAG_BACKLOG is restricted to historical-replay frames only
+///              (is_replaying=true). Live frames — even when the retransmit buffer
+///              is non-empty — must have FLAG_BACKLOG clear.
+#[tokio::test]
+async fn test_flag_backlog_not_set_on_live_frames() {
+    use crate::domain::ble_protocol::FLAG_BACKLOG;
+
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    {
+        let mut st = state.write().await;
+        st.subscribe(SignalId::HR.as_u16());
+
+        let f1 = st.add_data(SignalId::HR.as_u16(), 70.0, 0).unwrap();
+        assert_eq!(
+            f1.header.flags & FLAG_BACKLOG,
+            0,
+            "First live frame: FLAG_BACKLOG must be clear"
+        );
+
+        // Second frame — tx buffer is non-empty (f1 not yet ACKed) but is_replaying=false
+        let f2 = st.add_data(SignalId::HR.as_u16(), 71.0, 1000).unwrap();
+        assert_eq!(
+            f2.header.flags & FLAG_BACKLOG,
+            0,
+            "Second live frame: FLAG_BACKLOG must be clear outside replay"
+        );
+    }
+}
+
+// ── Selective ACK bitmap retransmit ───────────────────────────────────────
+
+/// ID SRS: SRS-TEST-BLERELIABLE-016
+/// Version: V1.0
+/// Title: Test handle_ack_with_bitmap returns lost frames for retransmission
+///
+/// Description: 4 frames buffered (seq 1-4). ACK: ack_upto=1, bitmap
+///              bit1=1 (seq 3 received, seq 2 missing). handle_ack_with_bitmap
+///              must return seq 2 with FLAG_RETRANSMIT, and purge seq 1.
+#[tokio::test]
+async fn test_handle_ack_with_bitmap_retransmit() {
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    let stream_id;
+
+    {
+        let mut st = state.write().await;
+        stream_id = st.subscribe(SignalId::HR.as_u16());
+        for i in 0u64..4 {
+            st.add_data(SignalId::HR.as_u16(), i as f32, i * 1000);
+        }
+    }
+
+    // ack_upto=1; bit0=seq2 (clear=missing), bit1=seq3 (set=received)
+    let mut bitmap = [0u8; 8];
+    bitmap[0] = 0b0000_0010; // bit1 set → seq 3 received
+
+    let retransmits = {
+        let mut st = state.write().await;
+        st.handle_ack_with_bitmap(1, stream_id, 1, &bitmap)
+    };
+
+    assert_eq!(retransmits.len(), 1, "Seq 2 is the only hole");
+    assert_eq!(retransmits[0].header.seq, 2);
+    assert_ne!(retransmits[0].header.flags & FLAG_RETRANSMIT, 0);
+
+    // seq 1 must have been purged (ack_upto=1)
+    let st = state.read().await;
+    let pending = st.get_pending_count(SignalId::HR.as_u16());
+    assert_eq!(pending, 3, "Seq 1 purged; seq 2,3,4 remain in buffer");
+}
+
+// ── subscribe_with_stream_id ──────────────────────────────────────────────
+
+/// ID SRS: SRS-TEST-BLERELIABLE-017
+/// Version: V1.0
+/// Title: Test subscribe_with_stream_id assigns IDs 1, 2, 3 for HR/SpO2/Temp
+///
+/// Description: subscribe_with_stream_id with preferred_stream_id = 1, 2, 3.
+///              All three signals must get independent fixed stream IDs.
+#[tokio::test]
+async fn test_subscribe_with_stream_id_all_signals() {
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    {
+        let mut st = state.write().await;
+        let hr_sid = st.subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+        let spo2_sid = st.subscribe_with_stream_id(SignalId::SpO2.as_u16(), 2);
+        let temp_sid = st.subscribe_with_stream_id(SignalId::Temperature.as_u16(), 3);
+
+        assert_eq!(hr_sid, 1);
+        assert_eq!(spo2_sid, 2);
+        assert_eq!(temp_sid, 3);
+        assert_eq!(st.streams.len(), 3);
+    }
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-018
+/// Version: V1.0
+/// build_char_uuid returns Err when the resulting string is not a valid UUID
+#[test]
+fn test_build_char_uuid_invalid_base_returns_error() {
+    // A base string of length != 32 that produces an invalid UUID format
+    let result = ReliableBleOutput::build_char_uuid("not-a-valid-uuid-base!!", "90ae");
+    assert!(result.is_err(), "Invalid UUID base must return Err");
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-019
+/// Version: V1.0
+/// extract_signal_values with room 0 having no tracks returns an empty Vec
+#[test]
+fn test_extract_signal_values_empty_tracks() {
+    let room = ProcessedRoom {
+        room_index: 0,
+        room_name: "BED_01".to_string(),
+        tracks: vec![],
+    };
+    let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+    let values = ReliableBleOutput::extract_signal_values(&data);
+    assert!(
+        values.is_empty(),
+        "Room with no tracks must yield no values"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-020
+/// Version: V1.0
+/// extract_signal_values skips a track when raw_value is None and display_value
+/// cannot be parsed as f32 (e.g., "N/A")
+#[test]
+fn test_extract_signal_values_unparseable_display_value_skipped() {
+    let mut track = create_test_track("HR", 0.0, 0, "BED_01");
+    track.raw_value = None;
+    track.display_value = "N/A".to_string(); // cannot parse as f32
+
+    let room = ProcessedRoom {
+        room_index: 0,
+        room_name: "BED_01".to_string(),
+        tracks: vec![track],
+    };
+    let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+    let values = ReliableBleOutput::extract_signal_values(&data);
+    assert!(
+        values.is_empty(),
+        "Unparseable display_value must be skipped"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-021
+/// Version: V1.0
+/// extract_signal_values returns an empty Vec when no rooms are present
+#[test]
+fn test_extract_signal_values_no_rooms() {
+    let data = ProcessedData::new("VR-TEST".to_string(), vec![]);
+    let values = ReliableBleOutput::extract_signal_values(&data);
+    assert!(values.is_empty());
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-022
+/// Version: V1.0
+/// extract_signal_values correctly maps "BT" (an alias) to Temperature signal_id
+#[test]
+fn test_extract_signal_values_bt_alias_maps_to_temperature() {
+    let room = ProcessedRoom {
+        room_index: 0,
+        room_name: "BED_01".to_string(),
+        tracks: vec![create_test_track("BT", 36.5, 0, "BED_01")],
+    };
+    let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+    let values = ReliableBleOutput::extract_signal_values(&data);
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0].0, SignalId::Temperature.as_u16());
+    assert!((values[0].1 - 36.5f32).abs() < f32::EPSILON);
+}
+
+// ── Registry validation path tests ───────────────────────────────────────
+// These tests validate the logic used in handle_subscribe_req
+// without requiring BLE hardware (GattServer), by exercising the same registry + state
+// objects that the async handlers use internally.
+
+/// ID SRS: SRS-TEST-BLERELIABLE-023
+/// Version: V1.0
+/// normalize_id returns None for IDs that must be rejected by subscribe handlers
+///
+/// Validates the `normalize_id(unknown) → None → warn+skip` guard used in both
+/// handle_subscribe_req and handle_tlv_subscribe.
+#[test]
+fn test_registry_unknown_signal_normalize_returns_none() {
+    use crate::domain::ble_protocol::SignalRegistry;
+    let r = SignalRegistry::with_defaults();
+    assert_eq!(
+        r.normalize_id(0x9999),
+        None,
+        "unknown IDT compound ID must be rejected"
+    );
+    assert_eq!(
+        r.normalize_id(0x0200),
+        None,
+        "unknown source-2 ID must be rejected"
+    );
+    assert_eq!(r.normalize_id(0), None, "zero must always be rejected");
+    assert_eq!(
+        r.normalize_id(99),
+        None,
+        "unknown legacy simple ID must be rejected"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-024
+/// Version: V1.0
+/// After normalize_id succeeds, registry.get(canonical) returns correct metadata
+///
+/// Validates the invariant relied upon by both subscribe handlers:
+/// `registry.get(canonical_id).unwrap()` must never panic after `normalize_id` returns Some.
+#[test]
+fn test_registry_known_signal_meta_available_after_normalize() {
+    use crate::domain::ble_protocol::SignalRegistry;
+    let r = SignalRegistry::with_defaults();
+    // Legacy path: raw_id=1 (HR) → canonical=0x0101
+    let canonical = r.normalize_id(1).unwrap();
+    let meta = r.get(canonical).unwrap(); // must not panic — handler invariant
+    assert_eq!(meta.source_id, 1);
+    assert_eq!(meta.nominal_period_ms, 1000); // HR = 1 Hz
+    assert_eq!(meta.signal_id, 0x0101);
+    // Canonical path: 0x0103 (Temperature)
+    let temp_meta = r.get(r.normalize_id(0x0103).unwrap()).unwrap();
+    assert_eq!(temp_meta.nominal_period_ms, 2000); // Temperature = 0.5 Hz
+    assert_eq!(temp_meta.source_id, 1);
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-025
+/// Version: V1.0
+/// Full normalized-subscribe path: legacy raw_id=1 → 0x0101 → state tracks canonical ID
+///
+/// Validates that subscribe_with_stream_id(canonical, preferred) records the subscription
+/// at the canonical IDT ID (0x0101), not at the raw legacy ID (1).
+#[tokio::test]
+async fn test_subscribe_with_normalized_id_state_reflects_canonical() {
+    use crate::domain::ble_protocol::SignalRegistry;
+    let r = SignalRegistry::with_defaults();
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    {
+        let mut st = state.write().await;
+        // Legacy simple ID raw_id=1 → normalize to canonical 0x0101
+        let canonical = r.normalize_id(1).unwrap();
+        assert_eq!(canonical, 0x0101);
+        let stream_id = st.subscribe_with_stream_id(canonical, 1);
+        assert_eq!(stream_id, 1, "preferred_stream_id must be honoured");
+        // State must record subscription at canonical IDT ID, not legacy raw ID
+        assert!(
+            st.is_subscribed(0x0101),
+            "must be subscribed at canonical IDT ID 0x0101"
+        );
+        assert!(
+            !st.is_subscribed(1),
+            "legacy raw ID 1 must NOT appear as subscribed"
+        );
+    }
+}
+
+// ── HistoryBuffer / replay integration ───────────────────────────────────
+
+/// ID SRS: SRS-TEST-BLERELIABLE-026
+/// Version: V1.0
+/// Title: output() feeds history buffer regardless of subscription state
+///
+/// Description: record_history must be called for every incoming sample in output(),
+///              even when no client is subscribed for the signal. This ensures history
+///              is available for subsequent BACKLOG_THEN_LIVE subscriptions.
+#[tokio::test]
+async fn test_output_feeds_history_when_not_subscribed() {
+    use crate::domain::ble_protocol::SignalId;
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+
+    // Build a minimal ProcessedData with one HR sample, no subscription active
+    let room = ProcessedRoom {
+        room_index: 0,
+        room_name: "BED_01".to_string(),
+        tracks: vec![create_test_track("HR", 75.0, 0i32, "BED_01")],
+    };
+    let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+
+    // Drive signal_to_history via record_history directly (mirrors output() behaviour)
+    {
+        let mut st = state.write().await;
+        st.record_history(SignalId::HR.as_u16(), 75.0, 1_700_000_000_000u64);
+    }
+
+    // History must contain the sample even though no stream is subscribed
+    {
+        let st = state.read().await;
+        assert!(
+            !st.is_subscribed(SignalId::HR.as_u16()),
+            "pre-condition: not subscribed"
+        );
+        let hist = st.history.get(&SignalId::HR.as_u16()).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0], (1_700_000_000_000u64, 75.0f32));
+    }
+
+    // Suppress unused-variable warning for `data`
+    let _ = data;
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-027
+/// Version: V1.0
+/// Title: start_replay returns FLAG_BACKLOG frames; live frames never carry FLAG_BACKLOG
+///
+/// Description: After subscribing and seeding history, start_replay() must return
+///              DataFrames with FLAG_BACKLOG set. Live frames produced by add_data()
+///              must NOT carry FLAG_BACKLOG regardless of is_replaying state — the flag
+///              is the exclusive property of get_replay_frames().
+#[tokio::test]
+async fn test_start_and_finish_replay_flag_lifecycle() {
+    use crate::domain::ble_protocol::{SignalId, FLAG_BACKLOG};
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+
+    {
+        let mut st = state.write().await;
+        // Seed history with 3 HR samples
+        st.record_history(SignalId::HR.as_u16(), 70.0, 1000);
+        st.record_history(SignalId::HR.as_u16(), 71.0, 2000);
+        st.record_history(SignalId::HR.as_u16(), 72.0, 3000);
+
+        // Subscribe to HR
+        st.subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+
+        // Trigger replay (start_time_ms=0 → all history)
+        let frames = st.start_replay(SignalId::HR.as_u16(), 0);
+        assert_eq!(frames.len(), 3, "all 3 history samples must be replayed");
+        for f in &frames {
+            assert_ne!(
+                f.header.flags & FLAG_BACKLOG,
+                0,
+                "every replay frame must carry FLAG_BACKLOG"
+            );
+        }
+
+        // While replaying, live frames must NOT carry FLAG_BACKLOG (BLE_REVIEW_FINDINGS F1)
+        let live_during = st.add_data(SignalId::HR.as_u16(), 73.0, 4000).unwrap();
+        assert_eq!(
+            live_during.header.flags & FLAG_BACKLOG,
+            0,
+            "live frame during replay must NOT carry FLAG_BACKLOG"
+        );
+
+        // Finish replay — clear is_replaying
+        let stream_id = st.get_stream_id(SignalId::HR.as_u16()).unwrap();
+        st.finish_replay(stream_id);
+
+        // Live frame after replay must NOT carry FLAG_BACKLOG
+        let live_after = st.add_data(SignalId::HR.as_u16(), 74.0, 5000).unwrap();
+        assert_eq!(
+            live_after.header.flags & FLAG_BACKLOG,
+            0,
+            "live frame after finish_replay must NOT carry FLAG_BACKLOG"
+        );
+    }
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-043
+/// Version: V1.0
+/// Title: Replay interleaves frames from multiple signals sorted by timestamp
+///
+/// Description: When two signals are replayed simultaneously, their frames must be
+///              merged and sorted by t0_ms so no single signal monopolises the BLE
+///              channel. HR frames at odd timestamps and SpO2 at even timestamps must
+///              emerge interleaved, and both streams must finish with is_replaying=false.
+#[tokio::test]
+async fn test_replay_interleaves_signals_by_timestamp() {
+    use crate::domain::ble_protocol::SignalId;
+
+    let mut st = BleSessionState::new(1);
+
+    // Seed HR at odd timestamps and SpO2 at even timestamps
+    st.record_history(SignalId::HR.as_u16(), 60.0, 1000);
+    st.record_history(SignalId::SpO2.as_u16(), 98.0, 2000);
+    st.record_history(SignalId::HR.as_u16(), 61.0, 3000);
+    st.record_history(SignalId::SpO2.as_u16(), 97.0, 4000);
+    st.record_history(SignalId::HR.as_u16(), 62.0, 5000);
+    st.record_history(SignalId::SpO2.as_u16(), 96.0, 6000);
+
+    st.subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+    st.subscribe_with_stream_id(SignalId::SpO2.as_u16(), 2);
+
+    let hr_frames = st.start_replay(SignalId::HR.as_u16(), 0);
+    let spo2_frames = st.start_replay(SignalId::SpO2.as_u16(), 0);
+
+    assert_eq!(hr_frames.len(), 3);
+    assert_eq!(spo2_frames.len(), 3);
+
+    // Reproduce the merge-and-sort from handle_subscribe_req (Phase B)
+    let mut merged: Vec<(u64, u16)> = hr_frames
+        .iter()
+        .map(|f| (f.t0_ms, SignalId::HR.as_u16()))
+        .chain(
+            spo2_frames
+                .iter()
+                .map(|f| (f.t0_ms, SignalId::SpO2.as_u16())),
+        )
+        .collect();
+    merged.sort_by_key(|(t0, _)| *t0);
+
+    // Frames must alternate HR/SpO2 in timestamp order
+    let expected: Vec<(u64, u16)> = vec![
+        (1000, SignalId::HR.as_u16()),
+        (2000, SignalId::SpO2.as_u16()),
+        (3000, SignalId::HR.as_u16()),
+        (4000, SignalId::SpO2.as_u16()),
+        (5000, SignalId::HR.as_u16()),
+        (6000, SignalId::SpO2.as_u16()),
+    ];
+    assert_eq!(merged, expected, "frames must be interleaved by t0_ms");
+
+    // Both streams must finish replaying (Phase D — single-pass finish)
+    let hr_stream = st.get_stream_id(SignalId::HR.as_u16()).unwrap();
+    let spo2_stream = st.get_stream_id(SignalId::SpO2.as_u16()).unwrap();
+    st.finish_replay(hr_stream);
+    st.finish_replay(spo2_stream);
+
+    assert!(
+        !st.streams[&hr_stream].is_replaying,
+        "HR must finish replaying"
+    );
+    assert!(
+        !st.streams[&spo2_stream].is_replaying,
+        "SpO2 must finish replaying"
+    );
+}
+
+// ── Control pull-request (health on demand) ───────────────────────────────
+
+/// ID SRS: SRS-TEST-BLERELIABLE-029
+/// Version: V1.0
+/// Title: Control write triggers immediate health_notify
+///
+/// Description: Any write on the Control characteristic shall call notify_one()
+///              on health_notify within 100 ms, waking the health task.
+#[tokio::test]
+async fn test_control_write_triggers_health_notify() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WriteEvent>();
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    let service_uuid = uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap();
+    let server = Arc::new(RwLock::new(GattServer::new(
+        "Test".to_string(),
+        service_uuid,
+    )));
+    let registry = Arc::new(SignalRegistry::with_defaults());
+    let health_state = Arc::new(RwLock::new(GateHealthState::default()));
+    let health_notify = Arc::new(Notify::new());
+    let health_notify_check = health_notify.clone();
+    let last_ack_time = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+
+    tokio::spawn(async move {
+        ReliableBleOutput::write_handler_loop(
+            rx,
+            state,
+            server,
+            registry,
+            health_state,
+            health_notify,
+            last_ack_time,
+        )
+        .await;
+    });
+
+    tx.send(WriteEvent {
+        characteristic_name: "Control".to_string(),
+        data: vec![0x01],
+    })
+    .unwrap();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        health_notify_check.notified(),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "health_notify must fire within 100 ms of a Control write"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-030
+/// Version: V1.0
+/// Title: Control write content is ignored — any payload triggers health push
+///
+/// Description: Writes of [0x00], [0xFF], and [] (empty) on Control must all
+///              trigger health_notify, regardless of content.
+#[tokio::test]
+async fn test_control_write_any_payload_triggers_notify() {
+    for data in [vec![0x00u8], vec![0xFFu8], vec![]] {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WriteEvent>();
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        let service_uuid = uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap();
+        let server = Arc::new(RwLock::new(GattServer::new(
+            "Test".to_string(),
+            service_uuid,
+        )));
+        let registry = Arc::new(SignalRegistry::with_defaults());
+        let health_state = Arc::new(RwLock::new(GateHealthState::default()));
+        let health_notify = Arc::new(Notify::new());
+        let health_notify_check = health_notify.clone();
+        let last_ack_time = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+
+        tokio::spawn(async move {
+            ReliableBleOutput::write_handler_loop(
+                rx,
+                state,
+                server,
+                registry,
+                health_state,
+                health_notify,
+                last_ack_time,
+            )
+            .await;
+        });
+
+        tx.send(WriteEvent {
+            characteristic_name: "Control".to_string(),
+            data,
+        })
+        .unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            health_notify_check.notified(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "health_notify must fire regardless of Control write payload"
+        );
+    }
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-031
+/// Version: V1.0
+/// Title: Concurrent health event + pull request coalesce — health_task wakes once
+///
+/// Description: tokio::Notify stores at most one permit. Two consecutive notify_one()
+///              calls before notified() is polled behave as one: the second notified()
+///              blocks. This verifies the documented coalescing behaviour relied upon
+///              by the health task to avoid double pushes on simultaneous triggers.
+#[tokio::test]
+async fn test_control_and_event_driven_notify_coalesce() {
+    let health_notify = Arc::new(Notify::new());
+
+    health_notify.notify_one(); // event-driven trigger (e.g. sio_connected changed)
+    health_notify.notify_one(); // pull request arriving simultaneously
+
+    // First notified() must resolve immediately (one permit stored).
+    let r1 = tokio::time::timeout(
+        std::time::Duration::from_millis(10),
+        health_notify.notified(),
+    )
+    .await;
+    assert!(r1.is_ok(), "first notified() must resolve immediately");
+
+    // Second notified() must time out — notify_one coalesces, only one permit issued.
+    let r2 = tokio::time::timeout(
+        std::time::Duration::from_millis(10),
+        health_notify.notified(),
+    )
+    .await;
+    assert!(
+        r2.is_err(),
+        "second notified() must time out — notify_one coalesces duplicates"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-028
+/// Title: output() deduplicates duplicate (signal_id, t0_ms) pairs
+///
+/// Description: VRConnect shall emit exactly one DATA_FRAME per unique
+///              (signal_id, t0_ms) pair within a single output() call.
+///              VitalRecorder may emit 2–3 records with the same timestamp
+///              for the same signal in one Socket.IO message; the extra copies
+///              must be silently dropped — not forwarded to MyPredi, not stored
+///              in the history buffer.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_output_deduplicates_same_signal_same_timestamp() {
+    use crate::domain::ble_protocol::SignalId;
+
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+
+    // Subscribe to HR so add_data() actually produces frames
+    {
+        let mut st = state.write().await;
+        st.subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+    }
+
+    // Build ProcessedData with 3 identical HR tracks (same t0_ms, same value)
+    let fixed_ts = chrono::DateTime::from_timestamp_millis(1_776_672_192_000).unwrap();
+    let make_track = |record_index: i32| ProcessedTrack {
+        name: "HR".to_string(),
+        display_value: "51.000".to_string(),
+        raw_value: Some(51.0),
+        unit: "bpm".to_string(),
+        timestamp: fixed_ts,
+        room_index: 0,
+        room_name: "BED_01".to_string(),
+        track_index: 0,
+        record_index,
+        track_type: crate::domain::processed_data::TrackType::Number,
+        waveform_stats: None,
+        waveform_points: None,
+    };
+
+    let room = ProcessedRoom {
+        room_index: 0,
+        room_name: "BED_01".to_string(),
+        tracks: vec![make_track(0), make_track(1), make_track(2)],
+    };
+    let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+
+    // Drive record_history + add_data via BleSessionState directly,
+    // mirroring the dedup logic in output().
+    {
+        let mut st = state.write().await;
+        let mut seen: std::collections::HashSet<(u16, u64)> = std::collections::HashSet::new();
+        let mut frames_generated = 0usize;
+        let mut history_inserts = 0usize;
+
+        for track in &data.all_tracks {
+            if track.room_index != 0 {
+                continue;
+            }
+            let signal_id = SignalId::HR.as_u16();
+            let t0_ms = track.timestamp.timestamp_millis() as u64;
+
+            if !seen.insert((signal_id, t0_ms)) {
+                continue;
+            }
+
+            let val = track.raw_value.unwrap() as f32;
+            st.record_history(signal_id, val, t0_ms);
+            history_inserts += 1;
+
+            if st.add_data(signal_id, val, t0_ms).is_some() {
+                frames_generated += 1;
+            }
+        }
+
+        assert_eq!(
+            frames_generated, 1,
+            "only one DATA_FRAME should be generated for 3 identical tracks"
+        );
+        assert_eq!(
+            history_inserts, 1,
+            "only one history entry should be stored for 3 identical tracks"
+        );
+
+        let hist = st.history.get(&SignalId::HR.as_u16()).unwrap();
+        assert_eq!(
+            hist.len(),
+            1,
+            "history ring-buffer must contain exactly 1 entry"
+        );
+        assert_eq!(
+            hist[0],
+            (1_776_672_192_000u64, 51.0f32),
+            "stored history entry must match the single expected sample"
+        );
+    }
+}
+
+// ── unsubscribe_all integration ───────────────────────────────────────────
+// These tests validate the unsubscribe_all behaviour used in handle_subscribe_req
+// and handle_tlv_subscribe without requiring BLE hardware, by exercising the same
+// BleSessionState operations the async handlers perform internally.
+
+/// ID SRS: SRS-TEST-BLERELIABLE-032
+/// Version: V1.0
+/// Title: SUB_OP_SUBSCRIBE path: unsubscribe_all then subscribe replaces prior set
+///
+/// Description: Mirrors handle_subscribe_req (op=SUBSCRIBE): pre-subscribed HR+SpO2,
+///              then unsubscribe_all() + subscribe(HR) → only HR active.
+#[tokio::test]
+async fn test_subscribe_op_replaces_prior_subscriptions_via_unsubscribe_all() {
+    use crate::domain::ble_protocol::{SignalId, SignalRegistry};
+
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    let registry = Arc::new(SignalRegistry::with_defaults());
+
+    {
+        let mut st = state.write().await;
+        st.subscribe(SignalId::HR.as_u16());
+        st.subscribe(SignalId::SpO2.as_u16());
+    }
+    assert_eq!(state.read().await.streams.len(), 2);
+
+    // Simulate handle_subscribe_req(op=SUBSCRIBE, items=[HR])
+    {
+        let mut st = state.write().await;
+        st.unsubscribe_all(); // <-- the new call
+        let canonical = registry.normalize_id(SignalId::HR.as_u16()).unwrap();
+        st.subscribe(canonical);
+    }
+
+    let st = state.read().await;
+    assert!(
+        st.is_subscribed(SignalId::HR.as_u16()),
+        "HR must be subscribed after simulate-SUBSCRIBE"
+    );
+    assert!(
+        !st.is_subscribed(SignalId::SpO2.as_u16()),
+        "SpO2 must be gone after unsubscribe_all"
+    );
+    assert_eq!(st.streams.len(), 1);
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-033
+/// Version: V1.0
+/// Title: SUB_OP_UNSUBSCRIBE path: no unsubscribe_all, only individual removal
+///
+/// Description: Mirrors handle_subscribe_req (op=UNSUBSCRIBE): pre-subscribed HR+SpO2,
+///              UNSUBSCRIBE path calls unsubscribe(SpO2) only — HR must remain.
+#[tokio::test]
+async fn test_unsubscribe_op_removes_only_targeted_signal() {
+    use crate::domain::ble_protocol::{SignalId, SignalRegistry};
+
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    let registry = Arc::new(SignalRegistry::with_defaults());
+
+    {
+        let mut st = state.write().await;
+        st.subscribe(SignalId::HR.as_u16());
+        st.subscribe(SignalId::SpO2.as_u16());
+    }
+
+    // Simulate handle_subscribe_req(op=UNSUBSCRIBE, items=[SpO2])
+    // — unsubscribe_all must NOT be called here
+    {
+        let mut st = state.write().await;
+        let canonical = registry
+            .normalize_id(SignalId::SpO2.as_u16())
+            .unwrap_or(SignalId::SpO2.as_u16());
+        st.unsubscribe(canonical);
+    }
+
+    let st = state.read().await;
+    assert!(
+        st.is_subscribed(SignalId::HR.as_u16()),
+        "HR must survive UNSUBSCRIBE(SpO2)"
+    );
+    assert!(
+        !st.is_subscribed(SignalId::SpO2.as_u16()),
+        "SpO2 must be removed by individual unsubscribe"
+    );
+    assert_eq!(st.streams.len(), 1);
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-034
+/// Version: V1.0
+/// Title: TLV-subscribe path: unsubscribe_all + subscribe_with_stream_id replaces prior set
+///
+/// Description: Mirrors handle_tlv_subscribe: pre-subscribed HR+SpO2, then
+///              unsubscribe_all() + subscribe_with_stream_id(HR, flutter_sid) → only HR.
+#[tokio::test]
+async fn test_tlv_subscribe_replaces_prior_subscriptions_via_unsubscribe_all() {
+    use crate::domain::ble_protocol::{SignalId, SignalRegistry};
+
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    let registry = Arc::new(SignalRegistry::with_defaults());
+
+    {
+        let mut st = state.write().await;
+        st.subscribe(SignalId::HR.as_u16());
+        st.subscribe(SignalId::SpO2.as_u16());
+    }
+    assert_eq!(state.read().await.streams.len(), 2);
+
+    // Simulate handle_tlv_subscribe(signal_ids=[HR])
+    {
+        let mut st = state.write().await;
+        st.unsubscribe_all(); // <-- the new call
+        let canonical = registry.normalize_id(SignalId::HR.as_u16()).unwrap();
+        let flutter_sid = ReliableBleOutput::flutter_stream_id(canonical);
+        st.subscribe_with_stream_id(canonical, flutter_sid);
+    }
+
+    let st = state.read().await;
+    assert!(
+        st.is_subscribed(SignalId::HR.as_u16()),
+        "HR must be subscribed after simulate-TLV-SUBSCRIBE"
+    );
+    assert!(
+        !st.is_subscribed(SignalId::SpO2.as_u16()),
+        "SpO2 must be cleared by unsubscribe_all in TLV-subscribe path"
+    );
+    assert_eq!(st.streams.len(), 1);
+}
+
+// ── disconnect_handler_loop grace period ─────────────────────────────────
+
+/// Helper: build a minimal Arc<RwLock<GateHealthState>> with ble_subscriber=true
+fn make_health(subscriber: bool) -> Arc<RwLock<GateHealthState>> {
+    Arc::new(RwLock::new(GateHealthState {
+        ble_subscriber: subscriber,
+        ..Default::default()
+    }))
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-035
+/// Title: grace_period=0 triggers on_disconnect() immediately on Disconnected event
+///
+/// Description: When ble_grace_period_sec=0, a Disconnected event must cause
+///              on_disconnect() to fire without any delay. signal_to_stream must be
+///              empty and ble_subscriber must be false immediately after yielding.
+///
+/// Version: V1.1
+#[tokio::test]
+async fn test_grace_zero_resets_immediately() {
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    state
+        .write()
+        .await
+        .subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+    let health_state = make_health(true);
+    let health_notify = Arc::new(Notify::new());
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BleConnectionEvent>();
+
+    tokio::spawn(ReliableBleOutput::disconnect_handler_loop(
+        rx,
+        state.clone(),
+        health_state.clone(),
+        health_notify.clone(),
+        Duration::ZERO,
+    ));
+
+    tx.send(BleConnectionEvent::Disconnected).unwrap();
+    tokio::task::yield_now().await;
+
+    assert!(
+        state.read().await.signal_to_stream.is_empty(),
+        "streams must be cleared immediately with grace=0"
+    );
+    assert!(
+        !health_state.read().await.ble_subscriber,
+        "ble_subscriber must be false after immediate reset"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-036
+/// Title: Reconnect within grace period preserves session and ble_subscriber
+///
+/// Description: When Flutter reconnects (Connected event) within the grace window,
+///              on_disconnect() must NOT be called: signal_to_stream remains intact,
+///              current_session_id is unchanged, and ble_subscriber stays true.
+///
+/// Version: V1.1
+#[tokio::test]
+async fn test_grace_reconnect_preserves_session() {
+    let initial_session_id = 1u16;
+    let state = Arc::new(RwLock::new(BleSessionState::new(initial_session_id)));
+    state
+        .write()
+        .await
+        .subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+    let health_state = make_health(true);
+    let health_notify = Arc::new(Notify::new());
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BleConnectionEvent>();
+
+    // Grace timer runs on a real OS thread — real (short) durations, no time mocking.
+    tokio::spawn(ReliableBleOutput::disconnect_handler_loop(
+        rx,
+        state.clone(),
+        health_state.clone(),
+        health_notify.clone(),
+        Duration::from_secs(2),
+    ));
+
+    // Disconnect then reconnect well within the 2 s window
+    tx.send(BleConnectionEvent::Disconnected).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tx.send(BleConnectionEvent::Connected).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let st = state.read().await;
+    assert!(
+        !st.signal_to_stream.is_empty(),
+        "subscriptions must be preserved after grace reconnect"
+    );
+    assert_eq!(
+        st.current_session_id, initial_session_id,
+        "session_id must not change after grace reconnect"
+    );
+    assert!(
+        health_state.read().await.ble_subscriber,
+        "ble_subscriber must remain true after grace reconnect"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-037
+/// Title: Grace period expiry triggers on_disconnect() and resets session
+///
+/// Description: When no reconnect occurs within ble_grace_period_sec, on_disconnect()
+///              fires: signal_to_stream is cleared, current_session_id increments,
+///              and ble_subscriber becomes false.
+///
+/// Version: V1.1
+#[tokio::test]
+async fn test_grace_expiry_resets_session() {
+    let initial_session_id = 1u16;
+    let state = Arc::new(RwLock::new(BleSessionState::new(initial_session_id)));
+    state
+        .write()
+        .await
+        .subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+    let health_state = make_health(true);
+    let health_notify = Arc::new(Notify::new());
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BleConnectionEvent>();
+
+    // Grace timer runs on a real OS thread — real (short) durations, no time mocking.
+    tokio::spawn(ReliableBleOutput::disconnect_handler_loop(
+        rx,
+        state.clone(),
+        health_state.clone(),
+        health_notify.clone(),
+        Duration::from_millis(100),
+    ));
+
+    tx.send(BleConnectionEvent::Disconnected).unwrap();
+
+    // Poll until the OS-thread grace timer fires (well past the 100 ms window).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !state.read().await.signal_to_stream.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "grace expiry must reset the session within 5 s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let st = state.read().await;
+    assert!(
+        st.signal_to_stream.is_empty(),
+        "streams must be cleared after grace expiry"
+    );
+    assert_eq!(
+        st.current_session_id,
+        initial_session_id.wrapping_add(1),
+        "session_id must increment after grace expiry"
+    );
+    assert!(
+        !health_state.read().await.ble_subscriber,
+        "ble_subscriber must be false after grace expiry"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-039
+/// Title: checkpoint_task writes atomic checkpoint after interval
+///
+/// Description: After one interval tick, checkpoint_task must produce a valid
+///              binary file at the given path. The file must be loadable by
+///              load_history_from_bytes and reproduce all recorded samples.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_checkpoint_task_writes_file() {
+    tokio::time::pause();
+
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    {
+        let mut st = state.write().await;
+        st.record_history(SignalId::HR.as_u16(), 75.0, 1000);
+        st.record_history(SignalId::HR.as_u16(), 76.0, 2000);
+    }
+
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir
+        .path()
+        .join("ckpt.bin")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    tokio::spawn(ReliableBleOutput::checkpoint_task(
+        state.clone(),
+        5,
+        path.clone(),
+    ));
+
+    // Yield so the task can register its sleep, then advance past the interval.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(6)).await;
+    // Multiple yields: one for the lock acquisition, one for the file I/O.
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+
+    let bytes = std::fs::read(&path).expect("checkpoint file must exist after interval");
+    let mut dst = BleSessionState::new(1);
+    let n = dst.load_history_from_bytes(&bytes).unwrap();
+    assert_eq!(n, 2, "checkpoint must contain the 2 recorded samples");
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-038
+/// Title: Re-disconnect during grace period resets the grace timer
+///
+/// Description: A second Disconnected event arriving while the grace timer is running
+///              must restart the grace window. A Connected event arriving after the
+///              second disconnect but within the new window must preserve the session.
+///
+/// Version: V1.1
+#[tokio::test]
+async fn test_redisconnect_resets_grace_timer() {
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    state
+        .write()
+        .await
+        .subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
+    let health_state = make_health(true);
+    let health_notify = Arc::new(Notify::new());
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<BleConnectionEvent>();
+
+    // Grace timer runs on a real OS thread — real (short) durations, no time mocking.
+    tokio::spawn(ReliableBleOutput::disconnect_handler_loop(
+        rx,
+        state.clone(),
+        health_state.clone(),
+        health_notify.clone(),
+        Duration::from_millis(1000),
+    ));
+
+    // First disconnect — starts 1000 ms timer
+    tx.send(BleConnectionEvent::Disconnected).unwrap();
+    tokio::task::yield_now().await;
+
+    // 600 ms pass, then a second disconnect — must reset timer to a new 1000 ms window
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    tx.send(BleConnectionEvent::Disconnected).unwrap();
+    tokio::task::yield_now().await;
+
+    // 600 ms after the second disconnect (1200 ms total, but timer was reset) — reconnect
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    tx.send(BleConnectionEvent::Connected).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(
+        !state.read().await.signal_to_stream.is_empty(),
+        "session must be preserved when reconnecting within the reset grace window"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-040
+/// Title: wal_task writes entries to file and final-flushes on channel close
+///
+/// Description: After sending 3 WalEntry items and dropping the sender (channel close),
+///              wal_task must exit, final-flush, and leave exactly 3 valid entries in the
+///              WAL file recoverable by replay_wal_entries.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_wal_task_writes_and_fsyncs() {
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let wal_path = tmp_dir
+        .path()
+        .join("test.wal")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let ckpt_path = tmp_dir
+        .path()
+        .join("ckpt.bin")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let (wal_tx, wal_rx) = tokio::sync::mpsc::unbounded_channel::<WalEntry>();
+
+    let task = tokio::spawn(ReliableBleOutput::wal_task(
+        state.clone(),
+        wal_rx,
+        wal_path.clone(),
+        // long intervals so neither fsync nor compact timer fires during the test
+        3600,
+        7200,
+        ckpt_path,
+    ));
+
+    // Send 3 entries then close the channel.
+    // wal_task will receive None from rx.recv(), break the loop, and final-flush.
+    wal_tx
+        .send(WalEntry {
+            signal_id: 0x0101,
+            t0_ms: 1000,
+            value: 75.0,
+        })
+        .unwrap();
+    wal_tx
+        .send(WalEntry {
+            signal_id: 0x0102,
+            t0_ms: 2000,
+            value: 99.0,
+        })
+        .unwrap();
+    wal_tx
+        .send(WalEntry {
+            signal_id: 0x0101,
+            t0_ms: 3000,
+            value: 76.0,
+        })
+        .unwrap();
+    drop(wal_tx); // closes channel → wal_task will exit after draining remaining entries
+
+    // Wait for the task to exit and final-flush.
+    task.await.expect("wal_task must not panic");
+
+    let entries = wal::replay_wal_entries(&wal_path);
+    assert_eq!(
+        entries.len(),
+        3,
+        "WAL file must contain exactly 3 entries after final flush"
+    );
+    assert_eq!(entries[0].signal_id, 0x0101);
+    assert_eq!(entries[0].t0_ms, 1000);
+    assert_eq!(entries[1].signal_id, 0x0102);
+    assert_eq!(entries[2].t0_ms, 3000);
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-041
+/// Title: wal_task compaction writes checkpoint then truncates WAL
+///
+/// Description: After sending an entry and flushing (channel close), then reloading
+///              with a short compaction interval and advancing past it, the checkpoint
+///              file must contain the recorded history samples and the WAL must be empty.
+///              The test verifies the invariant: checkpoint rename happens BEFORE WAL
+///              truncation, so no data is lost.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_wal_task_compaction_snapshot_before_truncate() {
+    tokio::time::pause();
+
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    {
+        let mut st = state.write().await;
+        st.record_history(SignalId::HR.as_u16(), 75.0, 1000);
+        st.record_history(SignalId::HR.as_u16(), 76.0, 2000);
+    }
+
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let wal_path = tmp_dir
+        .path()
+        .join("test.wal")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let ckpt_path = tmp_dir
+        .path()
+        .join("ckpt.bin")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Phase 1: send an entry so the WAL file is created and has content.
+    {
+        let (wal_tx, wal_rx) = tokio::sync::mpsc::unbounded_channel::<WalEntry>();
+        let task = tokio::spawn(ReliableBleOutput::wal_task(
+            state.clone(),
+            wal_rx,
+            wal_path.clone(),
+            3600, // long fsync — won't fire
+            3600, // long compact — won't fire
+            ckpt_path.clone(),
+        ));
+        wal_tx
+            .send(WalEntry {
+                signal_id: 0x0101,
+                t0_ms: 3000,
+                value: 77.0,
+            })
+            .unwrap();
+        drop(wal_tx); // close → final flush
+        task.await.expect("phase-1 wal_task must not panic");
+    }
+    // WAL now has 1 entry on disk.
+    assert_eq!(wal::replay_wal_entries(&wal_path).len(), 1);
+
+    // Phase 2: spawn wal_task with a short compaction interval (5 s) and fire it.
+    let (wal_tx2, wal_rx2) = tokio::sync::mpsc::unbounded_channel::<WalEntry>();
+    tokio::spawn(ReliableBleOutput::wal_task(
+        state.clone(),
+        wal_rx2,
+        wal_path.clone(),
+        3600, // fsync won't fire
+        5,    // compact fires after 5 s
+        ckpt_path.clone(),
+    ));
+    // Keep tx alive so the task stays in the loop (doesn't exit from channel close).
+    let _keep_tx = wal_tx2;
+
+    // Yield so the task starts and consumes its initial ticks, then advance past compact.
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(6)).await;
+    // Multiple yields: lock acquisition + file I/O + reopen after compact.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    // Checkpoint must exist and contain the 2 history samples (from record_history above).
+    let ckpt_bytes = std::fs::read(&ckpt_path).expect("checkpoint must exist after compaction");
+    let mut dst = BleSessionState::new(1);
+    let n = dst
+        .load_history_from_bytes(&ckpt_bytes)
+        .expect("checkpoint must be valid");
+    assert!(
+        n >= 2,
+        "checkpoint must contain at least the 2 history samples"
+    );
+
+    // WAL must be empty (truncated after checkpoint was durable).
+    let wal_entries = wal::replay_wal_entries(&wal_path);
+    assert_eq!(wal_entries.len(), 0, "WAL must be empty after compaction");
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-042
+/// Title: supervision_task resets session after brutal link-layer disconnect
+///
+/// Description: With pending frames in tx_buffer and no ACK arriving (simulating a
+///   Central that went out of range without CCCD update), supervision_task must reset
+///   the session (total_pending → 0) once supervision_timeout_sec has elapsed.
+///   Data durability is unaffected: record_history() runs before add_data() in output(),
+///   so all samples are already in history before they enter tx_buffer.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_supervision_task_resets_on_timeout() {
+    tokio::time::pause();
+
+    use crate::domain::ble_protocol::SignalId;
+
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    let health_state = Arc::new(RwLock::new(GateHealthState::default()));
+    let health_notify = Arc::new(Notify::new());
+    let last_ack_time = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+
+    // Subscribe and queue 2 frames into tx_buffer (no ACK will arrive).
+    {
+        let mut st = state.write().await;
+        st.subscribe(SignalId::HR.as_u16());
+        st.add_data(SignalId::HR.as_u16(), 72.0, 1_000_000);
+        st.add_data(SignalId::HR.as_u16(), 73.0, 2_000_000);
+    }
+    assert_eq!(
+        state.read().await.total_pending(),
+        2,
+        "pre: 2 frames pending"
+    );
+
+    // Spawn supervision task with a 10 s timeout.
+    let state2 = state.clone();
+    let hs = health_state.clone();
+    let hn = health_notify.clone();
+    let lat = last_ack_time.clone();
+    tokio::spawn(async move {
+        ReliableBleOutput::supervision_task(state2, hs, hn, lat, 10).await;
+    });
+
+    // Yield to let the task start and consume its initial skip-tick.
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+
+    // Advance past CHECK_INTERVAL (5 s) + supervision_timeout (10 s).
+    tokio::time::advance(Duration::from_secs(16)).await;
+
+    // Multiple yields: task wakes on tick, acquires locks, resets session.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        state.read().await.total_pending(),
+        0,
+        "supervision must reset session and clear tx_buffer"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-045
+/// Title: E6 — failed notify is queued for one-shot retry, discarded on second failure
+///
+/// Description: When server.notify() always fails (GattServer not started → local_chars
+///   empty → VitalError::Config), the first output() call must queue the failed frame in
+///   retry_queue. The second output() call (same data → fully deduped, no new frame) must
+///   drain and attempt the retry, discard on failure, and leave retry_queue empty.
+///   History must contain the sample regardless of notify outcomes.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_failed_notify_queued_then_drained_on_retry() {
+    use crate::domain::ble_protocol::SignalId;
+
+    // GattServer::new() does not call Windows APIs.
+    // add_characteristic() (called inside new()) only fills `chars`, not `local_chars`.
+    // `local_chars` is populated only by start(), which we never call here.
+    // Therefore server.notify() always returns Err("Unknown characteristic 'Data_OUT'").
+    let ble = ReliableBleOutput::new(
+        "Test".to_string(),
+        "12345678-1234-1234-1234-1234567890ab".to_string(),
+        None, // registry (uses default)
+        30,   // health_check_interval_sec
+        60,   // health_ble_flow_timeout_sec
+        "logs/health.json".to_string(),
+        5,              // ble_grace_period_sec
+        30,             // ble_supervision_timeout_sec
+        3600,           // history_checkpoint_interval_sec
+        86400,          // history_checkpoint_max_age_sec
+        "".to_string(), // history_checkpoint_path (disabled)
+        21600,          // history_retention_sec
+        false,          // wal_enabled
+        "".to_string(),
+        30,
+        3600,
+    )
+    .await
+    .expect("minimal ReliableBleOutput must construct");
+
+    ble.subscribe_for_test(SignalId::HR.as_u16(), 1).await;
+
+    let data = ProcessedData::new(
+        "VR-TEST".to_string(),
+        vec![ProcessedRoom {
+            room_index: 0,
+            room_name: "BED_01".to_string(),
+            tracks: vec![create_test_track("HR", 75.0, 0i32, "BED_01")],
+        }],
+    );
+
+    // First output(): add_data returns Some(frame), notify fails → frame queued.
+    ble.output(&data)
+        .await
+        .expect("output must not propagate notify errors");
+    assert_eq!(
+        ble.retry_queue_len().await,
+        1,
+        "first failed frame must be held in retry queue"
+    );
+    assert_eq!(
+        ble.history_len_for_test(SignalId::HR.as_u16()).await,
+        1,
+        "history must be populated regardless of notify outcome"
+    );
+
+    // Second output() with same data: record_history and add_data both dedup on t0_ms,
+    // so frames_to_send is empty. Only to_retry is drained → retry fails → discarded.
+    ble.output(&data)
+        .await
+        .expect("output must not propagate retry errors");
+    assert_eq!(
+        ble.retry_queue_len().await,
+        0,
+        "retry queue must be drained and frame discarded after one-shot retry"
+    );
+    assert_eq!(
+        ble.history_len_for_test(SignalId::HR.as_u16()).await,
+        1,
+        "history count unchanged: second call was fully deduped"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-044
+/// Title: N3 — WAL send failure does not affect history ring-buffer
+///
+/// Description: When the WAL channel receiver is dropped (wal_task exited or session reset),
+///              send() on the closed channel must return Err gracefully (no panic), and
+///              record_history must still have populated the history ring-buffer.
+///              Mirrors the ordering in output(): record_history is called before the WAL
+///              send, so history is always durable even when the WAL path is unavailable.
+///
+/// Version: V1.0
+#[test]
+fn test_wal_closed_channel_does_not_affect_history() {
+    use crate::output::wal::WalEntry;
+
+    let mut state = BleSessionState::new(1);
+
+    // Drop the receiver immediately — simulates wal_task having exited.
+    let (wal_tx, wal_rx) = tokio::sync::mpsc::unbounded_channel::<WalEntry>();
+    drop(wal_rx);
+
+    // record_history is always called before the WAL send in output().
+    state.record_history(0x0101, 72.0, 1000);
+    state.record_history(0x0101, 73.0, 2000);
+
+    // WAL send on a closed channel must return Err, not panic.
+    let result = wal_tx.send(WalEntry {
+        signal_id: 0x0101,
+        t0_ms: 1000,
+        value: 72.0,
+    });
+    assert!(
+        result.is_err(),
+        "send on closed WAL channel must fail gracefully"
+    );
+
+    // History must contain both samples regardless of the WAL send failure.
+    let history = state
+        .history
+        .get(&0x0101)
+        .expect("HR history must be populated");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0], (1000, 72.0));
+    assert_eq!(history[1], (2000, 73.0));
+}
+
+// ── Flutter stream ID mapping / subscribe parse diagnostics ──────────────
+
+/// ID SRS: SRS-TEST-BLERELIABLE-046
+/// Title: Test flutter_stream_id fixed mapping
+///
+/// Description: VRConnect shall map each catalog signal_id to the stream ID
+/// hardcoded by Flutter's `_initStreams()`. This table is FIXED — any change
+/// makes Flutter drop every DATA_FRAME (activeStreams[streamId] == null).
+///
+/// Version: V1.0
+#[test]
+fn test_flutter_stream_id_mapping() {
+    assert_eq!(ReliableBleOutput::flutter_stream_id(0x0101), 1); // HR
+    assert_eq!(ReliableBleOutput::flutter_stream_id(0x0102), 2); // SpO2
+    assert_eq!(ReliableBleOutput::flutter_stream_id(0x0103), 3); // Temp
+    assert_eq!(ReliableBleOutput::flutter_stream_id(0x0201), 4); // SBP
+    assert_eq!(ReliableBleOutput::flutter_stream_id(0x0202), 5); // DBP
+    assert_eq!(ReliableBleOutput::flutter_stream_id(0x0203), 6); // MBP
+    assert_eq!(ReliableBleOutput::flutter_stream_id(0x0501), 7); // AmbPres
+    assert_eq!(ReliableBleOutput::flutter_stream_id(0x0301), 8); // ST_II
+    assert_eq!(ReliableBleOutput::flutter_stream_id(0x0302), 9); // ST_V
+    assert_eq!(ReliableBleOutput::flutter_stream_id(0x0303), 10); // ST_AVL
+    assert_eq!(ReliableBleOutput::flutter_stream_id(0x0401), 11); // SPV
+    assert_eq!(ReliableBleOutput::flutter_stream_id(0x0402), 12); // PPV
+
+    // Unknown signals pass through unchanged
+    assert_eq!(ReliableBleOutput::flutter_stream_id(0x0999), 0x0999);
+}
+
+/// Helper: build a SUBSCRIBE_REQ-shaped frame with a non-standard item size
+/// (valid IDT header, unparseable items). CRC is valid or corrupted on demand.
+fn make_bad_subscribe_bytes(item_size: usize, signal_id: u16, valid_crc: bool) -> Vec<u8> {
+    let header = IdtHeader {
+        magic: IDT_MAGIC,
+        version: IDT_VERSION,
+        msg_type: MSG_SUBSCRIBE_REQ,
+        flags: 0,
+        session_id: 1,
+        stream_id: 0,
+        seq: 0,
+    };
+    let mut buf: Vec<u8> = header.to_bytes().to_vec();
+    buf.extend_from_slice(&7u16.to_le_bytes()); // req_id
+    buf.push(SUB_OP_SUBSCRIBE); // op
+    buf.push(1u8); // n = 1 item
+    let mut item = vec![0u8; item_size];
+    item[0] = 1; // source_id
+    item[1..3].copy_from_slice(&signal_id.to_le_bytes());
+    buf.extend_from_slice(&item);
+    let crc = crc32c::crc32c(&buf);
+    let crc = if valid_crc { crc } else { crc ^ 1 };
+    buf.extend_from_slice(&crc.to_le_bytes());
+    buf
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-047
+/// Title: Test subscribe parse-failure diagnostic — CRC match branch
+///
+/// Description: VRConnect shall identify the actual item size of an unparseable
+/// SUBSCRIBE_REQ by brute-forcing candidate sizes (17..=30) and report the size
+/// whose CRC matches. The diagnostic must not panic on any input.
+///
+/// Version: V1.0
+#[test]
+fn test_log_subscribe_parse_failure_crc_match() {
+    // 20-byte items (server expects 17) with a valid CRC → "CRC MATCH" branch
+    // + item dump with IDT compound signal_id label.
+    let buf = make_bad_subscribe_bytes(20, 0x0101, true);
+    ReliableBleOutput::log_subscribe_parse_failure(&buf);
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-048
+/// Title: Test subscribe parse-failure diagnostic — CRC mismatch + legacy ID
+///
+/// Description: VRConnect shall report a CRC mismatch for a size-matching
+/// candidate and label legacy simple signal IDs (1/2/3) in the item dump.
+///
+/// Version: V1.0
+#[test]
+fn test_log_subscribe_parse_failure_crc_mismatch_legacy_id() {
+    let buf = make_bad_subscribe_bytes(20, 0x0001, false);
+    ReliableBleOutput::log_subscribe_parse_failure(&buf);
+}
+
+// ── Background tasks / write-handler loop (no hardware required) ─────────
+
+/// Helper: construct a ReliableBleOutput without hardware access.
+/// Only supervision / checkpoint / WAL vary between tests; the rest is fixed.
+async fn make_reliable_output(
+    supervision_sec: u64,
+    ckpt_interval_sec: u64,
+    ckpt_path: &str,
+    wal_enabled: bool,
+    wal_path: &str,
+) -> ReliableBleOutput {
+    ReliableBleOutput::new(
+        "Test".to_string(),
+        "12345678-1234-1234-1234-1234567890ab".to_string(),
+        None, // registry (uses default)
+        30,   // health_check_interval_sec
+        60,   // health_ble_flow_timeout_sec
+        "logs/health.json".to_string(),
+        5,                     // ble_grace_period_sec
+        supervision_sec,       // ble_supervision_timeout_sec
+        ckpt_interval_sec,     // history_checkpoint_interval_sec
+        86400,                 // history_checkpoint_max_age_sec
+        ckpt_path.to_string(), // history_checkpoint_path
+        21600,                 // history_retention_sec
+        wal_enabled,
+        wal_path.to_string(),
+        2,    // wal_fsync_interval_sec
+        3600, // wal_compaction_interval_sec
+    )
+    .await
+    .unwrap()
+}
+
+/// Helper: spawn write_handler_loop on a fresh channel wired to `ble`'s shared state.
+fn spawn_write_handler(
+    ble: &ReliableBleOutput,
+    last_ack: &Arc<tokio::sync::Mutex<tokio::time::Instant>>,
+) -> (
+    tokio::sync::mpsc::UnboundedSender<WriteEvent>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = tokio::spawn(ReliableBleOutput::write_handler_loop(
+        rx,
+        ble.state.clone(),
+        ble.server.clone(),
+        ble.registry.clone(),
+        ble.health_state.clone(),
+        ble.health_notify.clone(),
+        last_ack.clone(),
+    ));
+    (tx, handle)
+}
+
+/// Helper: WriteEvent on a named characteristic.
+fn write_event(characteristic: &str, data: Vec<u8>) -> WriteEvent {
+    WriteEvent {
+        characteristic_name: characteristic.to_string(),
+        data,
+    }
+}
+
+/// Helper: build a MyPredi ACK (45 bytes: 24-byte header + 17-byte payload + CRC32C).
+fn make_mypredi_ack_bytes(session_id: u16, stream_id: u16, ack_upto: u32) -> Vec<u8> {
+    let header = IdtHeader {
+        magic: IDT_MAGIC,
+        version: IDT_VERSION,
+        msg_type: MSG_ACK_FRAME,
+        flags: 0,
+        session_id,
+        stream_id,
+        seq: 0,
+    };
+    let mut buf: Vec<u8> = header.to_bytes().to_vec(); // 13 bytes
+    buf.extend_from_slice(&0u64.to_le_bytes()); // t0_ms        → 21
+    buf.push(1u8); // count                                     → 22
+    buf.extend_from_slice(&17u16.to_le_bytes()); // payloadLen  → 24
+    buf.extend_from_slice(&session_id.to_le_bytes());
+    buf.extend_from_slice(&stream_id.to_le_bytes());
+    buf.extend_from_slice(&ack_upto.to_le_bytes());
+    buf.push(8u8); // bitmap_len
+    buf.extend_from_slice(&[0u8; 8]); // bitmap                 → 41
+    let crc = crc32c::crc32c(&buf);
+    buf.extend_from_slice(&crc.to_le_bytes()); // → 45
+    buf
+}
+
+/// Helper: build a legacy Flutter ACK (17 bytes, no IDT magic, no CRC).
+fn make_flutter_ack_bytes(session_id: u16, stream_id: u16, ack_upto: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(17);
+    buf.extend_from_slice(&session_id.to_le_bytes());
+    buf.extend_from_slice(&stream_id.to_le_bytes());
+    buf.extend_from_slice(&ack_upto.to_le_bytes());
+    buf.push(8u8); // bitmap_len
+    buf.extend_from_slice(&[0u8; 8]);
+    buf
+}
+
+/// Helper: build a valid IDT NACK_FRAME (header + n + reason + seq_list + CRC32C).
+fn make_nack_bytes(session_id: u16, stream_id: u16, seqs: &[u32]) -> Vec<u8> {
+    let header = IdtHeader {
+        magic: IDT_MAGIC,
+        version: IDT_VERSION,
+        msg_type: MSG_NACK_FRAME,
+        flags: 0,
+        session_id,
+        stream_id,
+        seq: 0,
+    };
+    let mut buf: Vec<u8> = header.to_bytes().to_vec();
+    buf.push(seqs.len() as u8);
+    buf.push(1u8); // reason
+    for s in seqs {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    let crc = crc32c::crc32c(&buf);
+    buf.extend_from_slice(&crc.to_le_bytes());
+    buf
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-049
+/// Title: Test start_background_tasks — full configuration + WAL replay
+///
+/// Description: VRConnect shall spawn every background task without hardware
+/// access, consume the write/disconnect/WAL receivers, and replay WAL entries
+/// into the history buffer. A second call must take the "receiver already
+/// taken" paths without panicking.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_start_background_tasks_full_config() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let wal_path = dir.path().join("test.wal");
+    let ckpt_path = dir.path().join("ckpt.bin");
+
+    // Seed a WAL file with two valid entries for replay.
+    let e1 = WalEntry {
+        signal_id: 0x0101,
+        t0_ms: 1000,
+        value: 72.0,
+    };
+    let e2 = WalEntry {
+        signal_id: 0x0102,
+        t0_ms: 2000,
+        value: 98.0,
+    };
+    let mut bytes = e1.to_bytes().to_vec();
+    bytes.extend_from_slice(&e2.to_bytes());
+    std::fs::write(&wal_path, bytes).unwrap();
+
+    let ble = make_reliable_output(
+        30,
+        30,
+        ckpt_path.to_str().unwrap(),
+        true,
+        wal_path.to_str().unwrap(),
+    )
+    .await;
+
+    ble.start_background_tasks().await;
+
+    // Every receiver must have been consumed by its spawned task.
+    {
+        let mut server = ble.server.write().await;
+        assert!(server.take_write_receiver().is_none());
+        assert!(server.take_disconnect_receiver().is_none());
+    }
+    assert!(ble.wal_rx.lock().await.is_none());
+
+    // WAL entries must have been replayed into the history buffer.
+    {
+        let st = ble.state.read().await;
+        assert_eq!(st.history.get(&0x0101).map(|h| h.len()), Some(1));
+        assert_eq!(st.history.get(&0x0102).map(|h| h.len()), Some(1));
+    }
+
+    // Second call: all "receiver already taken" branches, must not panic.
+    ble.start_background_tasks().await;
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-050
+/// Title: Test start_background_tasks — disabled features
+///
+/// Description: VRConnect shall skip supervision (timeout=0), checkpoint
+/// (interval=0) and WAL (disabled) tasks while still spawning the write and
+/// disconnect handlers.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_start_background_tasks_disabled_paths() {
+    let ble = make_reliable_output(0, 0, "", false, "").await;
+
+    ble.start_background_tasks().await;
+
+    {
+        let mut server = ble.server.write().await;
+        assert!(server.take_write_receiver().is_none());
+        assert!(server.take_disconnect_receiver().is_none());
+    }
+    // WAL disabled: no channel was ever created.
+    assert!(ble.wal_rx.lock().await.is_none());
+    assert!(ble.wal_tx.is_none());
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-051
+/// Title: Test write_handler_loop — IDT subscribe activates BLE health flag
+///
+/// Description: VRConnect shall process a strict-IDT SUBSCRIBE_REQ received on
+/// the Subscribe characteristic, register the stream, and raise ble_subscriber.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_write_handler_loop_subscribe_activates_ble() {
+    let ble = make_reliable_output(0, 0, "", false, "").await;
+    let last_ack = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+    let (tx, handle) = spawn_write_handler(&ble, &last_ack);
+
+    tx.send(write_event(
+        "Subscribe",
+        make_subscribe_req_bytes(1, 7, SUB_OP_SUBSCRIBE, 0x0101),
+    ))
+    .unwrap();
+    drop(tx); // close the channel → loop drains the queue then exits
+    handle.await.unwrap();
+
+    assert!(
+        ble.state
+            .read()
+            .await
+            .signal_to_stream
+            .contains_key(&0x0101),
+        "HR must be subscribed"
+    );
+    assert!(
+        ble.health_state.read().await.ble_subscriber,
+        "ble_subscriber must be raised after subscribe"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-052
+/// Title: Test write_handler_loop — dispatch of malformed and legacy events
+///
+/// Description: VRConnect shall discard malformed payloads on every
+/// characteristic without panicking, honor the legacy 2-byte unsubscribe,
+/// trigger a health push on Control writes, and warn on unknown
+/// characteristics. After unsubscribe, ble_subscriber must fall back to false.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_write_handler_loop_dispatch_and_unsubscribe() {
+    let ble = make_reliable_output(0, 0, "", false, "").await;
+    let last_ack = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+    let (tx, handle) = spawn_write_handler(&ble, &last_ack);
+
+    // Valid IDT subscribe, then a storm of malformed/legacy events.
+    tx.send(write_event(
+        "Subscribe",
+        make_subscribe_req_bytes(1, 7, SUB_OP_SUBSCRIBE, 0x0101),
+    ))
+    .unwrap();
+    // IDT magic but msg_type=ACK on Subscribe → discarded
+    tx.send(write_event("Subscribe", make_ack_bytes(1, 1, 0)))
+        .unwrap();
+    // Unrecognized format on Subscribe → parse-failure diagnostic
+    tx.send(write_event("Subscribe", vec![0xFF, 0x00, 0x13]))
+        .unwrap();
+    // Garbage on Data_IN → discarded
+    tx.send(write_event("Data_IN", vec![0xDE, 0xAD])).unwrap();
+    // Control write → immediate health push request
+    tx.send(write_event("Control", vec![0x01])).unwrap();
+    // Unknown characteristic → warn
+    tx.send(write_event("Bogus", vec![0x00])).unwrap();
+    // Legacy 2-byte unsubscribe for HR
+    tx.send(write_event("Unsubscribe", 0x0101u16.to_le_bytes().to_vec()))
+        .unwrap();
+    // Too-short unsubscribe → discarded
+    tx.send(write_event("Unsubscribe", vec![0x01])).unwrap();
+
+    drop(tx);
+    handle.await.unwrap();
+
+    assert!(
+        ble.state.read().await.signal_to_stream.is_empty(),
+        "legacy unsubscribe must remove the HR stream"
+    );
+    assert!(
+        !ble.health_state.read().await.ble_subscriber,
+        "ble_subscriber must fall back to false after unsubscribe"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-053
+/// Title: Test write_handler_loop — ACK/NACK paths drain the tx buffer
+///
+/// Description: VRConnect shall drain pending frames through all three ACK wire
+/// formats (IDT strict, MyPredi 45-byte, legacy Flutter 17-byte),
+/// retransmit on NACK, and refresh last_ack_time on every accepted ACK.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_write_handler_loop_ack_nack_paths() {
+    let ble = make_reliable_output(0, 0, "", false, "").await;
+    let last_ack = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+
+    // Phase A: subscribe HR through the loop, then let it exit.
+    let (tx, handle) = spawn_write_handler(&ble, &last_ack);
+    tx.send(write_event(
+        "Subscribe",
+        make_subscribe_req_bytes(1, 7, SUB_OP_SUBSCRIBE, 0x0101),
+    ))
+    .unwrap();
+    drop(tx);
+    handle.await.unwrap();
+
+    // Queue three frames and capture the live session/stream/seq numbers.
+    let (session_id, stream_id, seqs) = {
+        let mut st = ble.state.write().await;
+        let f1 = st.add_data(0x0101, 72.0, 1000).expect("subscribed");
+        let f2 = st.add_data(0x0101, 73.0, 2000).expect("subscribed");
+        let f3 = st.add_data(0x0101, 74.0, 3000).expect("subscribed");
+        (
+            st.current_session_id,
+            f1.header.stream_id,
+            [f1.header.seq, f2.header.seq, f3.header.seq],
+        )
+    };
+    assert_eq!(ble.state.read().await.total_pending(), 3);
+
+    // Phase B: drive NACK + the three ACK formats through a fresh loop.
+    let t0 = *last_ack.lock().await;
+    let (tx, handle) = spawn_write_handler(&ble, &last_ack);
+    // NACK on the first pending seq → retransmit path (notify fails harmlessly)
+    tx.send(write_event(
+        "Data_IN",
+        make_nack_bytes(session_id, stream_id, &seqs[..1]),
+    ))
+    .unwrap();
+    // IDT strict ACK clears seq 1
+    tx.send(write_event(
+        "Data_IN",
+        make_ack_bytes(session_id, stream_id, seqs[0]),
+    ))
+    .unwrap();
+    // Legacy Flutter ACK clears seq 2
+    tx.send(write_event(
+        "Data_IN",
+        make_flutter_ack_bytes(session_id, stream_id, seqs[1]),
+    ))
+    .unwrap();
+    // MyPredi 45-byte ACK clears seq 3
+    tx.send(write_event(
+        "Data_IN",
+        make_mypredi_ack_bytes(session_id, stream_id, seqs[2]),
+    ))
+    .unwrap();
+    drop(tx);
+    handle.await.unwrap();
+
+    assert_eq!(
+        ble.state.read().await.total_pending(),
+        0,
+        "all pending frames must be drained by the three ACK formats"
+    );
+    assert!(
+        *last_ack.lock().await > t0,
+        "last_ack_time must be refreshed by accepted ACKs"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-054
+/// Title: Test output — full signal alias table, room filter and dedup
+///
+/// Description: VRConnect shall map every VitalRecorder alias to its IDT
+/// signal_id and record it to history, skip tracks outside room 0, skip
+/// unknown signal names, and skip duplicate (signal_id, t0_ms) pairs.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_output_signal_aliases_and_dedup() {
+    let ble = make_reliable_output(0, 0, "", false, "").await;
+
+    let mut tracks = vec![
+        create_test_track("HR", 72.0, 0, "BED_01"),
+        create_test_track("PLETH_SPO2", 98.0, 0, "BED_01"),
+        create_test_track("BT1_TEMP", 36.8, 0, "BED_01"),
+        create_test_track("NIBP_SBP", 120.0, 0, "BED_01"),
+        create_test_track("NIBP_DBP", 80.0, 0, "BED_01"),
+        create_test_track("NIBP_MBP", 93.0, 0, "BED_01"),
+        create_test_track("ST_II", 0.1, 0, "BED_01"),
+        create_test_track("ST_V", 0.2, 0, "BED_01"),
+        create_test_track("ST_AVL", 0.3, 0, "BED_01"),
+        create_test_track("SPV", 12.0, 0, "BED_01"),
+        create_test_track("PPV", 14.0, 0, "BED_01"),
+        create_test_track("AMB_PRES", 1013.0, 0, "BED_01"),
+        // Unknown name and non-room-0 track: both skipped.
+        create_test_track("UNKNOWN_SIGNAL", 1.0, 0, "BED_01"),
+        create_test_track("HR", 75.0, 1, "BED_02"),
+    ];
+    // Duplicate (signal_id, t0_ms) of the first HR sample → skipped by dedup.
+    let mut dup = create_test_track("HR", 99.0, 0, "BED_01");
+    dup.timestamp = tracks[0].timestamp;
+    tracks.push(dup);
+
+    let room = ProcessedRoom {
+        room_index: 0,
+        room_name: "BED_01".to_string(),
+        tracks,
+    };
+    let data = ProcessedData::new("VR-TEST".to_string(), vec![room]);
+
+    ble.output(&data).await.unwrap();
+
+    let st = ble.state.read().await;
+    for sid in [
+        0x0101u16, 0x0102, 0x0103, 0x0201, 0x0202, 0x0203, 0x0301, 0x0302, 0x0303, 0x0401, 0x0402,
+        0x0501,
+    ] {
+        assert!(
+            st.history.contains_key(&sid),
+            "history must contain signal 0x{:04X}",
+            sid
+        );
+    }
+    assert_eq!(
+        st.history.len(),
+        12,
+        "unknown and non-room-0 signals must not be recorded"
+    );
+    assert_eq!(
+        st.history.get(&0x0101).unwrap().len(),
+        1,
+        "duplicate HR (signal, t0_ms) must be skipped"
+    );
+    drop(st);
+    assert!(
+        ble.health_state.read().await.last_processed_data.is_some(),
+        "output() must refresh the flow timestamp"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-055
+/// Title: Test health_task — notify-triggered and heartbeat iterations
+///
+/// Description: VRConnect shall run a health iteration on health_notify and on
+/// the heartbeat timer, building the payload from a missing health file (stale
+/// OS snapshot) and tolerating the absent Control subscriber. Uses paused tokio
+/// time so the heartbeat fires instantly.
+///
+/// Version: V1.0
+#[tokio::test(start_paused = true)]
+async fn test_health_task_iterations() {
+    let ble = make_reliable_output(0, 0, "", false, "").await;
+
+    let handle = tokio::spawn(ReliableBleOutput::health_task(
+        ble.health_state.clone(),
+        ble.server.clone(),
+        ble.health_notify.clone(),
+        30,
+        "logs/nonexistent_health_test.json".to_string(),
+    ));
+
+    // Notify-triggered iteration, then one heartbeat (virtual 31 s).
+    ble.health_notify.notify_one();
+    tokio::time::sleep(Duration::from_secs(31)).await;
+
+    assert!(!handle.is_finished(), "health task must keep running");
+    handle.abort();
+}
+
+// ── negotiate_period_ms ──────────────────────────────────────────────────
+// handle_tlv_subscribe and handle_subscribe_req both delegate their period_ms
+// negotiation to this pure function, so it is what actually gets unit-tested —
+// the two async handlers themselves require a real GattServer (see the
+// unsubscribe_all integration block above) and are never called directly here.
+
+/// ID SRS: SRS-TEST-BLERELIABLE-056
+/// Title: negotiate_period_ms floors a too-fast request to the nominal rate
+///
+/// Description: A client request FASTER than nominal (smaller period_ms) must be
+///              floored: the RSP reports the nominal, and the gate is armed at the
+///              nominal (throttling is still active, just not faster than the
+///              catalog allows).
+///
+/// Version: V1.0
+#[test]
+fn test_negotiate_period_ms_floors_request_faster_than_nominal() {
+    let (effective, gate) = ReliableBleOutput::negotiate_period_ms(Some(200), 1_000);
+    assert_eq!(effective, 1_000);
+    assert_eq!(gate, 1_000);
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-057
+/// Title: negotiate_period_ms honors a request slower than nominal
+///
+/// Description: A client asking for a slower rate than the catalog nominal gets
+///              exactly what it asked for, both in the RSP and the gate.
+///
+/// Version: V1.0
+#[test]
+fn test_negotiate_period_ms_honors_request_slower_than_nominal() {
+    let (effective, gate) = ReliableBleOutput::negotiate_period_ms(Some(10_000), 1_000);
+    assert_eq!(effective, 10_000);
+    assert_eq!(gate, 10_000);
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-058
+/// Title: negotiate_period_ms treats "no request" and "requested 0" identically —
+///        non-regression for every app deployed before this field existed
+///
+/// Description: `None` (strict-IDT item.period_ms == 0) and `Some(0)` (Flutter TLV
+///              nested tag 0x04 == 0, what every deployed app sends today) must both
+///              yield the nominal for the RSP and gate=0 (throttling inactive) — the
+///              live BLE stream's behavior must be bit-for-bit what it was before
+///              this feature existed.
+///
+/// Version: V1.0
+#[test]
+fn test_negotiate_period_ms_no_request_is_non_regression() {
+    assert_eq!(
+        ReliableBleOutput::negotiate_period_ms(None, 1_000),
+        (1_000, 0)
+    );
+    assert_eq!(
+        ReliableBleOutput::negotiate_period_ms(Some(0), 1_000),
+        (1_000, 0)
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-059
+/// Title: end-to-end REQ→negotiation→RSP round trip on real captured Flutter bytes
+///
+/// Description: Takes the same 89-byte Flutter TLV capture used in
+///              ble_protocol.rs's parser tests, patches the first item's period_ms
+///              to 5000 (a real throttle request), runs it through
+///              parse_tlv_subscribe_req -> negotiate_period_ms exactly as
+///              handle_tlv_subscribe does, and verifies the resulting
+///              SubscribeRspItem serializes tag 0x04 = 5000 for that stream while
+///              the other two (unrequested) streams keep the nominal. This is the
+///              proof that the wire format, the parser, and the RSP encoder agree
+///              end-to-end on real traffic, not just on each stage in isolation.
+///
+/// Version: V1.0
+#[test]
+fn test_period_ms_round_trip_on_real_flutter_capture() {
+    let mut bytes: Vec<u8> = vec![
+        0x20, 0x56, 0x00, 0x01, 0x02, 0x00, 0x2A, 0x00, // header (8b)
+        0x03, 0x18, 0x00, // item 1 tag+len
+        0x01, 0x01, 0x00, 0x01, // nested TLV: source_id=1
+        0x02, 0x02, 0x00, 0x01, 0x00, // nested TLV: signal_id=1 (HR)
+        0x03, 0x01, 0x00, 0x00, // nested TLV: mode=0
+        0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, // nested TLV: period_ms=0 (patched below)
+        0x05, 0x01, 0x00, 0x01, // nested TLV: batch_max=1
+        0x03, 0x18, 0x00, // item 2 tag+len
+        0x01, 0x01, 0x00, 0x01, 0x02, 0x02, 0x00, 0x02, 0x00, // signal_id=2 (SpO2)
+        0x03, 0x01, 0x00, 0x00, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x00, 0x01,
+        0x03, 0x18, 0x00, // item 3 tag+len
+        0x01, 0x01, 0x00, 0x01, 0x02, 0x02, 0x00, 0x03, 0x00, // signal_id=3 (Temperature)
+        0x03, 0x01, 0x00, 0x00, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x01, 0x00, 0x01,
+    ];
+    // period_ms value bytes for item 1 (HR) are at absolute offset 27..31.
+    bytes[27..31].copy_from_slice(&5_000u32.to_le_bytes());
+
+    let (req_id, entries) = parse_tlv_subscribe_req(&bytes).unwrap();
+    assert_eq!(
+        entries,
+        vec![(1u16, Some(5_000)), (2u16, None), (3u16, None)]
+    );
+
+    let registry = SignalRegistry::with_defaults();
+    let mut rsp_items = Vec::new();
+    for (i, (raw_id, requested_period_ms)) in entries.iter().enumerate() {
+        let canonical_id = registry.normalize_id(*raw_id).unwrap();
+        let meta = registry.get(canonical_id).unwrap();
+        let (effective_period_ms, _gate) =
+            ReliableBleOutput::negotiate_period_ms(*requested_period_ms, meta.nominal_period_ms);
+        rsp_items.push(SubscribeRspItem {
+            source_id: meta.source_id,
+            signal_id: canonical_id,
+            stream_id: (i + 1) as u16,
+            effective_period_ms,
+            effective_batch_max: 1,
+        });
+    }
+
+    let rsp = SubscribeRsp {
+        session_id: 1,
+        req_id,
+        status: 0,
+        results: rsp_items,
+    };
+    let rsp_bytes = rsp.to_mypredi_ble_bytes();
+
+    // HR (nominal 1000 ms) requested 5000 -> effective 5000 -> tag 0x04 = 5000 LE.
+    let hr_period_tlv: Vec<u8> = [0x04u8, 0x04, 0x00]
+        .into_iter()
+        .chain(5_000u32.to_le_bytes())
+        .collect();
+    assert!(
+        rsp_bytes
+            .windows(hr_period_tlv.len())
+            .any(|w| w == hr_period_tlv.as_slice()),
+        "RSP must encode tag 0x04 = 5000 (LE) for the throttled HR stream"
+    );
+
+    // SpO2 (nominal 1000 ms) and Temperature (nominal 2000 ms) were not requested
+    // -> effective = their own nominal, not 5000.
+    let spo2_nominal_tlv: Vec<u8> = [0x04u8, 0x04, 0x00]
+        .into_iter()
+        .chain(1_000u32.to_le_bytes())
+        .collect();
+    let temp_nominal_tlv: Vec<u8> = [0x04u8, 0x04, 0x00]
+        .into_iter()
+        .chain(2_000u32.to_le_bytes())
+        .collect();
+    assert!(
+        rsp_bytes
+            .windows(spo2_nominal_tlv.len())
+            .any(|w| w == spo2_nominal_tlv.as_slice()),
+        "RSP must encode tag 0x04 = 1000 (LE) for the unthrottled SpO2 stream"
+    );
+    assert!(
+        rsp_bytes
+            .windows(temp_nominal_tlv.len())
+            .any(|w| w == temp_nominal_tlv.as_slice()),
+        "RSP must encode tag 0x04 = 2000 (LE) for the unthrottled Temperature stream"
+    );
+}

@@ -248,9 +248,8 @@ pub fn read_os_snapshot(path: &Path, stale_threshold_sec: u64) -> OsHealthSnapsh
 /// read regardless of whether a line is emitted here. The fail-safe behaviour is
 /// deliberately untouched.
 ///
-/// Rationale: on the ~70 h soak of 2026-09-03/06 HealthWriter.ps1 died after its
-/// very first write and GATE emitted 8 156 identical warnings — one every 30 s —
-/// which buried the condition instead of surfacing it. Each suppressed occurrence
+/// Rationale: when HealthWriter.ps1 dies, an unthrottled warning every 30 s buries
+/// the condition instead of surfacing it. Each suppressed occurrence
 /// is counted and reported on the next emitted line, so nothing is lost.
 ///
 /// The escalation transition (WARN → ERROR) is intentionally exempt from the hourly
@@ -651,10 +650,6 @@ mod tests {
     /// Description: VRConnect shall log the first stale read immediately, suppress
     /// and count the repeats, then log again once `STALE_LOG_INTERVAL_SEC` has
     /// elapsed, reporting how many were suppressed.
-    ///
-    /// Regression guard for F13: HealthWriter.ps1 died on the very first cycle of the
-    /// ~70 h soak of 2026-09-03/06 and GATE emitted 8 156 identical warnings, one
-    /// every 30 s, burying the condition instead of surfacing it.
     ///
     /// `#[serial]`: drives the module-level rate-limiter statics.
     ///

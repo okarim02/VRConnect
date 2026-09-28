@@ -918,7 +918,7 @@ mod tests {
     ///
     /// Description: VRConnect shall initialise GateHealthState.flow_timeout_sec from
     /// health_ble_flow_timeout_sec (60 s), not from health_check_interval_sec (30 s).
-    /// Regression test for bug I-1: the two values are intentionally set to different
+    /// The two values are intentionally set to different
     /// numbers so a mix-up is detected at compile-test time.
     ///
     /// Version: V1.0
