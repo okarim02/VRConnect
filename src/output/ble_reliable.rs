@@ -69,6 +69,15 @@ pub struct ReliableBleOutput {
     /// within this window, GATE treats it as a brutal link-layer disconnect and resets the
     /// session. 0 = disabled (not recommended in production).
     ble_supervision_timeout_sec: u64,
+    /// Shared last-ACK timestamp — reset on ACK receipt, on successful subscribe, and in
+    /// output() on the tx_buffer idle→busy transition (state.total_pending() 0 → >0).
+    /// That last reset point matters for throttled streams (period_ms): without it,
+    /// elapsed-since-ACK is measured from the last real ACK (~period_ms ago), so
+    /// supervision_task can race the client's ACK and misfire a "brutal disconnect" reset
+    /// on a perfectly healthy, merely-throttled connection. Resetting only on idle→busy
+    /// (not on every send) keeps a truly dead, unthrottled link detectable: pending never
+    /// returns to 0 for it, so the clock never gets refreshed and supervision still fires.
+    last_ack_time: Arc<tokio::sync::Mutex<tokio::time::Instant>>,
     /// Interval in seconds between periodic history checkpoints. 0 = disabled.
     history_checkpoint_interval_sec: u64,
     /// Maximum age in seconds of a checkpoint file to be loaded at startup.
@@ -223,6 +232,7 @@ impl ReliableBleOutput {
             health_file,
             ble_grace_period_sec,
             ble_supervision_timeout_sec,
+            last_ack_time: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
             history_checkpoint_interval_sec,
             history_checkpoint_max_age_sec,
             history_checkpoint_path,
@@ -339,9 +349,9 @@ impl ReliableBleOutput {
             server.set_read_value("Catalog", catalog_bytes);
         }
 
-        // Shared last-ACK timestamp: write_handler_loop updates it on every ACK received;
+        // write_handler_loop updates self.last_ack_time on every ACK received;
         // supervision_task reads it to detect a frozen ACK channel (brutal link-layer drop).
-        let last_ack_time = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+        let last_ack_time = self.last_ack_time.clone();
 
         // 2. Spawn write-handler task
         let write_rx = {
@@ -1752,6 +1762,10 @@ impl ReliableBleOutput {
         let mut frames_to_send: Vec<(Vec<u8>, u16, u16, u32)> = Vec::new(); // (bytes, signal_id, stream_id, seq)
         {
             let mut state = self.state.write().await;
+            // Was tx_buffer empty before this batch? Used below to detect the idle→busy
+            // transition — the only point where last_ack_time needs a fresh window (see
+            // ReliableBleOutput::supervision_task and last_ack_time's doc comment).
+            let was_idle = state.total_pending() == 0;
             let mut seen: std::collections::HashSet<(u16, u64)> = std::collections::HashSet::new();
 
             for track in &data.all_tracks {
@@ -1842,6 +1856,14 @@ impl ReliableBleOutput {
                         frame.header.seq,
                     ));
                 }
+            }
+            // Idle→busy transition (still under the state lock, so supervision_task can
+            // never observe the new pending frames alongside a stale last_ack_time — it
+            // reads total_pending() then last_ack_time in that same order). A dead link
+            // never returns to pending==0, so this never re-arms for it; only a throttled
+            // stream coming back from an idle gap gets a fresh window.
+            if was_idle && state.total_pending() > 0 {
+                *self.last_ack_time.lock().await = tokio::time::Instant::now();
             }
         } // ← state.write() released here, before any BLE I/O
 

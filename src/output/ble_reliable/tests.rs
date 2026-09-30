@@ -1712,6 +1712,179 @@ async fn test_supervision_task_resets_on_timeout() {
     );
 }
 
+/// ID SRS: SRS-TEST-BLERELIABLE-060
+/// Title: output() refreshes last_ack_time on the idle→busy transition
+///
+/// Description: Drives the real ble.output() path (not a hand-rolled copy of its logic).
+///   After a long idle gap (tx_buffer empty, matching a throttled stream between releases),
+///   the next output() call that produces a pending frame must reset last_ack_time to "now"
+///   — otherwise supervision_task, waking up right after, sees a stale elapsed time and
+///   treats a healthy just-released connection as a brutal disconnect. Reproduces the
+///   2026-09-30 field bug ("Supervision timeout: 6 frame(s) pending, no ACK for 3601s"
+///   firing on a live link).
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_output_resets_last_ack_time_on_idle_to_busy() {
+    tokio::time::pause();
+    use crate::domain::ble_protocol::SignalId;
+
+    let ble = ReliableBleOutput::new(
+        "Test".to_string(),
+        "12345678-1234-1234-1234-1234567890ab".to_string(),
+        None,
+        30,
+        60,
+        "logs/health.json".to_string(),
+        5,
+        30, // ble_supervision_timeout_sec (irrelevant here, output() doesn't read it)
+        3600,
+        86400,
+        "".to_string(),
+        21600,
+        false,
+        "".to_string(),
+        30,
+        3600,
+    )
+    .await
+    .expect("minimal ReliableBleOutput must construct");
+
+    ble.subscribe_for_test(SignalId::HR.as_u16(), 1).await;
+    assert_eq!(
+        ble.state.read().await.total_pending(),
+        0,
+        "pre: idle, no pending frames"
+    );
+
+    // Long gap with tx_buffer empty — the throttle interval between two releases.
+    tokio::time::advance(Duration::from_secs(3601)).await;
+
+    // Throttle releases: real output() call produces the first frame since the gap.
+    let fixed_ts = chrono::DateTime::from_timestamp_millis(1_000_000).unwrap();
+    let data = ProcessedData::new(
+        "VR-TEST".to_string(),
+        vec![ProcessedRoom {
+            room_index: 0,
+            room_name: "BED_01".to_string(),
+            tracks: vec![ProcessedTrack {
+                name: "HR".to_string(),
+                display_value: "72.0".to_string(),
+                raw_value: Some(72.0),
+                unit: "bpm".to_string(),
+                timestamp: fixed_ts,
+                room_index: 0,
+                room_name: "BED_01".to_string(),
+                track_index: 0,
+                record_index: 0,
+                track_type: TrackType::Number,
+                waveform_stats: None,
+                waveform_points: None,
+            }],
+        }],
+    );
+    ble.output(&data).await.expect("output must not error");
+
+    assert_eq!(
+        ble.state.read().await.total_pending(),
+        1,
+        "idle→busy: the release must have produced a pending frame"
+    );
+    assert!(
+        ble.last_ack_time.lock().await.elapsed() < Duration::from_secs(1),
+        "last_ack_time must be reset to ~now on the idle→busy transition, not left stale \
+         from ~3601s ago"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-061
+/// Title: output() does NOT refresh last_ack_time on a busy→busy call (no ACK yet)
+///
+/// Description: Regression guard for a broken fix variant (v1) that reset last_ack_time on
+///   every send regardless of whether the Central had ACKed anything, which silently
+///   disabled brutal-disconnect detection for the normal unthrottled case (period_ms=0):
+///   since VitalRecorder output() runs roughly every second, tx_buffer is non-empty on
+///   almost every call, so the flawed reset fired constantly and supervision_task never
+///   saw elapsed >= supervision_timeout_sec. This test fails under v1 and passes under the
+///   idle→busy-only reset: a second output() call, while the first frame is still pending
+///   and unACKed, must leave last_ack_time untouched.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_output_does_not_reset_last_ack_time_when_already_busy() {
+    tokio::time::pause();
+    use crate::domain::ble_protocol::SignalId;
+
+    let ble = ReliableBleOutput::new(
+        "Test".to_string(),
+        "12345678-1234-1234-1234-1234567890ab".to_string(),
+        None,
+        30,
+        60,
+        "logs/health.json".to_string(),
+        5,
+        30,
+        3600,
+        86400,
+        "".to_string(),
+        21600,
+        false,
+        "".to_string(),
+        30,
+        3600,
+    )
+    .await
+    .expect("minimal ReliableBleOutput must construct");
+
+    ble.subscribe_for_test(SignalId::HR.as_u16(), 1).await;
+
+    let make_data = |t0_ms: i64| {
+        let ts = chrono::DateTime::from_timestamp_millis(t0_ms).unwrap();
+        ProcessedData::new(
+            "VR-TEST".to_string(),
+            vec![ProcessedRoom {
+                room_index: 0,
+                room_name: "BED_01".to_string(),
+                tracks: vec![ProcessedTrack {
+                    name: "HR".to_string(),
+                    display_value: "72.0".to_string(),
+                    raw_value: Some(72.0),
+                    unit: "bpm".to_string(),
+                    timestamp: ts,
+                    room_index: 0,
+                    room_name: "BED_01".to_string(),
+                    track_index: 0,
+                    record_index: 0,
+                    track_type: TrackType::Number,
+                    waveform_stats: None,
+                    waveform_points: None,
+                }],
+            }],
+        )
+    };
+
+    // First call: idle→busy, frame pending, clock reset (covered by the sibling test above).
+    ble.output(&make_data(1_000_000)).await.unwrap();
+    assert_eq!(ble.state.read().await.total_pending(), 1);
+
+    // Nothing ACKs it. 20s later, VitalRecorder produces a new sample for the same stream —
+    // busy→busy (pending was already >0 before this call), so no reset should happen.
+    tokio::time::advance(Duration::from_secs(20)).await;
+    ble.output(&make_data(2_000_000)).await.unwrap();
+
+    assert_eq!(
+        ble.state.read().await.total_pending(),
+        2,
+        "second sample must also be pending (still unACKed, busy→busy)"
+    );
+    assert!(
+        ble.last_ack_time.lock().await.elapsed() >= Duration::from_secs(20),
+        "last_ack_time must NOT be refreshed on a busy→busy call — only a real ACK or an \
+         idle→busy transition may reset it, otherwise a genuinely dead unthrottled link \
+         would never trip supervision (the v1 regression)"
+    );
+}
+
 /// ID SRS: SRS-TEST-BLERELIABLE-045
 /// Title: E6 — failed notify is queued for one-shot retry, discarded on second failure
 ///
