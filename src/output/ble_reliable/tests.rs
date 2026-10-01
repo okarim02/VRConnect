@@ -1649,16 +1649,53 @@ async fn test_wal_task_compaction_snapshot_before_truncate() {
     assert_eq!(wal_entries.len(), 0, "WAL must be empty after compaction");
 }
 
+/// Helper: an unstarted GattServer — notify() fails fast without touching Windows APIs.
+fn unstarted_server() -> Arc<RwLock<GattServer>> {
+    let uuid = uuid::Uuid::parse_str("12345678-1234-1234-1234-1234567890ab").unwrap();
+    Arc::new(RwLock::new(GattServer::new("Test".to_string(), uuid)))
+}
+
+/// Helper: advance paused virtual time 1 s at a time, yielding so background tasks run
+/// every tick they are due (instead of one burst at the end of a big advance).
+async fn advance_secs(secs: u64) {
+    for _ in 0..secs {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+/// Helper: spawn supervision_task (timeout 10 s) on `state`, return its last_ack_time.
+async fn spawn_supervision(
+    state: &Arc<RwLock<BleSessionState>>,
+) -> Arc<tokio::sync::Mutex<tokio::time::Instant>> {
+    let last_ack_time = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+    tokio::spawn(ReliableBleOutput::supervision_task(
+        state.clone(),
+        unstarted_server(),
+        Arc::new(RwLock::new(GateHealthState::default())),
+        Arc::new(Notify::new()),
+        last_ack_time.clone(),
+        10,
+    ));
+    for _ in 0..4 {
+        tokio::task::yield_now().await; // let it consume its initial skip-tick
+    }
+    last_ack_time
+}
+
 /// ID SRS: SRS-TEST-BLERELIABLE-042
 /// Title: supervision_task resets session after brutal link-layer disconnect
 ///
 /// Description: With pending frames in tx_buffer and no ACK arriving (simulating a
-///   Central that went out of range without CCCD update), supervision_task must reset
-///   the session (total_pending → 0) once supervision_timeout_sec has elapsed.
+///   Central that went out of range without CCCD update), supervision_task must first
+///   attempt a last-chance retransmit (session kept) at supervision_timeout_sec, then
+///   reset the session (total_pending → 0) after a second timeout with still no ACK.
 ///   Data durability is unaffected: record_history() runs before add_data() in output(),
 ///   so all samples are already in history before they enter tx_buffer.
 ///
-/// Version: V1.0
+/// Version: V2.0
 #[tokio::test]
 async fn test_supervision_task_resets_on_timeout() {
     tokio::time::pause();
@@ -1666,9 +1703,6 @@ async fn test_supervision_task_resets_on_timeout() {
     use crate::domain::ble_protocol::SignalId;
 
     let state = Arc::new(RwLock::new(BleSessionState::new(1)));
-    let health_state = Arc::new(RwLock::new(GateHealthState::default()));
-    let health_notify = Arc::new(Notify::new());
-    let last_ack_time = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
 
     // Subscribe and queue 2 frames into tx_buffer (no ACK will arrive).
     {
@@ -1683,33 +1717,219 @@ async fn test_supervision_task_resets_on_timeout() {
         "pre: 2 frames pending"
     );
 
-    // Spawn supervision task with a 10 s timeout.
-    let state2 = state.clone();
-    let hs = health_state.clone();
-    let hn = health_notify.clone();
-    let lat = last_ack_time.clone();
-    tokio::spawn(async move {
-        ReliableBleOutput::supervision_task(state2, hs, hn, lat, 10).await;
-    });
+    let _last_ack_time = spawn_supervision(&state).await;
 
-    // Yield to let the task start and consume its initial skip-tick.
-    for _ in 0..4 {
-        tokio::task::yield_now().await;
-    }
+    // First timeout (10 s, checked on 5 s ticks): retransmit stage, session kept.
+    advance_secs(12).await;
+    assert_eq!(
+        state.read().await.total_pending(),
+        2,
+        "first timeout must retransmit, not reset"
+    );
+    assert!(state.read().await.is_subscribed(SignalId::HR.as_u16()));
 
-    // Advance past CHECK_INTERVAL (5 s) + supervision_timeout (10 s).
-    tokio::time::advance(Duration::from_secs(16)).await;
-
-    // Multiple yields: task wakes on tick, acquires locks, resets session.
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
-
+    // Second timeout with still no ACK: link is dead → reset.
+    advance_secs(12).await;
     assert_eq!(
         state.read().await.total_pending(),
         0,
-        "supervision must reset session and clear tx_buffer"
+        "supervision must reset session and clear tx_buffer after the retransmit went unanswered"
     );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-062
+/// Title: an ACK after the last-chance retransmit disarms the reset
+///
+/// Description: Reproduces the 2026-09-30 21:42 / 2026-10-01 06:53 field failure shape:
+///   one frame on a long-period stream is never ACKed and no later frame can cumulatively
+///   ACK it. supervision_task must retransmit instead of resetting; when the Central then
+///   ACKs (last_ack_time moves), the escalation is disarmed — a later timeout must start
+///   over with another retransmit, never jump straight to a reset.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_supervision_ack_after_retransmit_disarms_reset() {
+    tokio::time::pause();
+    let hr = SignalId::HR.as_u16();
+    let spo2 = SignalId::SpO2.as_u16();
+
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    {
+        let mut st = state.write().await;
+        st.subscribe(hr);
+        st.subscribe(spo2);
+        st.add_data(hr, 72.0, 1_000_000); // the "lost" frame
+        st.add_data(spo2, 97.0, 1_000_000); // stays pending across the test
+    }
+    let last_ack_time = spawn_supervision(&state).await;
+
+    advance_secs(12).await; // 1st timeout → retransmit
+    assert!(
+        state.read().await.is_subscribed(hr),
+        "retransmit, not reset"
+    );
+
+    // Central ACKs HR after the retransmit.
+    let hr_sid = state.read().await.get_stream_id(hr).unwrap();
+    real_ack(&state, &last_ack_time, hr_sid, 1).await;
+
+    // Another full timeout with SpO2 still pending (ACK at t=12 → next timeout seen on
+    // the t=25 tick): must retransmit again, NOT reset.
+    advance_secs(15).await;
+    assert!(
+        state.read().await.is_subscribed(spo2),
+        "an ACK since the last retransmit must disarm the reset stage"
+    );
+    assert_eq!(state.read().await.total_pending(), 1);
+
+    // The re-armed escalation must still terminate: no ACK for SpO2 → reset at t=35.
+    advance_secs(12).await;
+    assert_eq!(
+        state.read().await.total_pending(),
+        0,
+        "after a disarm, a dead stream must still end in a reset"
+    );
+}
+
+/// Helper: deliver an ACK through the real ACK path (apply_ack_and_retransmit).
+async fn real_ack(
+    state: &Arc<RwLock<BleSessionState>>,
+    last_ack_time: &Arc<tokio::sync::Mutex<tokio::time::Instant>>,
+    stream_id: u16,
+    ack_upto: u32,
+) {
+    let session = state.read().await.current_session_id;
+    ReliableBleOutput::apply_ack_and_retransmit(
+        state,
+        &unstarted_server(),
+        last_ack_time,
+        session,
+        stream_id,
+        ack_upto,
+        &[0u8; 8],
+        false,
+    )
+    .await;
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-063
+/// Title: TLV SUBSCRIBE — no DATA_FRAME can be produced before SUBSCRIBE_RSP, for any period_ms
+///
+/// Description: Drives the real handle_tlv_subscribe(). While the handler is between its
+///   state reset and the SUBSCRIBE_RSP notify (100 ms DEV-4 delay), a concurrent output()
+///   must not be able to emit a DATA_FRAME: add_data() must return None and no stale
+///   pending frame from the previous subscription may remain. After the RSP the stream is
+///   registered with the negotiated gate and the first sample goes out. Covered for
+///   period_ms = none, 1 s, 1 min, 10 min, 1 h — the race is independent of the value, and
+///   a re-subscribe on an already-subscribed state (the field reconnection case) is used.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_tlv_subscribe_rsp_precedes_any_data_frame_for_any_period() {
+    tokio::time::pause();
+    let hr = SignalId::HR.as_u16();
+    let registry = Arc::new(SignalRegistry::with_defaults());
+
+    for requested in [
+        None,
+        Some(1_000u32),
+        Some(60_000),
+        Some(600_000),
+        Some(3_600_000),
+    ] {
+        let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+        {
+            // Previous session still registered, with an unACKed frame in flight.
+            let mut st = state.write().await;
+            st.subscribe_with_stream_id(hr, 1);
+            st.add_data(hr, 70.0, 500_000);
+        }
+
+        let handler = tokio::spawn({
+            let (state, registry) = (state.clone(), registry.clone());
+            async move {
+                ReliableBleOutput::handle_tlv_subscribe(
+                    7,
+                    vec![(hr, requested)],
+                    &state,
+                    &unstarted_server(),
+                    &registry,
+                )
+                .await;
+            }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await; // handler now parked in its pre-RSP delay
+        }
+
+        {
+            let mut st = state.write().await;
+            assert!(
+                st.add_data(hr, 72.0, 1_000_000).is_none(),
+                "period {:?}: a DATA_FRAME must not be producible before SUBSCRIBE_RSP",
+                requested
+            );
+            assert_eq!(
+                st.total_pending(),
+                0,
+                "old in-flight frames must be dropped"
+            );
+        }
+
+        tokio::time::advance(Duration::from_millis(200)).await;
+        handler.await.unwrap();
+
+        let mut st = state.write().await;
+        let sid = st.get_stream_id(hr).expect("stream registered after RSP");
+        assert_eq!(
+            sid, 1,
+            "stream_id must match flutter_stream_id (what the RSP advertised)"
+        );
+        let expected_gate = requested.map_or(0, |p| p.max(1000));
+        assert_eq!(st.streams[&sid].period_ms, expected_gate, "{:?}", requested);
+        assert!(
+            st.add_data(hr, 73.0, 2_000_000).is_some(),
+            "period {:?}: first sample after RSP must go out",
+            requested
+        );
+    }
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-064
+/// Title: a reconnected Central gets its long-period frame through without a session reset
+///
+/// Description: End-to-end shape of the field failure: a frame is lost (never ACKed) on a
+///   1 h throttled stream, so no later frame arrives to cumulatively ACK it (the throttle
+///   gate drops every sample within the period). With the last-chance retransmit the
+///   Central receives it again; once it ACKs (real ACK path), nothing is pending and the
+///   session survives. Without the retransmit stage this exact sequence reset the session
+///   at the first timeout.
+///
+/// Version: V1.0
+#[tokio::test]
+async fn test_lost_frame_on_long_period_recovered_without_reset() {
+    tokio::time::pause();
+    let hr = SignalId::HR.as_u16();
+
+    let state = Arc::new(RwLock::new(BleSessionState::new(1)));
+    {
+        let mut st = state.write().await;
+        st.subscribe_with_period(hr, Some(1), 3_600_000);
+        assert!(st.add_data(hr, 72.0, 1_000_000).is_some()); // lost on air
+        assert!(
+            st.add_data(hr, 73.0, 1_060_000).is_none(),
+            "within the period: throttled, no frame to cumulatively ACK the lost one"
+        );
+    }
+    let last_ack_time = spawn_supervision(&state).await;
+
+    advance_secs(12).await; // timeout → retransmit
+    real_ack(&state, &last_ack_time, 1, 1).await; // Central got the retransmit
+
+    advance_secs(30).await;
+    let st = state.read().await;
+    assert!(st.is_subscribed(hr), "session must survive one lost frame");
+    assert_eq!(st.total_pending(), 0);
 }
 
 /// ID SRS: SRS-TEST-BLERELIABLE-060

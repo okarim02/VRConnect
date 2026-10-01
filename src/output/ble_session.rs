@@ -822,6 +822,30 @@ impl BleSessionState {
             .collect()
     }
 
+    /// ID SRS: SRS-FN-BLESESSION-026
+    /// Title: oldest_pending_per_stream
+    ///
+    /// Description: VRConnect shall return, for every stream with unacknowledged frames,
+    ///              a copy of its OLDEST pending frame with FLAG_RETRANSMIT set. The buffer
+    ///              itself is NOT modified. Used by supervision_task as a last-chance
+    ///              retransmit before declaring the link dead: the oldest frame is the one
+    ///              blocking the cumulative ACK, so resending it alone is enough for a live
+    ///              Central to ACK everything after it — and it bounds the burst to one
+    ///              frame per stream, whatever the buffer depth.
+    ///
+    /// Version: V1.0
+    pub fn oldest_pending_per_stream(&self) -> Vec<DataFrame> {
+        self.streams
+            .values()
+            .filter_map(|e| e.tx_buffer.front())
+            .map(|f| {
+                let mut retransmit = f.clone();
+                retransmit.header.flags |= FLAG_RETRANSMIT;
+                retransmit
+            })
+            .collect()
+    }
+
     /// ID SRS: SRS-FN-BLESESSION-010
     /// Title: reset_session
     ///

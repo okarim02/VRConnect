@@ -115,8 +115,10 @@ pub struct Config {
     pub ble_grace_period_sec: u64,
 
     /// Supervision timeout in seconds — if tx_buffer has pending frames and no ACK is received
-    /// within this window, GATE assumes a brutal link-layer drop (Central out of range without
-    /// CCCD update) and resets the session. Must be > ble_grace_period_sec to avoid false fires.
+    /// within this window, GATE retransmits the oldest pending frame of each stream; after a
+    /// second window still without an ACK it assumes a brutal link-layer drop (Central out of
+    /// range without CCCD update) and resets the session. Must be > ble_grace_period_sec to
+    /// avoid false fires.
     /// Set to 0 to disable (not recommended in production).
     /// ID SRS: SRS-CFG-BLE-001
     #[arg(long, default_value = "30")]

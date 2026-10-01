@@ -66,8 +66,9 @@ pub struct ReliableBleOutput {
     /// 0 = immediate reset (legacy behaviour).
     ble_grace_period_sec: u64,
     /// Supervision timeout in seconds — if tx_buffer has pending frames and no ACK arrives
-    /// within this window, GATE treats it as a brutal link-layer disconnect and resets the
-    /// session. 0 = disabled (not recommended in production).
+    /// within this window, GATE retransmits the oldest pending frame of each stream; if a
+    /// second window passes still without an ACK, it treats it as a brutal link-layer
+    /// disconnect and resets the session. 0 = disabled (not recommended in production).
     ble_supervision_timeout_sec: u64,
     /// Shared last-ACK timestamp — reset on ACK receipt, on successful subscribe, and in
     /// output() on the tx_buffer idle→busy transition (state.total_pending() 0 → >0).
@@ -427,6 +428,7 @@ impl ReliableBleOutput {
         // out of range without a CCCD update; SubscribedClientsChanged never fires).
         if self.ble_supervision_timeout_sec > 0 {
             let state = self.state.clone();
+            let server = self.server.clone();
             let health_state = self.health_state.clone();
             let health_notify = self.health_notify.clone();
             let last_ack_time_sv = last_ack_time.clone();
@@ -434,6 +436,7 @@ impl ReliableBleOutput {
             tokio::spawn(async move {
                 Self::supervision_task(
                     state,
+                    server,
                     health_state,
                     health_notify,
                     last_ack_time_sv,
@@ -1011,18 +1014,29 @@ impl ReliableBleOutput {
     /// Description: VRConnect shall detect brutal link-layer disconnections that bypass the CCCD
     ///   SubscribedClientsChanged event (Central goes out of range without a graceful BLE
     ///   disconnect). Every CHECK_INTERVAL_SEC: if tx_buffer holds pending frames AND no ACK
-    ///   has been received for supervision_timeout_sec, GATE resets the session via
-    ///   do_session_reset() — the same path as grace-period expiry.
-    ///   last_ack_time is reset immediately after each trigger so the timer re-arms cleanly.
+    ///   has been received for supervision_timeout_sec, GATE retransmits, then resets the
+    ///   session via do_session_reset() — the same path as grace-period expiry — if a further
+    ///   timeout passes with still no ACK (see two-stage escalation below).
+    ///   last_ack_time is reset immediately after a reset so the timer re-arms cleanly.
+    ///
+    ///   Two-stage escalation (V2.0): the first timeout does NOT reset — it retransmits the
+    ///   oldest pending frame of each stream (oldest_pending_per_stream) and gives the
+    ///   Central a fresh supervision_timeout_sec window. Only a second consecutive timeout,
+    ///   with no ACK in between, resets the session. Reason: with a long period_ms a single
+    ///   lost frame (radio drop, or a frame the Central discarded) has no next frame to
+    ///   cumulatively ACK it away, so one lost frame used to kill a perfectly live session.
+    ///   Any ACK in between (last_ack_time moves) disarms the escalation. Cost: a truly dead
+    ///   link is declared dead after 2 × supervision_timeout_sec instead of 1×.
     ///
     ///   Why tx_buffer check is safe: record_history() and the WAL journal are called in
     ///   output() BEFORE add_data(), so every sample is already durable when frames enter
     ///   tx_buffer. A supervision-triggered reset does NOT lose data — it ensures the Central
     ///   can recover all missed samples via BACKLOG_THEN_LIVE on reconnect.
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     async fn supervision_task(
         state: Arc<RwLock<BleSessionState>>,
+        server: Arc<RwLock<GattServer>>,
         health_state: Arc<RwLock<GateHealthState>>,
         health_notify: Arc<Notify>,
         last_ack_time: Arc<tokio::sync::Mutex<tokio::time::Instant>>,
@@ -1031,23 +1045,69 @@ impl ReliableBleOutput {
         const CHECK_INTERVAL_SEC: u64 = 5;
         let mut tick = tokio::time::interval(Duration::from_secs(CHECK_INTERVAL_SEC));
         tick.tick().await; // skip the immediate first tick
+        let timeout = Duration::from_secs(supervision_timeout_sec);
+
+        // Set after a last-chance retransmit: (last_ack_time seen then, when we retransmitted).
+        // Kept local — the shared last_ack_time is left to its real writers (ACKs, subscribe,
+        // idle→busy), so an ACK racing the retransmit can never be overwritten.
+        let mut armed: Option<(tokio::time::Instant, tokio::time::Instant)> = None;
 
         loop {
             tick.tick().await;
             let pending = state.read().await.total_pending();
             if pending == 0 {
+                armed = None;
                 continue;
             }
-            let elapsed = last_ack_time.lock().await.elapsed().as_secs();
-            if elapsed >= supervision_timeout_sec {
-                log::warn!(
-                    "[BLE] Supervision timeout: {} frame(s) pending, no ACK for {}s \
-                     — brutal disconnect assumed, resetting session",
-                    pending,
-                    elapsed
-                );
-                Self::do_session_reset(&state, &health_state, &health_notify).await;
-                *last_ack_time.lock().await = tokio::time::Instant::now();
+            let last_ack = *last_ack_time.lock().await;
+            if armed.is_some_and(|(seen, _)| seen != last_ack) {
+                armed = None; // an ACK (or a fresh subscribe / idle→busy window) since
+            }
+            match armed {
+                None if last_ack.elapsed() >= timeout => {
+                    let frames = state.read().await.oldest_pending_per_stream();
+                    log::warn!(
+                        "[BLE] Supervision: {} frame(s) pending, no ACK for {}s — retransmitting \
+                         the oldest pending frame of {} stream(s) before declaring the link dead",
+                        pending,
+                        last_ack.elapsed().as_secs(),
+                        frames.len()
+                    );
+                    // Bounded: a stalled BLE stack must not keep the dead-link detector from
+                    // reaching its reset stage.
+                    let send = async {
+                        let srv = server.read().await;
+                        for frame in frames {
+                            if let Err(e) = srv.notify("Data_OUT", &frame.to_ble_bytes()).await {
+                                log::warn!(
+                                    "[BLE] Supervision retransmit failed (stream {}, seq {}): {}",
+                                    frame.header.stream_id,
+                                    frame.header.seq,
+                                    e
+                                );
+                            }
+                        }
+                    };
+                    if tokio::time::timeout(Duration::from_secs(5), send)
+                        .await
+                        .is_err()
+                    {
+                        log::warn!("[BLE] Supervision retransmit timed out after 5s");
+                    }
+                    armed = Some((last_ack, tokio::time::Instant::now()));
+                }
+                Some((_, retransmitted)) if retransmitted.elapsed() >= timeout => {
+                    log::warn!(
+                        "[BLE] Supervision timeout: {} frame(s) pending, no ACK for {}s even after \
+                         retransmit — brutal disconnect assumed, resetting session",
+                        pending,
+                        last_ack.elapsed().as_secs()
+                    );
+                    Self::do_session_reset(&state, &health_state, &health_notify).await;
+                    *last_ack_time.lock().await = tokio::time::Instant::now();
+                    armed = None;
+                }
+                _ => {}
             }
         }
     }
@@ -1574,8 +1634,25 @@ impl ReliableBleOutput {
     /// assigns stream IDs matching the raw signal ID (HR=1, SpO2=2, Temp=3) so Flutter's
     /// hardcoded `activeStreams` map aligns, then sends SUBSCRIBE_RSP on Data_OUT.
     ///
-    /// A 300 ms delay before the RSP notify is required because the Flutter app enables
-    /// CCCD *after* writing to the Subscribe characteristic.
+    /// Ordering guarantee — SUBSCRIBE_RSP strictly before any DATA_FRAME of the new
+    /// subscription. The handler runs in three steps:
+    ///   1. under the state lock: unsubscribe_all() and plan the streams (nothing registered);
+    ///   2. lock released: 100 ms safety delay [DEV-4], then notify SUBSCRIBE_RSP;
+    ///   3. under the state lock again: register the planned streams.
+    ///
+    /// Between 1 and 3 no stream is subscribed, so a concurrent output() call gets `None`
+    /// from add_data() and cannot notify a DATA_FRAME ahead of the RSP. That race used to
+    /// exist (streams registered *before* the delay + RSP): on a fresh connection Flutter's
+    /// activeStreams is still empty [DEV-6], so the early frame was silently dropped and
+    /// never ACKed. With a long period_ms there is no next frame to cumulatively ACK it
+    /// away, so supervision_task reset the session ~300 s later (field: 2026-09-30 21:42,
+    /// 2026-10-01 06:53 — "1 frame(s) pending, no ACK for 301s"). Samples arriving during
+    /// the window are not lost: record_history() + WAL run before add_data() in output().
+    ///
+    /// Registration happens even if the RSP notify fails, as before this change.
+    ///
+    /// ID SRS: SRS-FN-BLERELIABLE-019
+    /// Version: V2.0
     async fn handle_tlv_subscribe(
         req_id: u16,
         entries: Vec<SubscribeReqEntry>,
@@ -1583,11 +1660,14 @@ impl ReliableBleOutput {
         server: &Arc<RwLock<GattServer>>,
         registry: &Arc<SignalRegistry>,
     ) {
-        let session_id = state.read().await.current_session_id;
+        let session_id;
         let mut rsp_items: Vec<SubscribeRspItem> = Vec::new();
+        // (canonical_id, stream_id, gate_period_ms) — registered only after the RSP is sent.
+        let mut planned: Vec<(u16, u16, u32)> = Vec::new();
 
         {
             let mut st = state.write().await;
+            session_id = st.current_session_id;
             st.unsubscribe_all();
             for (raw_id, requested_period_ms) in &entries {
                 let canonical_id = match registry.normalize_id(*raw_id) {
@@ -1615,8 +1695,10 @@ impl ReliableBleOutput {
                 let meta = registry.get(canonical_id).unwrap();
                 let (effective_period_ms, gate_period_ms) =
                     Self::negotiate_period_ms(*requested_period_ms, meta.nominal_period_ms);
-                let stream_id =
-                    st.subscribe_with_period(canonical_id, Some(flutter_sid), gate_period_ms);
+                // After unsubscribe_all() a pinned stream_id is always granted as-is
+                // (subscribe_with_period), so the RSP can carry it before registration.
+                let stream_id = flutter_sid;
+                planned.push((canonical_id, stream_id, gate_period_ms));
                 // RSP stream_id encoded as-is (Flutter ignores the RSP stream_id).
                 // Future IDT-compliant clients will read it correctly in LE.
                 rsp_items.push(SubscribeRspItem {
@@ -1665,20 +1747,36 @@ impl ReliableBleOutput {
         // CCCD is pre-enabled by Flutter before the SUBSCRIBE write, so no long wait needed.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let srv = server.read().await;
-        if let Err(e) = srv.notify("Data_OUT", &rsp_bytes).await {
+        {
+            let srv = server.read().await;
+            if let Err(e) = srv.notify("Data_OUT", &rsp_bytes).await {
+                log::warn!(
+                    "SUBSCRIBE_RSP notify on Data_OUT failed (req_id={}): {}",
+                    req_id,
+                    e
+                );
+            } else {
+                log::info!(
+                    "SUBSCRIBE_RSP sent on Data_OUT (req_id={}, {} stream(s), {} bytes)",
+                    req_id,
+                    rsp.results.len(),
+                    rsp_bytes.len()
+                );
+            }
+        }
+
+        // Only now may the new streams produce DATA_FRAMEs (see ordering guarantee above).
+        let mut st = state.write().await;
+        if st.current_session_id != session_id {
             log::warn!(
-                "SUBSCRIBE_RSP notify on Data_OUT failed (req_id={}): {}",
-                req_id,
-                e
+                "TLV SUBSCRIBE: session reset during RSP window (session {} → {}) — \
+                 registering streams on the new session",
+                session_id,
+                st.current_session_id
             );
-        } else {
-            log::info!(
-                "SUBSCRIBE_RSP sent on Data_OUT (req_id={}, {} stream(s), {} bytes)",
-                req_id,
-                rsp.results.len(),
-                rsp_bytes.len()
-            );
+        }
+        for (canonical_id, stream_id, gate_period_ms) in planned {
+            st.subscribe_with_period(canonical_id, Some(stream_id), gate_period_ms);
         }
     }
 

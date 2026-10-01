@@ -1259,6 +1259,32 @@ fn test_start_replay_frames_in_tx_buffer() {
     );
 }
 
+/// ID SRS: SRS-TEST-BLESESSION-053
+/// Title: oldest_pending_per_stream returns one FLAG_RETRANSMIT frame per busy stream
+///
+/// Description: VRConnect shall return exactly the oldest unACKed frame of each stream
+///              with pending frames (none for idle streams), with FLAG_RETRANSMIT set,
+///              and shall leave tx_buffer untouched.
+///
+/// Version: V1.0
+#[test]
+fn test_oldest_pending_per_stream() {
+    let mut session = BleSessionState::new(1);
+    let hr = SignalId::HR.as_u16();
+    let spo2 = SignalId::SpO2.as_u16();
+    session.subscribe(hr);
+    session.subscribe(spo2);
+    session.add_data(hr, 70.0, 1000);
+    session.add_data(hr, 71.0, 2000);
+    session.add_data(hr, 72.0, 3000);
+
+    let frames = session.oldest_pending_per_stream();
+    assert_eq!(frames.len(), 1, "idle SpO2 stream contributes nothing");
+    assert_eq!(frames[0].header.seq, 1, "oldest pending frame");
+    assert_ne!(frames[0].header.flags & FLAG_RETRANSMIT, 0);
+    assert_eq!(session.total_pending(), 3, "buffer must not be modified");
+}
+
 /// ID SRS: SRS-TEST-BLESESSION-047
 /// Title: Test tx_buffer keeps only the most recent frames for a backlog larger than the cap
 ///
