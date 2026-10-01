@@ -72,7 +72,7 @@ pub struct StreamEntry {
 ///              BLE communication, including multi-stream sequence tracking,
 ///              retransmit buffer management, and subscription handling.
 ///
-/// Version: V1.0
+/// Version: V1.1
 pub struct BleSessionState {
     /// Current IDT session identifier (from the BLE Central handshake)
     pub current_session_id: u16,
@@ -97,6 +97,15 @@ pub struct BleSessionState {
     /// spanning multiple days within the size cap.
     /// Set via with_history_retention(). 0 = age eviction disabled.
     pub max_history_age_ms: u64,
+    /// Per-signal t0_ms of the last live sample CONFIRMED delivered (covered by a real
+    /// cumulative ACK — see record_delivery), kept OUTSIDE StreamEntry so it survives
+    /// unsubscribe_all() and on_disconnect(). A re-subscribe (the app reconnects every
+    /// 10-30 min in the field) seeds the new StreamEntry's last_sent_t0_ms from it, so a
+    /// requested period_ms of 1 h stays 1 h instead of restarting the clock on every
+    /// reconnect. A value never confirmed does not count, so it is re-sent at once on
+    /// the next subscription. Bounded by the number of signals; not persisted across a
+    /// VRConnect restart.
+    pub last_sent_by_signal: HashMap<u16, u64>,
 }
 
 impl BleSessionState {
@@ -120,6 +129,7 @@ impl BleSessionState {
             history: HashMap::new(),
             max_history_size: 21600, // 6 h at 1 Hz — matches default HISTORY_RETENTION_SEC
             max_history_age_ms: 21600 * 1000, // 6 h age eviction threshold
+            last_sent_by_signal: HashMap::new(),
         }
     }
 
@@ -132,7 +142,7 @@ impl BleSessionState {
     ///   - Check bitmap for selective ACKs (bit i in bitmap = seq [ack_upto+1+i] received).
     ///   - Return list of frames NOT in bitmap (lost frames) with FLAG_RETRANSMIT set.
     ///
-    /// Version: V1.0
+    /// Version: V1.1
     ///
     /// # Arguments
     /// * `session_id` - Session identifier from the received ACK header
@@ -155,6 +165,8 @@ impl BleSessionState {
             for entry in self.streams.values_mut() {
                 entry.tx_buffer.clear();
                 entry.last_seq = 0;
+                // Cleared frames were never confirmed: fall back to the confirmed cadence.
+                entry.last_sent_t0_ms = self.last_sent_by_signal.get(&entry.signal_id).copied();
             }
             return vec![];
         }
@@ -203,9 +215,43 @@ impl BleSessionState {
         }
 
         // Purge all frames with seq ≤ ack_upto (cumulatively acknowledged)
+        Self::record_delivery(&mut self.last_sent_by_signal, entry, ack_upto);
         entry.tx_buffer.retain(|f| f.header.seq > ack_upto);
 
         retransmits
+    }
+
+    /// ID SRS: SRS-FN-BLESESSION-027
+    /// Title: record_delivery
+    ///
+    /// Description: VRConnect shall record, per signal, the t0_ms of the newest LIVE frame
+    ///              (not FLAG_BACKLOG) covered by a cumulative ACK (seq ≤ ack_upto), before
+    ///              those frames are purged. This "last confirmed delivery" seeds the
+    ///              throttle gate of the next subscription for that signal, so a requested
+    ///              period_ms holds across re-subscribes and session resets. Only a real
+    ///              ACK counts: emitting a frame, or a new-session ACK clearing tx_buffer,
+    ///              does not.
+    ///
+    /// Version: V1.0
+    fn record_delivery(
+        last_sent_by_signal: &mut HashMap<u16, u64>,
+        entry: &StreamEntry,
+        ack_upto: u32,
+    ) {
+        // An ACK beyond any seq this entry issued is stale/foreign (old numbering after a
+        // re-subscribe or new-session reset restarted last_seq): not a delivery.
+        if ack_upto > entry.last_seq {
+            return;
+        }
+        let delivered = entry
+            .tx_buffer
+            .iter()
+            .filter(|f| f.header.seq <= ack_upto && f.header.flags & FLAG_BACKLOG == 0)
+            .map(|f| f.t0_ms)
+            .max();
+        if let Some(t0_ms) = delivered {
+            last_sent_by_signal.insert(entry.signal_id, t0_ms);
+        }
     }
 
     /// ID SRS: SRS-FN-BLESESSION-002
@@ -346,8 +392,10 @@ impl BleSessionState {
     ///              request. `period_ms = 0` means "no throttling requested": the gate
     ///              in add_data() stays inactive and live throughput is unchanged, which
     ///              is the case for every app deployed before this field existed.
+    ///              A NEW StreamEntry resumes the signal's throttle cadence from its last
+    ///              confirmed delivery (`last_sent_by_signal`).
     ///
-    /// Version: V1.0
+    /// Version: V2.0
     ///
     /// # Arguments
     /// * `signal_id` - IDT signal identifier to subscribe
@@ -389,7 +437,8 @@ impl BleSessionState {
             last_seq: 0,
             last_t0_ms: None,
             period_ms,
-            last_sent_t0_ms: None,
+            // Resume the throttle cadence across re-subscribes (see last_sent_by_signal).
+            last_sent_t0_ms: self.last_sent_by_signal.get(&signal_id).copied(),
             tx_buffer: VecDeque::new(),
             is_replaying: false,
         });
@@ -471,8 +520,11 @@ impl BleSessionState {
     ///              caller (`output()` in ble_reliable.rs) always calls
     ///              `record_history()` and journals to the WAL *before* `add_data()`, so
     ///              throttling never reduces what is recorded or replayable.
+    ///              A sample a full period or more older than `last_sent_t0_ms` (source
+    ///              clock went backwards) is treated as a timeline reset and sent; a
+    ///              smaller step back (sliding-window re-send) is throttled.
     ///
-    /// Version: V2.0
+    /// Version: V2.1
     ///
     /// # Arguments
     /// * `signal_id` - IDT signal identifier (e.g. 0x0101 = HR)
@@ -505,9 +557,15 @@ impl BleSessionState {
         // Per-stream throttle gate: inactive when period_ms == 0 (no request made —
         // every deployed app today). Placed after the dedup commit above but before
         // last_seq/tx_buffer so a throttled sample burns no sequence number.
+        // t0_ms < last_sent is only reachable on a fresh stream seeded from
+        // last_sent_by_signal (dedup above filters it within a stream). Within one period
+        // behind it is VitalRecorder's sliding window re-sending already-delivered
+        // samples → throttled like any other. A full period or more behind means the
+        // source clock went backwards (restart / clock correction) → treated as a reset
+        // and sent, so the stream never stays silent longer than ~2 periods.
         if entry.period_ms > 0 {
             if let Some(last_sent) = entry.last_sent_t0_ms {
-                if t0_ms.saturating_sub(last_sent) < entry.period_ms as u64 {
+                if t0_ms.abs_diff(last_sent) < entry.period_ms as u64 {
                     log::debug!(
                         "Throttled: signal=0x{:04X} t0_ms={} last_sent={} period_ms={}",
                         signal_id,
@@ -518,8 +576,10 @@ impl BleSessionState {
                     return None;
                 }
             }
-            entry.last_sent_t0_ms = Some(t0_ms);
         }
+        // Tracked for every emitted sample (also unthrottled), so a later switch to a
+        // non-zero period on the same stream starts from the real last emission.
+        entry.last_sent_t0_ms = Some(t0_ms);
 
         entry.last_seq += 1;
         let seq = entry.last_seq;
@@ -765,7 +825,7 @@ impl BleSessionState {
     ///   - If a new session_id is detected: reset all stream buffers and sequence counters.
     ///   - Otherwise: purge frames with seq ≤ ack_upto from the named stream's buffer.
     ///
-    /// Version: V1.0
+    /// Version: V1.1
     ///
     /// # Arguments
     /// * `session_id` - Session identifier from the received ACK header
@@ -778,12 +838,15 @@ impl BleSessionState {
             for entry in self.streams.values_mut() {
                 entry.tx_buffer.clear();
                 entry.last_seq = 0;
+                // Cleared frames were never confirmed: fall back to the confirmed cadence.
+                entry.last_sent_t0_ms = self.last_sent_by_signal.get(&entry.signal_id).copied();
             }
             return;
         }
 
         // Purge confirmed frames from the targeted stream
         if let Some(entry) = self.streams.get_mut(&stream_id) {
+            Self::record_delivery(&mut self.last_sent_by_signal, entry, ack_upto);
             entry.tx_buffer.retain(|f| f.header.seq > ack_upto);
         }
     }
@@ -852,7 +915,7 @@ impl BleSessionState {
     /// Description: VRConnect shall reset all streams to a new session ID, clearing
     ///              retransmit buffers and sequence counters.  Subscriptions are preserved.
     ///
-    /// Version: V1.0
+    /// Version: V1.1
     ///
     /// # Arguments
     /// * `new_session_id` - New IDT session identifier
@@ -861,6 +924,7 @@ impl BleSessionState {
         for entry in self.streams.values_mut() {
             entry.tx_buffer.clear();
             entry.last_seq = 0;
+            entry.last_sent_t0_ms = self.last_sent_by_signal.get(&entry.signal_id).copied();
         }
     }
 

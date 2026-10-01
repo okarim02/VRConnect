@@ -1259,6 +1259,320 @@ fn test_start_replay_frames_in_tx_buffer() {
     );
 }
 
+/// ID SRS: SRS-TEST-BLESESSION-054
+/// Title: throttle cadence survives a re-subscribe (unsubscribe_all) and a session reset
+///
+/// Description: VRConnect shall keep a requested period_ms across re-subscriptions: after
+///              an ACKed sample, unsubscribe_all() + re-subscribe (field: the app reconnects
+///              every 10-30 min) or on_disconnect() + re-subscribe must not restart the
+///              clock — a sample within the period is still throttled, and the next one
+///              goes out exactly one period after the last delivered sample. Covered for
+///              both ACK paths (handle_ack and handle_ack_with_bitmap — the latter is the
+///              one the live Data_IN handler uses).
+///
+/// Version: V1.0
+#[test]
+fn test_throttle_cadence_survives_resubscribe_and_reset() {
+    let hr = SignalId::HR.as_u16();
+    for (reset_via_disconnect, bitmap_ack) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let mut s = BleSessionState::new(1);
+        s.subscribe_with_period(hr, Some(1), 3_600_000);
+        assert!(s.add_data(hr, 70.0, 1_000_000).is_some());
+        let session = s.current_session_id;
+        if bitmap_ack {
+            s.handle_ack_with_bitmap(session, 1, 1, &[0u8; 8]);
+        } else {
+            s.handle_ack(session, 1, 1); // delivered
+        }
+
+        if reset_via_disconnect {
+            s.on_disconnect();
+        } else {
+            s.unsubscribe_all();
+        }
+        s.subscribe_with_period(hr, Some(1), 3_600_000);
+
+        assert!(
+            s.add_data(hr, 71.0, 1_000_000 + 600_000).is_none(),
+            "10 min after the last delivered sample: still throttled (disconnect={})",
+            reset_via_disconnect
+        );
+        assert!(
+            s.add_data(hr, 72.0, 1_000_000 + 3_600_000).is_some(),
+            "exactly one period later: sent (disconnect={})",
+            reset_via_disconnect
+        );
+    }
+}
+
+/// ID SRS: SRS-TEST-BLESESSION-055
+/// Title: an unACKed throttled sample is re-sent immediately after re-subscribe
+///
+/// Description: If the last emitted sample was still pending (never ACKed) when the
+///              stream was cleared — by unsubscribe_all(), unsubscribe() or on_disconnect()
+///              — VRConnect shall not keep its cadence: the Central may never have received
+///              it, so the first sample after the next subscription must go out at once.
+///
+/// Version: V1.0
+#[test]
+fn test_unacked_throttled_sample_resent_after_resubscribe() {
+    let hr = SignalId::HR.as_u16();
+    for how in ["unsubscribe_all", "unsubscribe", "on_disconnect"] {
+        let mut s = BleSessionState::new(1);
+        s.subscribe_with_period(hr, Some(1), 3_600_000);
+        assert!(s.add_data(hr, 70.0, 1_000_000).is_some()); // never ACKed
+        match how {
+            "unsubscribe_all" => s.unsubscribe_all(),
+            "unsubscribe" => s.unsubscribe(hr),
+            _ => s.on_disconnect(),
+        }
+        s.subscribe_with_period(hr, Some(1), 3_600_000);
+        assert!(
+            s.add_data(hr, 71.0, 1_000_000 + 600_000).is_some(),
+            "unACKed before {}: must be sent immediately after re-subscribe",
+            how
+        );
+    }
+}
+
+/// Helper: HR stream throttled to 1 h with one sample at t0=1_000_000 ACKed.
+fn hr_hourly_delivered() -> BleSessionState {
+    let hr = SignalId::HR.as_u16();
+    let mut s = BleSessionState::new(1);
+    s.subscribe_with_period(hr, Some(1), 3_600_000);
+    assert!(s.add_data(hr, 70.0, 1_000_000).is_some());
+    let session = s.current_session_id;
+    s.handle_ack(session, 1, 1);
+    s
+}
+
+/// ID SRS: SRS-TEST-BLESESSION-056
+/// Title: a new-session ACK clearing tx_buffer is not a delivery
+///
+/// Description: handle_ack / handle_ack_with_bitmap with a different session_id clear
+///              tx_buffer without confirming anything. VRConnect shall not treat that as a
+///              delivery: after re-subscribe the undelivered value goes out immediately.
+///
+/// Version: V1.0
+#[test]
+fn test_new_session_ack_is_not_a_delivery() {
+    let hr = SignalId::HR.as_u16();
+    for with_bitmap in [false, true] {
+        let mut s = BleSessionState::new(1);
+        s.subscribe_with_period(hr, Some(1), 3_600_000);
+        assert!(s.add_data(hr, 70.0, 1_000_000).is_some());
+        let stale = s.current_session_id.wrapping_add(7);
+        if with_bitmap {
+            s.handle_ack_with_bitmap(stale, 1, 1, &[0u8; 8]);
+        } else {
+            s.handle_ack(stale, 1, 1);
+        }
+        s.unsubscribe_all();
+        s.subscribe_with_period(hr, Some(1), 3_600_000);
+        assert!(
+            s.add_data(hr, 71.0, 1_000_000 + 600_000).is_some(),
+            "bitmap={}: never confirmed → must be re-sent at once",
+            with_bitmap
+        );
+    }
+}
+
+/// ID SRS: SRS-TEST-BLESESSION-057
+/// Title: a backward source-clock jump after re-subscribe does not silence the stream
+///
+/// Description: If VitalRecorder's timeline goes backwards (restart / clock correction),
+///              the carried-over cadence would otherwise throttle until the old timeline is
+///              caught up (hours). VRConnect shall treat t0 < last delivery as a reset:
+///              send, then throttle normally from the new timeline.
+///
+/// Version: V1.0
+#[test]
+fn test_backward_clock_after_resubscribe_sends_and_reseeds() {
+    let hr = SignalId::HR.as_u16();
+    let delivered = 10_000_000;
+    let mut s = BleSessionState::new(1);
+    s.subscribe_with_period(hr, Some(1), 3_600_000);
+    assert!(s.add_data(hr, 70.0, delivered).is_some());
+    let session = s.current_session_id;
+    s.handle_ack(session, 1, 1);
+    s.unsubscribe_all();
+    s.subscribe_with_period(hr, Some(1), 3_600_000);
+    let back = delivered - 7_200_000; // clock jumped back 2 h (> one period)
+    assert!(
+        s.add_data(hr, 71.0, back).is_some(),
+        "clock went back by more than a period: send"
+    );
+    assert!(
+        s.add_data(hr, 72.0, back + 60_000).is_none(),
+        "then throttle on the new timeline"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLESESSION-060
+/// Title: sliding-window re-sends right after re-subscribe are throttled, not a clock reset
+///
+/// Description: A new stream has no dedup history, so VitalRecorder's sliding window can
+///              re-send samples slightly older than the last delivery. VRConnect shall
+///              throttle them (no out-of-order sample to the app, no drift of the
+///              cadence): the next sample goes out exactly one period after the delivery.
+///
+/// Version: V1.0
+#[test]
+fn test_window_resend_after_resubscribe_is_throttled() {
+    let hr = SignalId::HR.as_u16();
+    let mut s = hr_hourly_delivered(); // delivered at 1_000_000
+    s.unsubscribe_all();
+    s.subscribe_with_period(hr, Some(1), 3_600_000);
+    for t0 in [997_000, 999_000, 1_000_000, 1_002_000] {
+        assert!(
+            s.add_data(hr, 71.0, t0).is_none(),
+            "window re-send t0={}",
+            t0
+        );
+    }
+    assert!(s.add_data(hr, 72.0, 1_000_000 + 3_599_000).is_none());
+    assert!(s.add_data(hr, 73.0, 1_000_000 + 3_600_000).is_some());
+}
+
+/// ID SRS: SRS-TEST-BLESESSION-061
+/// Title: an ACK beyond any issued seq does not record a delivery
+///
+/// Description: After a re-subscribe the new stream restarts at seq 1 on the same
+///              stream_id; a late ACK from the old numbering (ack_upto=50) must not mark the
+///              new, unconfirmed seq 1 as delivered — after the next re-subscribe it is
+///              re-sent immediately.
+///
+/// Version: V1.0
+#[test]
+fn test_stale_ack_beyond_issued_seq_is_not_a_delivery() {
+    let hr = SignalId::HR.as_u16();
+    let mut s = BleSessionState::new(1);
+    s.subscribe_with_period(hr, Some(1), 3_600_000);
+    assert!(s.add_data(hr, 70.0, 1_000_000).is_some()); // seq 1, unconfirmed
+    let session = s.current_session_id;
+    s.handle_ack_with_bitmap(session, 1, 50, &[0u8; 8]); // stale, old numbering
+    s.unsubscribe_all();
+    s.subscribe_with_period(hr, Some(1), 3_600_000);
+    assert!(
+        s.add_data(hr, 71.0, 1_000_000 + 60_000).is_some(),
+        "never really confirmed → re-sent at once"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLESESSION-062
+/// Title: a new-session reset falls back to the confirmed cadence within a live stream
+///
+/// Description: When a new-session ACK (or reset_session) clears tx_buffer, the cleared
+///              frames were never confirmed; the live stream's gate shall fall back to the
+///              last confirmed delivery instead of the last emission, so an unconfirmed
+///              value is re-sent without waiting a full period.
+///
+/// Version: V1.0
+#[test]
+fn test_new_session_reset_falls_back_to_confirmed_cadence() {
+    let hr = SignalId::HR.as_u16();
+    for how in 0..3 {
+        let mut s = BleSessionState::new(1);
+        s.subscribe_with_period(hr, Some(1), 3_600_000);
+        assert!(s.add_data(hr, 70.0, 1_000_000).is_some()); // unconfirmed
+        let other = s.current_session_id.wrapping_add(3);
+        match how {
+            0 => s.handle_ack(other, 1, 1),
+            1 => {
+                s.handle_ack_with_bitmap(other, 1, 1, &[0u8; 8]);
+            }
+            _ => s.reset_session(other),
+        }
+        assert!(
+            s.add_data(hr, 71.0, 1_000_000 + 60_000).is_some(),
+            "reset path {}: unconfirmed value must be re-sent",
+            how
+        );
+    }
+}
+
+/// ID SRS: SRS-TEST-BLESESSION-058
+/// Title: unthrottled deliveries keep the cadence reference current
+///
+/// Description: 1 h throttled, then a period of unthrottled (period_ms=0) delivered
+///              samples, then 1 h again: the next hourly sample must be measured from the
+///              last delivered sample, not from the older throttled one.
+///
+/// Version: V1.0
+#[test]
+fn test_unthrottled_deliveries_update_cadence() {
+    let hr = SignalId::HR.as_u16();
+    let mut s = hr_hourly_delivered(); // delivered at 1_000_000
+    s.unsubscribe_all();
+    s.subscribe_with_period(hr, Some(1), 0);
+    let t40 = 1_000_000 + 40 * 60_000;
+    assert!(s.add_data(hr, 71.0, t40).is_some());
+    let session = s.current_session_id;
+    s.handle_ack(session, 1, 1);
+
+    s.unsubscribe_all();
+    s.subscribe_with_period(hr, Some(1), 3_600_000);
+    assert!(
+        s.add_data(hr, 72.0, 1_000_000 + 60 * 60_000).is_none(),
+        "only 20 min after the last delivery: throttled"
+    );
+    assert!(s.add_data(hr, 73.0, t40 + 3_600_000).is_some());
+
+    // Same stream switched from 0 to 1 h in place (idempotent re-subscribe): the gate
+    // must start from the last unthrottled emission.
+    let mut s = BleSessionState::new(1);
+    s.subscribe_with_period(hr, Some(1), 0);
+    assert!(s.add_data(hr, 70.0, 1_000_000).is_some());
+    s.subscribe_with_period(hr, Some(1), 3_600_000);
+    assert!(
+        s.add_data(hr, 71.0, 1_000_000 + 600_000).is_none(),
+        "in-place switch to 1 h: measured from the last unthrottled emission"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLESESSION-059
+/// Title: pending backlog-replay frames neither reset nor advance the live cadence
+///
+/// Description: Replay (FLAG_BACKLOG) frames are not live deliveries. With the last live
+///              sample ACKed and replay frames still pending, a re-subscribe shall keep the
+///              live cadence (no early extra live sample).
+///
+/// Version: V1.0
+#[test]
+fn test_pending_replay_frames_do_not_affect_cadence() {
+    let hr = SignalId::HR.as_u16();
+    let mut s = hr_hourly_delivered();
+    s.record_history(hr, 60.0, 2_000_000);
+    s.record_history(hr, 61.0, 3_000_000);
+    let replay = s.start_replay(hr, 0);
+    assert!(!replay.is_empty());
+    assert!(s.total_pending() > 0, "replay frames pending");
+    s.unsubscribe_all();
+    s.subscribe_with_period(hr, Some(1), 3_600_000);
+    assert!(
+        s.add_data(hr, 73.0, 1_000_000 + 300_000).is_none(),
+        "pending replay frames must not reset the live cadence"
+    );
+
+    // Even once ACKed, replay frames (t0 2_000_000 / 3_000_000) must not move the live
+    // reference: otherwise 1_600_000 would look like a backward clock jump and be sent.
+    let mut s = hr_hourly_delivered();
+    s.record_history(hr, 60.0, 2_000_000);
+    s.record_history(hr, 61.0, 3_000_000);
+    let replay = s.start_replay(hr, 0);
+    let last_seq = replay.last().unwrap().header.seq;
+    let session = s.current_session_id;
+    s.handle_ack(session, 1, last_seq);
+    s.unsubscribe_all();
+    s.subscribe_with_period(hr, Some(1), 3_600_000);
+    assert!(
+        s.add_data(hr, 74.0, 1_000_000 + 600_000).is_none(),
+        "live cadence kept despite pending replay frames"
+    );
+}
+
 /// ID SRS: SRS-TEST-BLESESSION-053
 /// Title: oldest_pending_per_stream returns one FLAG_RETRANSMIT frame per busy stream
 ///
