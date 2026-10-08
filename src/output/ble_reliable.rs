@@ -38,6 +38,17 @@ use tokio::sync::{Notify, RwLock};
 /// A single one-shot retry entry: `(frame_bytes, signal_id, stream_id, seq)`.
 type RetryEntry = (Vec<u8>, u16, u16, u32);
 
+/// Catch-up is skipped below this negotiated gate period (would flood the link).
+const CATCHUP_MIN_PERIOD_MS: u32 = 60_000;
+
+/// Replay frames collected for one stream (IDT backlog or TLV catch-up).
+struct ReplayBatch {
+    canonical_id: u16,
+    stream_id: u16,
+    mode: u8,
+    frames: Vec<crate::domain::ble_protocol::DataFrame>,
+}
+
 /// ID SRS: SRS-MOD-BLERELIABLE-001
 /// Title: ReliableBleOutput
 ///
@@ -476,6 +487,21 @@ impl ReliableBleOutput {
             .history_checkpoint_max_age_sec
             .max(self.history_retention_sec);
         Self::try_load_checkpoint(&self.state, &self.history_checkpoint_path, ckpt_max_age).await;
+        {
+            // Opt-in: with HOURLY_CATCHUP off, restart behaviour is exactly as before.
+            let loaded = if Self::hourly_catchup_enabled() {
+                Self::load_delivery_ref(&self.history_checkpoint_path)
+            } else {
+                Default::default()
+            };
+            if !loaded.is_empty() {
+                log::info!(
+                    "[CKPT] Loaded delivery reference for {} signal(s)",
+                    loaded.len()
+                );
+                self.state.write().await.last_sent_by_signal.extend(loaded);
+            }
+        }
 
         // 6.5 Replay WAL entries not yet captured in the checkpoint (if WAL enabled).
         // record_history dedup guard prevents double-insertion with checkpoint data.
@@ -741,7 +767,12 @@ impl ReliableBleOutput {
                                     entries
                                 );
                                 Self::handle_tlv_subscribe(
-                                    req_id, entries, &state, &server, &registry,
+                                    req_id,
+                                    entries,
+                                    &state,
+                                    &server,
+                                    &registry,
+                                    &last_ack_time,
                                 )
                                 .await;
                             } else {
@@ -765,8 +796,15 @@ impl ReliableBleOutput {
                             req_id,
                             entries
                         );
-                        Self::handle_tlv_subscribe(req_id, entries, &state, &server, &registry)
-                            .await;
+                        Self::handle_tlv_subscribe(
+                            req_id,
+                            entries,
+                            &state,
+                            &server,
+                            &registry,
+                            &last_ack_time,
+                        )
+                        .await;
                     } else {
                         log::warn!(
                             "Subscribe: unrecognized format ({} bytes, byte[0]=0x{:02X}) — \
@@ -1117,13 +1155,26 @@ impl ReliableBleOutput {
     ///
     /// Description: VRConnect shall periodically serialize the history ring buffer to a
     ///              binary checkpoint file using an atomic write (tmp + rename). Runs as a
-    ///              background task; skips the write if history is empty.
+    ///              background task; skips the write if history is empty. Also persists
+    ///              `last_sent_by_signal` to `delivery_ref.json` (next to the checkpoint) when
+    ///              it changed. Limit: ACKed backlog only raises the reference (max), so a
+    ///              backward source-clock jump re-arms only via live frames.
     ///
-    /// Version: V1.0
+    /// Version: V1.1
     async fn checkpoint_task(state: Arc<RwLock<BleSessionState>>, interval_sec: u64, path: String) {
+        let mut last_ref = std::collections::HashMap::new();
         loop {
             tokio::time::sleep(Duration::from_secs(interval_sec)).await;
-            let bytes = state.read().await.serialize_history_to_bytes();
+            let (bytes, delivery_ref) = {
+                let st = state.read().await;
+                (
+                    st.serialize_history_to_bytes(),
+                    st.last_sent_by_signal.clone(),
+                )
+            };
+            if delivery_ref != last_ref && Self::write_delivery_ref(&path, &delivery_ref) {
+                last_ref = delivery_ref;
+            }
             // Header only = 20 bytes — means no signals; skip write
             if bytes.len() <= 20 {
                 continue;
@@ -1139,6 +1190,65 @@ impl ReliableBleOutput {
                 Err(e) => log::warn!("[CKPT] Failed to write checkpoint: {}", e),
             }
         }
+    }
+
+    /// Path of the delivery-reference file, next to the history checkpoint
+    /// (`None` when the checkpoint path is empty = persistence disabled).
+    ///
+    /// ID SRS: SRS-FN-BLERELIABLE-024
+    /// Version: V1.0
+    fn delivery_ref_path(checkpoint_path: &str) -> Option<std::path::PathBuf> {
+        if checkpoint_path.is_empty() {
+            return None;
+        }
+        Some(Path::new(checkpoint_path).with_file_name("delivery_ref.json"))
+    }
+
+    /// ID SRS: SRS-FN-BLERELIABLE-021
+    /// Title: write_delivery_ref
+    ///
+    /// Description: VRConnect shall persist `last_sent_by_signal` (last confirmed delivery
+    ///              t0 per signal) as JSON next to the history checkpoint, atomically
+    ///              (tmp + rename), so the catch-up reference survives a restart.
+    ///
+    /// Version: V1.0
+    fn write_delivery_ref(
+        checkpoint_path: &str,
+        map: &std::collections::HashMap<u16, u64>,
+    ) -> bool {
+        let Some(path) = Self::delivery_ref_path(checkpoint_path) else {
+            return false;
+        };
+        let tmp = path.with_extension("json.tmp");
+        let res = serde_json::to_vec(map)
+            .map_err(|e| e.to_string())
+            .and_then(|b| std::fs::write(&tmp, b).map_err(|e| e.to_string()))
+            .and_then(|_| std::fs::rename(&tmp, &path).map_err(|e| e.to_string()));
+        if let Err(e) = &res {
+            log::warn!("[CKPT] Failed to write delivery_ref: {}", e);
+        }
+        res.is_ok()
+    }
+
+    /// ID SRS: SRS-FN-BLERELIABLE-022
+    /// Title: load_delivery_ref
+    ///
+    /// Description: VRConnect shall load the persisted delivery reference at startup.
+    ///              Missing file, disabled path or corrupt content yields an empty map
+    ///              (corrupt content is logged as a warning).
+    ///
+    /// Version: V1.0
+    fn load_delivery_ref(checkpoint_path: &str) -> std::collections::HashMap<u16, u64> {
+        let Some(path) = Self::delivery_ref_path(checkpoint_path) else {
+            return Default::default();
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Default::default();
+        };
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            log::warn!("[CKPT] Invalid delivery_ref '{}': {}", path.display(), e);
+            Default::default()
+        })
     }
 
     /// ID SRS: SRS-FN-BLERELIABLE-014
@@ -1485,17 +1595,11 @@ impl ReliableBleOutput {
         // Phase A — collect frames from every signal that needs replay.
         // start_replay() reserves the seq block eagerly and pushes frames into tx_buffer (F4),
         // so un-sent frames remain NACK-recoverable even if this loop exits early.
-        struct ReplayBatch {
-            canonical_id: u16,
-            stream_id: u16,
-            mode: u8,
-            frames: Vec<crate::domain::ble_protocol::DataFrame>,
-        }
         let mut batches: Vec<ReplayBatch> = Vec::new();
         for (canonical_id, stream_id, mode, start_time_ms) in &replay_requests {
             let frames = {
                 let mut st = state.write().await;
-                st.start_replay(*canonical_id, *start_time_ms)
+                st.start_replay(*canonical_id, *start_time_ms, 0)
             };
             if frames.is_empty() {
                 log::info!(
@@ -1520,6 +1624,20 @@ impl ReliableBleOutput {
             });
         }
 
+        Self::send_replay_batches(state, server, &batches).await;
+    }
+
+    /// Send collected replay batches (frames already reserved in tx_buffer by start_replay):
+    /// merge by t0, notify on Data_OUT with 20 ms pacing, then finish_replay for every stream.
+    /// Shared by the IDT-strict backlog path and the TLV hourly catch-up.
+    ///
+    /// ID SRS: SRS-FN-BLERELIABLE-020
+    /// Version: V1.0
+    async fn send_replay_batches(
+        state: &Arc<RwLock<BleSessionState>>,
+        server: &Arc<RwLock<GattServer>>,
+        batches: &[ReplayBatch],
+    ) {
         // Phase B — merge frames from all signals and sort by t0_ms.
         // Sorting by timestamp interleaves signals proportionally to their natural rate:
         // a 1 Hz signal contributes ~1 frame/s of history, a 5-min NBP signal contributes
@@ -1559,7 +1677,7 @@ impl ReliableBleOutput {
         // signal B permanently stuck with is_replaying=true.
         {
             let mut st = state.write().await;
-            for batch in &batches {
+            for batch in batches {
                 st.finish_replay(batch.stream_id);
                 if batch.mode == 2 {
                     st.unsubscribe(batch.canonical_id);
@@ -1651,16 +1769,28 @@ impl ReliableBleOutput {
     ///
     /// Registration happens even if the RSP notify fails, as before this change.
     ///
+    /// After registration, streams with `period_ms > 0` and a known delivery reference get a
+    /// downsampled FLAG_BACKLOG catch-up (one value per missed period), always after the RSP.
+    ///
     /// ID SRS: SRS-FN-BLERELIABLE-019
-    /// Version: V2.0
+    /// Version: V2.1
     async fn handle_tlv_subscribe(
         req_id: u16,
         entries: Vec<SubscribeReqEntry>,
         state: &Arc<RwLock<BleSessionState>>,
         server: &Arc<RwLock<GattServer>>,
         registry: &Arc<SignalRegistry>,
+        last_ack_time: &Arc<tokio::sync::Mutex<tokio::time::Instant>>,
     ) {
         let session_id;
+        let catchup = Self::hourly_catchup_enabled();
+        // Highest CATCH-UP t0 already emitted per signal in the CURRENT session (possibly
+        // unACKed): a second SUBSCRIBE in the same session must not resend it. Live frames
+        // are excluded so an unconfirmed live value is still re-sent at once.
+        // A real reconnect (on_disconnect) clears the streams, so this is empty then.
+        let mut prior_sent: std::collections::HashMap<u16, u64> = Default::default();
+        let mut planned_ids: std::collections::HashSet<u16> = Default::default();
+        let mut rsp_ok = false;
         let mut rsp_items: Vec<SubscribeRspItem> = Vec::new();
         // (canonical_id, stream_id, gate_period_ms) — registered only after the RSP is sent.
         let mut planned: Vec<(u16, u16, u32)> = Vec::new();
@@ -1668,6 +1798,9 @@ impl ReliableBleOutput {
         {
             let mut st = state.write().await;
             session_id = st.current_session_id;
+            if catchup {
+                prior_sent = st.backlog_emitted();
+            }
             st.unsubscribe_all();
             for (raw_id, requested_period_ms) in &entries {
                 let canonical_id = match registry.normalize_id(*raw_id) {
@@ -1756,6 +1889,7 @@ impl ReliableBleOutput {
                     e
                 );
             } else {
+                rsp_ok = true;
                 log::info!(
                     "SUBSCRIBE_RSP sent on Data_OUT (req_id={}, {} stream(s), {} bytes)",
                     req_id,
@@ -1775,9 +1909,59 @@ impl ReliableBleOutput {
                 st.current_session_id
             );
         }
+        // Hourly catch-up (opt-in, HOURLY_CATCHUP=true): one backlog value per missed period
+        // since the last confirmed delivery (or the last value already emitted in this
+        // session, if later). No reference (first ever subscription), period 0 or < 60 s,
+        // or a failed RSP -> no replay. Limits: the 6 h history retention caps how far back
+        // this reaches, at most CATCHUP_MAX_FRAMES (most recent) per signal; samples are the
+        // first at/after each period boundary relative to the reference.
+        let mut batches: Vec<ReplayBatch> = Vec::new();
         for (canonical_id, stream_id, gate_period_ms) in planned {
             st.subscribe_with_period(canonical_id, Some(stream_id), gate_period_ms);
+            if !catchup || !rsp_ok || !planned_ids.insert(canonical_id) {
+                continue;
+            }
+            let prior = prior_sent.get(&canonical_id).copied();
+            let Some((since, frames)) =
+                st.catchup_replay(canonical_id, gate_period_ms, prior, CATCHUP_MIN_PERIOD_MS)
+            else {
+                continue;
+            };
+            if !frames.is_empty() {
+                log::info!(
+                    "[backlog] catch-up signal 0x{:04X}: {} frames (period {} ms, since t0 {})",
+                    canonical_id,
+                    frames.len(),
+                    gate_period_ms,
+                    since
+                );
+            }
+            batches.push(ReplayBatch {
+                canonical_id,
+                stream_id,
+                mode: 0,
+                frames,
+            });
         }
+        drop(st);
+        if batches.iter().any(|b| !b.frames.is_empty()) {
+            // Fresh supervision window: a stale last_ack_time must not trigger a stage-1
+            // retransmit on the burst we are about to send.
+            *last_ack_time.lock().await = tokio::time::Instant::now();
+        }
+        // Same send path as the IDT backlog; RSP was already notified above.
+        Self::send_replay_batches(state, server, &batches).await;
+    }
+
+    /// Hourly catch-up kill switch: env `HOURLY_CATCHUP=true` (default false = dev behaviour).
+    ///
+    /// ID SRS: SRS-FN-BLERELIABLE-023
+    /// Version: V1.0
+    fn hourly_catchup_enabled() -> bool {
+        std::env::var("HOURLY_CATCHUP")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false)
     }
 
     /// Extract (signal_id, f32) pairs from ProcessedData for room_index=0.

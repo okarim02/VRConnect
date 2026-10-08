@@ -13,6 +13,9 @@
 //          Isolated from Bluetooth radio for safe unit testing.
 
 use crate::domain::ble_protocol::{DataFrame, FLAG_BACKLOG, FLAG_RETRANSMIT};
+
+/// Max frames of a downsampled catch-up replay per signal (most recent kept).
+const CATCHUP_MAX_FRAMES: usize = 24;
 use std::collections::{HashMap, VecDeque};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -97,14 +100,15 @@ pub struct BleSessionState {
     /// spanning multiple days within the size cap.
     /// Set via with_history_retention(). 0 = age eviction disabled.
     pub max_history_age_ms: u64,
-    /// Per-signal t0_ms of the last live sample CONFIRMED delivered (covered by a real
+    /// Per-signal t0_ms of the last sample CONFIRMED delivered (covered by a real
     /// cumulative ACK — see record_delivery), kept OUTSIDE StreamEntry so it survives
     /// unsubscribe_all() and on_disconnect(). A re-subscribe (the app reconnects every
     /// 10-30 min in the field) seeds the new StreamEntry's last_sent_t0_ms from it, so a
     /// requested period_ms of 1 h stays 1 h instead of restarting the clock on every
     /// reconnect. A value never confirmed does not count, so it is re-sent at once on
-    /// the next subscription. Bounded by the number of signals; not persisted across a
-    /// VRConnect restart.
+    /// the next subscription. ACKed FLAG_BACKLOG (catch-up) frames only raise it.
+    /// Bounded by the number of signals; persisted by ReliableBleOutput's checkpoint task
+    /// (delivery_ref.json).
     pub last_sent_by_signal: HashMap<u16, u64>,
 }
 
@@ -225,8 +229,9 @@ impl BleSessionState {
     /// Title: record_delivery
     ///
     /// Description: VRConnect shall record, per signal, the t0_ms of the newest LIVE frame
-    ///              (not FLAG_BACKLOG) covered by a cumulative ACK (seq ≤ ack_upto), before
-    ///              those frames are purged. This "last confirmed delivery" seeds the
+    ///              covered by a cumulative ACK (seq ≤ ack_upto), before those frames are
+    ///              purged. ACKed FLAG_BACKLOG frames (catch-up replay) only raise the
+    ///              reference, never lower it. This "last confirmed delivery" seeds the
     ///              throttle gate of the next subscription for that signal, so a requested
     ///              period_ms holds across re-subscribes and session resets. Only a real
     ///              ACK counts: emitting a frame, or a new-session ACK clearing tx_buffer,
@@ -243,14 +248,25 @@ impl BleSessionState {
         if ack_upto > entry.last_seq {
             return;
         }
-        let delivered = entry
-            .tx_buffer
-            .iter()
-            .filter(|f| f.header.seq <= ack_upto && f.header.flags & FLAG_BACKLOG == 0)
-            .map(|f| f.t0_ms)
-            .max();
-        if let Some(t0_ms) = delivered {
+        let newest = |backlog: bool| {
+            entry
+                .tx_buffer
+                .iter()
+                .filter(|f| {
+                    f.header.seq <= ack_upto && (f.header.flags & FLAG_BACKLOG != 0) == backlog
+                })
+                .map(|f| f.t0_ms)
+                .max()
+        };
+        // Live frames set the reference as-is (a lower t0 = source clock reset).
+        if let Some(t0_ms) = newest(false) {
             last_sent_by_signal.insert(entry.signal_id, t0_ms);
+        }
+        // ACKed backlog (catch-up / replay) frames only ever move it forward, so the next
+        // catch-up does not resend them.
+        if let Some(t0_ms) = newest(true) {
+            let r = last_sent_by_signal.entry(entry.signal_id).or_insert(t0_ms);
+            *r = (*r).max(t0_ms);
         }
     }
 
@@ -704,6 +720,10 @@ impl BleSessionState {
     /// * `session_id`  - IDT session identifier for the replay frames
     /// * `stream_id`   - IDT stream identifier for the replay frames
     /// * `seq_start`   - Sequence number of the first replay frame
+    /// * `min_gap_ms`  - 0 = full resolution. >0 = downsample: emit a sample only when
+    ///   `t0 - last_emitted >= min_gap_ms` (last_emitted starts at `start_time_ms`), i.e. the
+    ///   same gate as the live throttle; one value per period, first sample at/after each
+    ///   period boundary. Capped to the most recent CATCHUP_MAX_FRAMES frames.
     ///
     /// # Returns
     /// Vec of DataFrames with FLAG_BACKLOG set, in chronological order
@@ -711,6 +731,7 @@ impl BleSessionState {
         &self,
         signal_id: u16,
         start_time_ms: u64,
+        min_gap_ms: u32,
         session_id: u16,
         stream_id: u16,
         seq_start: u32,
@@ -720,12 +741,26 @@ impl BleSessionState {
         };
         let mut frames = Vec::new();
         let mut seq = seq_start;
+        let mut last_emitted = start_time_ms;
         for &(t0_ms, value) in buf.iter() {
             if start_time_ms == 0 || t0_ms >= start_time_ms {
+                if min_gap_ms > 0 {
+                    if t0_ms.saturating_sub(last_emitted) < min_gap_ms as u64 {
+                        continue;
+                    }
+                    last_emitted = t0_ms;
+                }
                 let mut frame = DataFrame::new(session_id, stream_id, seq, t0_ms, value);
                 frame.header.flags |= FLAG_BACKLOG;
                 frames.push(frame);
                 seq = seq.wrapping_add(1);
+            }
+        }
+        // Catch-up cap: keep the most recent CATCHUP_MAX_FRAMES, renumber seqs.
+        if min_gap_ms > 0 && frames.len() > CATCHUP_MAX_FRAMES {
+            frames.drain(..frames.len() - CATCHUP_MAX_FRAMES);
+            for (i, f) in frames.iter_mut().enumerate() {
+                f.header.seq = seq_start.wrapping_add(i as u32);
             }
         }
         frames
@@ -761,11 +796,20 @@ impl BleSessionState {
     /// # Arguments
     /// * `signal_id`     - IDT signal identifier
     /// * `start_time_ms` - Replay start (epoch ms); 0 = replay all history
+    /// * `min_gap_ms`    - 0 = full resolution; >0 = one sample per period (see
+    ///   get_replay_frames). Catch-up mode: the live gate (`last_sent_t0_ms`) is also moved
+    ///   to the last replayed t0 so the next live value comes one period later.
+    ///   Limit: history retention (6 h) caps how far back a catch-up can reach.
     ///
     /// # Returns
     /// Vec of replay DataFrames (FLAG_BACKLOG set).  Empty if signal not subscribed
     /// or no history available.
-    pub fn start_replay(&mut self, signal_id: u16, start_time_ms: u64) -> Vec<DataFrame> {
+    pub fn start_replay(
+        &mut self,
+        signal_id: u16,
+        start_time_ms: u64,
+        min_gap_ms: u32,
+    ) -> Vec<DataFrame> {
         let stream_id = match self.signal_to_stream.get(&signal_id).copied() {
             Some(id) => id,
             None => return vec![],
@@ -782,12 +826,23 @@ impl BleSessionState {
 
         // `entry`'s mutable borrow ends here (NLL: last use was the line above) — no
         // explicit drop needed before get_replay_frames() takes an immutable &self borrow.
-        let frames =
-            self.get_replay_frames(signal_id, start_time_ms, session_id, stream_id, seq_start);
+        let frames = self.get_replay_frames(
+            signal_id,
+            start_time_ms,
+            min_gap_ms,
+            session_id,
+            stream_id,
+            seq_start,
+        );
 
         if let Some(entry) = self.streams.get_mut(&stream_id) {
             // [F5] Reserve the seq block eagerly so concurrent live frames get seq AFTER it.
             entry.last_seq = entry.last_seq.wrapping_add(frames.len() as u32);
+            if min_gap_ms > 0 {
+                if let Some(last) = frames.last() {
+                    entry.last_sent_t0_ms = Some(last.t0_ms);
+                }
+            }
             // [F4] Keep replay frames in tx_buffer for NACK recovery (bounded; silent eviction).
             for frame in &frames {
                 entry.tx_buffer.push_back(frame.clone());
@@ -798,6 +853,67 @@ impl BleSessionState {
         }
 
         frames
+    }
+
+    /// ID SRS: SRS-FN-BLESESSION-029
+    /// Title: backlog_emitted
+    ///
+    /// Description: VRConnect shall return, per signal, the highest t0 of FLAG_BACKLOG frames
+    ///              still held in the stream tx_buffers (catch-up already sent in this
+    ///              session, possibly unACKed). Live frames are deliberately excluded: an
+    ///              unconfirmed live value must be re-sent at once on the next subscription.
+    ///
+    /// Version: V1.0
+    pub fn backlog_emitted(&self) -> HashMap<u16, u64> {
+        self.streams
+            .values()
+            .filter_map(|e| {
+                e.tx_buffer
+                    .iter()
+                    .filter(|f| f.header.flags & FLAG_BACKLOG != 0)
+                    .map(|f| f.t0_ms)
+                    .max()
+                    .map(|t| (e.signal_id, t))
+            })
+            .collect()
+    }
+
+    /// ID SRS: SRS-FN-BLESESSION-028
+    /// Title: catchup_replay
+    ///
+    /// Description: VRConnect shall build the downsampled catch-up for a freshly registered
+    ///              stream: since = max(last confirmed delivery, `prior_sent` = highest
+    ///              catch-up (backlog) t0 already emitted for the signal in the same session). None when neither
+    ///              exists (first ever subscription, no replay). The live gate is seeded from
+    ///              `since` so a repeated SUBSCRIBE in the same session resends nothing and
+    ///              the next live value is one period later. Period 0 or below
+    ///              `min_period_ms` seeds the gate but replays nothing.
+    ///
+    /// Version: V1.0
+    ///
+    /// # Returns
+    /// Some((since, frames)) - frames may be empty; None when there is no reference
+    pub fn catchup_replay(
+        &mut self,
+        signal_id: u16,
+        period_ms: u32,
+        prior_sent: Option<u64>,
+        min_period_ms: u32,
+    ) -> Option<(u64, Vec<DataFrame>)> {
+        let since = self
+            .last_sent_by_signal
+            .get(&signal_id)
+            .copied()
+            .into_iter()
+            .chain(prior_sent)
+            .max()?;
+        let stream_id = *self.signal_to_stream.get(&signal_id)?;
+        let entry = self.streams.get_mut(&stream_id)?;
+        entry.last_sent_t0_ms = entry.last_sent_t0_ms.max(Some(since));
+        if period_ms == 0 || period_ms < min_period_ms {
+            return Some((since, vec![]));
+        }
+        Some((since, self.start_replay(signal_id, since, period_ms)))
     }
 
     /// ID SRS: SRS-FN-BLESESSION-016

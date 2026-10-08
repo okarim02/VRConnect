@@ -275,7 +275,7 @@ fn test_throttled_stream_keeps_full_resolution_in_history_and_replay() {
         "live BLE stream: only t0=0 and t0=5000 pass the gate"
     );
 
-    let replay = session.get_replay_frames(SignalId::HR.as_u16(), 0, 1, 1, 1);
+    let replay = session.get_replay_frames(SignalId::HR.as_u16(), 0, 0, 1, 1, 1);
     assert_eq!(
         replay.len(),
         6,
@@ -1190,7 +1190,7 @@ fn test_start_replay_reserves_seq_block() {
     session.record_history(SignalId::HR.as_u16(), 71.0, 2000);
     session.record_history(SignalId::HR.as_u16(), 72.0, 3000);
 
-    let frames = session.start_replay(SignalId::HR.as_u16(), 0);
+    let frames = session.start_replay(SignalId::HR.as_u16(), 0, 0);
     assert_eq!(frames.len(), 3);
     // Replay frames occupy seq 1, 2, 3
     assert_eq!(frames[0].header.seq, 1);
@@ -1234,7 +1234,7 @@ fn test_start_replay_frames_in_tx_buffer() {
     session.record_history(SignalId::HR.as_u16(), 71.0, 2000);
     session.record_history(SignalId::HR.as_u16(), 72.0, 3000);
 
-    let frames = session.start_replay(SignalId::HR.as_u16(), 0);
+    let frames = session.start_replay(SignalId::HR.as_u16(), 0, 0);
     assert_eq!(frames.len(), 3);
 
     // F4: all replay frames must be in the retransmit buffer immediately after start_replay
@@ -1533,11 +1533,11 @@ fn test_unthrottled_deliveries_update_cadence() {
 }
 
 /// ID SRS: SRS-TEST-BLESESSION-059
-/// Title: pending backlog-replay frames neither reset nor advance the live cadence
+/// Title: pending backlog frames do not move the reference; ACKed ones only raise it
 ///
-/// Description: Replay (FLAG_BACKLOG) frames are not live deliveries. With the last live
-///              sample ACKed and replay frames still pending, a re-subscribe shall keep the
-///              live cadence (no early extra live sample).
+/// Description: Pending replay (FLAG_BACKLOG) frames are not deliveries: a re-subscribe keeps
+///              the live cadence. Once ACKed they raise the reference via max (never lower
+///              it), so the next catch-up does not resend them.
 ///
 /// Version: V1.0
 #[test]
@@ -1546,7 +1546,7 @@ fn test_pending_replay_frames_do_not_affect_cadence() {
     let mut s = hr_hourly_delivered();
     s.record_history(hr, 60.0, 2_000_000);
     s.record_history(hr, 61.0, 3_000_000);
-    let replay = s.start_replay(hr, 0);
+    let replay = s.start_replay(hr, 0, 0);
     assert!(!replay.is_empty());
     assert!(s.total_pending() > 0, "replay frames pending");
     s.unsubscribe_all();
@@ -1561,10 +1561,11 @@ fn test_pending_replay_frames_do_not_affect_cadence() {
     let mut s = hr_hourly_delivered();
     s.record_history(hr, 60.0, 2_000_000);
     s.record_history(hr, 61.0, 3_000_000);
-    let replay = s.start_replay(hr, 0);
+    let replay = s.start_replay(hr, 0, 0);
     let last_seq = replay.last().unwrap().header.seq;
     let session = s.current_session_id;
     s.handle_ack(session, 1, last_seq);
+    assert_eq!(s.last_sent_by_signal[&hr], 3_000_000);
     s.unsubscribe_all();
     s.subscribe_with_period(hr, Some(1), 3_600_000);
     assert!(
@@ -1616,7 +1617,7 @@ fn test_start_replay_tx_buffer_bounded_for_large_backlog() {
     session.record_history(SignalId::HR.as_u16(), 71.0, 2000);
     session.record_history(SignalId::HR.as_u16(), 72.0, 3000);
 
-    let frames = session.start_replay(SignalId::HR.as_u16(), 0);
+    let frames = session.start_replay(SignalId::HR.as_u16(), 0, 0);
     assert_eq!(frames.len(), 3, "all 3 frames are returned for sending");
 
     // tx_buffer capped at 2 → only the newest 2 (seq 2, 3) retained
@@ -1629,4 +1630,192 @@ fn test_start_replay_tx_buffer_bounded_for_large_backlog() {
     );
     assert_eq!(entry.tx_buffer.front().unwrap().header.seq, 2);
     assert_eq!(entry.tx_buffer.back().unwrap().header.seq, 3);
+}
+
+// ── Hourly catch-up replay (downsampled backlog) ──────────────────────────
+
+const CU_BASE: u64 = 1_000_000;
+const CU_HOUR: u32 = 3_600_000;
+
+/// Helper: 3 h of 1 Hz HR history starting at CU_BASE, last confirmed delivery = CU_BASE,
+/// re-subscribed hourly. Returns the session and the catch-up frames.
+fn cu_session_with_catchup() -> (BleSessionState, Vec<DataFrame>) {
+    let hr = SignalId::HR.as_u16();
+    let mut s = BleSessionState::new(1);
+    for i in 0..=10_800u64 {
+        s.record_history(hr, 60.0 + (i % 10) as f32, CU_BASE + i * 1000);
+    }
+    s.last_sent_by_signal.insert(hr, CU_BASE);
+    s.subscribe_with_period(hr, Some(1), CU_HOUR);
+    let frames = s.start_replay(hr, CU_BASE, CU_HOUR);
+    (s, frames)
+}
+
+/// ID SRS: SRS-TEST-BLESESSION-063
+/// Title: catch-up replay keeps one sample per missed period
+///
+/// Description: 3 h of 1 Hz history, reference = start, period 1 h → exactly 3 FLAG_BACKLOG
+///              frames at +1 h, +2 h, +3 h with consecutive seqs; period 0 = full resolution.
+///
+/// Version: V1.0
+#[test]
+fn test_catchup_replay_downsamples_to_one_per_period() {
+    let (s, frames) = cu_session_with_catchup();
+    let t0s: Vec<u64> = frames.iter().map(|f| f.t0_ms).collect();
+    let h = CU_HOUR as u64;
+    assert_eq!(t0s, vec![CU_BASE + h, CU_BASE + 2 * h, CU_BASE + 3 * h]);
+    assert!(frames.iter().all(|f| f.header.flags & FLAG_BACKLOG != 0));
+    let seqs: Vec<u32> = frames.iter().map(|f| f.header.seq).collect();
+    assert_eq!(seqs, vec![1, 2, 3]);
+    assert_eq!(s.streams.get(&1).unwrap().last_seq, 3, "seq block reserved");
+
+    let hr = SignalId::HR.as_u16();
+    let full = s.get_replay_frames(hr, CU_BASE, 0, 1, 1, 1);
+    assert_eq!(full.len(), 10_801, "min_gap 0 keeps full resolution");
+}
+
+/// ID SRS: SRS-TEST-BLESESSION-064
+/// Title: no delivery reference means no catch-up gate input
+///
+/// Description: Without a reference the caller (handle_tlv_subscribe) must not replay; the
+///              session exposes this as an absent last_sent_by_signal entry, so a fresh
+///              subscription starts live-only with an empty gate.
+///
+/// Version: V1.0
+#[test]
+fn test_catchup_without_reference_is_not_requested() {
+    let hr = SignalId::HR.as_u16();
+    let mut s = BleSessionState::new(1);
+    for i in 0..100u64 {
+        s.record_history(hr, 70.0, CU_BASE + i * 1000);
+    }
+    s.subscribe_with_period(hr, Some(1), CU_HOUR);
+    assert!(!s.last_sent_by_signal.contains_key(&hr));
+    assert!(s.streams.get(&1).unwrap().last_sent_t0_ms.is_none());
+    assert_eq!(s.total_pending(), 0, "nothing queued without a reference");
+}
+
+/// ID SRS: SRS-TEST-BLESESSION-065
+/// Title: ACKed catch-up frames advance the reference; no second catch-up
+///
+/// Description: After the catch-up frames are cumulatively ACKed, the reference moves to
+///              the last replayed t0 (backlog ACKs only raise it) and a re-subscribe
+///              produces 0 catch-up frames. Unacked catch-up would be resent.
+///
+/// Version: V1.0
+#[test]
+fn test_catchup_acked_not_resent_on_next_resubscribe() {
+    let hr = SignalId::HR.as_u16();
+    let h = CU_HOUR as u64;
+
+    // Unacked: next re-subscribe repeats the catch-up.
+    let (mut s, _) = cu_session_with_catchup();
+    s.unsubscribe_all();
+    s.subscribe_with_period(hr, Some(1), CU_HOUR);
+    assert_eq!(s.start_replay(hr, CU_BASE, CU_HOUR).len(), 3);
+
+    // Acked: reference advances, nothing left to catch up.
+    let (mut s, _) = cu_session_with_catchup();
+    let session = s.current_session_id;
+    s.handle_ack(session, 1, 3);
+    assert_eq!(s.last_sent_by_signal.get(&hr), Some(&(CU_BASE + 3 * h)));
+    s.unsubscribe_all();
+    s.subscribe_with_period(hr, Some(1), CU_HOUR);
+    let since = s.last_sent_by_signal[&hr];
+    assert!(s.start_replay(hr, since, CU_HOUR).is_empty());
+}
+
+/// ID SRS: SRS-TEST-BLESESSION-066
+/// Title: live gate continues from the last replayed sample
+///
+/// Description: After catch-up the live throttle measures the period from the last replayed
+///              t0, so the sample being emitted live is not a duplicate of the backlog.
+///
+/// Version: V1.0
+#[test]
+fn test_catchup_live_gate_continues_from_last_replayed() {
+    let hr = SignalId::HR.as_u16();
+    let (mut s, frames) = cu_session_with_catchup();
+    let last = frames.last().unwrap().t0_ms;
+    assert_eq!(s.streams.get(&1).unwrap().last_sent_t0_ms, Some(last));
+    assert!(s.add_data(hr, 70.0, last + 1000).is_none(), "same period");
+    assert!(s.add_data(hr, 71.0, last + 600_000).is_none());
+    let live = s.add_data(hr, 72.0, last + CU_HOUR as u64).unwrap();
+    assert_eq!(live.header.flags & FLAG_BACKLOG, 0);
+    assert_eq!(live.header.seq, 4, "live seq follows the reserved block");
+}
+
+/// ID SRS: SRS-TEST-BLESESSION-067
+/// Title: catch-up is capped to the most recent frames with contiguous seqs
+///
+/// Description: 2 h of 1 Hz history at a 60 s period would give 120 frames; only the newest
+///              24 are returned, numbered seq_start.. contiguously.
+///
+/// Version: V1.0
+#[test]
+fn test_catchup_capped_to_most_recent_frames() {
+    let hr = SignalId::HR.as_u16();
+    let mut s = BleSessionState::new(1);
+    for i in 0..=7_200u64 {
+        s.record_history(hr, 60.0, CU_BASE + i * 1000);
+    }
+    let f = s.get_replay_frames(hr, CU_BASE, 60_000, 1, 1, 5);
+    assert_eq!(f.len(), 24);
+    assert_eq!(f.last().unwrap().t0_ms, CU_BASE + 7_200_000);
+    assert_eq!(f[0].header.seq, 5);
+    assert_eq!(f[23].header.seq, 28);
+}
+
+/// ID SRS: SRS-TEST-BLESESSION-068
+/// Title: second subscribe in the same session resends no catch-up
+///
+/// Description: SUB1 produces 3 catch-up frames (unACKed); SUB2 (unsubscribe_all +
+///              re-register, prior = stream's last_sent_t0_ms) produces 0 frames and no
+///              duplicate t0. A real reconnect (on_disconnect, no prior) resends from the
+///              confirmed reference. No reference at all -> None.
+///
+/// Version: V1.0
+#[test]
+fn test_catchup_second_subscribe_same_session_is_empty() {
+    let hr = SignalId::HR.as_u16();
+    let (mut s, frames) = cu_session_with_catchup();
+    assert_eq!(frames.len(), 3);
+    let prior = s.backlog_emitted().get(&hr).copied();
+    assert_eq!(prior, Some(CU_BASE + 3 * CU_HOUR as u64));
+    s.unsubscribe_all();
+    s.subscribe_with_period(hr, Some(1), CU_HOUR);
+    let (_, f2) = s.catchup_replay(hr, CU_HOUR, prior, 60_000).unwrap();
+    assert!(f2.is_empty(), "no duplicate catch-up in the same session");
+
+    // An unACKed LIVE frame is not a catch-up emission: after a same-session re-subscribe
+    // it is re-sent at once (gate seeded from the confirmed reference only).
+    let (mut s2, _) = cu_session_with_catchup();
+    let live_t0 = CU_BASE + 3 * CU_HOUR as u64 + CU_HOUR as u64;
+    assert!(s2.add_data(hr, 70.0, live_t0).is_some());
+    let prior2 = s2.backlog_emitted().get(&hr).copied();
+    s2.unsubscribe_all();
+    s2.subscribe_with_period(hr, Some(1), CU_HOUR);
+    s2.catchup_replay(hr, CU_HOUR, prior2, 60_000).unwrap();
+    assert!(
+        s2.add_data(hr, 71.0, live_t0).is_some(),
+        "unconfirmed live value re-sent immediately"
+    );
+
+    // Real reconnect: streams gone, only the confirmed reference remains.
+    s.on_disconnect();
+    s.subscribe_with_period(hr, Some(1), CU_HOUR);
+    let (_, f3) = s.catchup_replay(hr, CU_HOUR, None, 60_000).unwrap();
+    assert_eq!(f3.len(), 3);
+
+    // Too-short period: nothing replayed. No reference: None.
+    s.unsubscribe_all();
+    s.subscribe_with_period(hr, Some(1), 1000);
+    assert!(s
+        .catchup_replay(hr, 1000, None, 60_000)
+        .unwrap()
+        .1
+        .is_empty());
+    let mut fresh = BleSessionState::new(1);
+    fresh.subscribe_with_period(hr, Some(1), CU_HOUR);
+    assert!(fresh.catchup_replay(hr, CU_HOUR, None, 60_000).is_none());
 }

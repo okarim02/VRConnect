@@ -6,6 +6,7 @@ use crate::domain::ble_protocol::{
 };
 use crate::domain::{ProcessedRoom, ProcessedTrack, TrackType};
 use chrono::Utc;
+use serial_test::serial;
 use tempfile;
 
 /// Helper: create a test ProcessedTrack
@@ -754,7 +755,7 @@ async fn test_start_and_finish_replay_flag_lifecycle() {
         st.subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
 
         // Trigger replay (start_time_ms=0 → all history)
-        let frames = st.start_replay(SignalId::HR.as_u16(), 0);
+        let frames = st.start_replay(SignalId::HR.as_u16(), 0, 0);
         assert_eq!(frames.len(), 3, "all 3 history samples must be replayed");
         for f in &frames {
             assert_ne!(
@@ -811,8 +812,8 @@ async fn test_replay_interleaves_signals_by_timestamp() {
     st.subscribe_with_stream_id(SignalId::HR.as_u16(), 1);
     st.subscribe_with_stream_id(SignalId::SpO2.as_u16(), 2);
 
-    let hr_frames = st.start_replay(SignalId::HR.as_u16(), 0);
-    let spo2_frames = st.start_replay(SignalId::SpO2.as_u16(), 0);
+    let hr_frames = st.start_replay(SignalId::HR.as_u16(), 0, 0);
+    let spo2_frames = st.start_replay(SignalId::SpO2.as_u16(), 0, 0);
 
     assert_eq!(hr_frames.len(), 3);
     assert_eq!(spo2_frames.len(), 3);
@@ -1854,6 +1855,7 @@ async fn test_tlv_subscribe_rsp_precedes_any_data_frame_for_any_period() {
                     &state,
                     &unstarted_server(),
                     &registry,
+                    &Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
                 )
                 .await;
             }
@@ -2942,4 +2944,60 @@ fn test_period_ms_round_trip_on_real_flutter_capture() {
             .any(|w| w == temp_nominal_tlv.as_slice()),
         "RSP must encode tag 0x04 = 2000 (LE) for the unthrottled Temperature stream"
     );
+}
+
+// ── delivery_ref persistence ──────────────────────────────────────────────
+
+/// ID SRS: SRS-TEST-BLERELIABLE-065
+/// Title: delivery_ref round-trip, missing, corrupt and disabled path
+///
+/// Description: write_delivery_ref/load_delivery_ref shall round-trip last_sent_by_signal
+///              next to the checkpoint; missing, corrupt or disabled ("") yield an empty map.
+///
+/// Version: V1.0
+#[test]
+fn test_delivery_ref_roundtrip_and_failures() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let ckpt = dir.join("history_checkpoint.bin");
+    let ckpt = ckpt.to_str().unwrap();
+
+    assert!(
+        ReliableBleOutput::load_delivery_ref(ckpt).is_empty(),
+        "missing"
+    );
+
+    let map: std::collections::HashMap<u16, u64> = [(0x0101, 123_456), (0x0201, 9)].into();
+    assert!(ReliableBleOutput::write_delivery_ref(ckpt, &map));
+    assert_eq!(ReliableBleOutput::load_delivery_ref(ckpt), map);
+
+    std::fs::write(dir.join("delivery_ref.json"), b"{not json").unwrap();
+    assert!(
+        ReliableBleOutput::load_delivery_ref(ckpt).is_empty(),
+        "corrupt"
+    );
+
+    assert!(!ReliableBleOutput::write_delivery_ref("", &map));
+    assert!(
+        ReliableBleOutput::load_delivery_ref("").is_empty(),
+        "disabled"
+    );
+}
+
+/// ID SRS: SRS-TEST-BLERELIABLE-066
+/// Title: HOURLY_CATCHUP kill switch defaults to off
+///
+/// Description: hourly_catchup_enabled is false when unset or invalid, true only for "true".
+///
+/// Version: V1.0
+#[test]
+#[serial]
+fn test_hourly_catchup_flag() {
+    std::env::remove_var("HOURLY_CATCHUP");
+    assert!(!ReliableBleOutput::hourly_catchup_enabled());
+    std::env::set_var("HOURLY_CATCHUP", "garbage");
+    assert!(!ReliableBleOutput::hourly_catchup_enabled());
+    std::env::set_var("HOURLY_CATCHUP", "true");
+    assert!(ReliableBleOutput::hourly_catchup_enabled());
+    std::env::remove_var("HOURLY_CATCHUP");
 }
