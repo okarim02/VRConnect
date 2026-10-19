@@ -1,0 +1,13 @@
+# GitLab Pages: the job must be named "pages" and publish the public/ folder.
+# --strict fails the build on broken links between docs pages.
+pages:
+  image: python:3.12-slim
+  script:
+    - pip install --no-cache-dir mkdocs-material==9.5.39
+    - mkdocs build --strict --site-dir public
+  artifacts:
+    paths:
+      - public
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: [docs/**/*, mkdocs.yml, .gitlab-ci.yml]

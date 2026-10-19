@@ -158,4 +158,3 @@ tools/__pycache__/ble_central_test.cpython-312.pyc
 tools/__pycache__/sio_feeder.cpython-312.pyc
 tools/__pycache__/zero_loss_diff.cpython-312.pyc
 dist/
-tools/package.ps1

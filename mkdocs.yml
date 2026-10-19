@@ -1,0 +1,27 @@
+site_name: VRConnect
+site_description: Developer documentation of VRConnect (GATE), the Alison++ BLE middleware
+# ponytail: no site_url, links stay relative so the site works under any Pages path;
+# set it once the pages.mypredi.fr URL format is confirmed (needed for sitemap/404 page).
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - tables
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+nav:
+  - Home: index.md
+  - Build & test: build.md
+  - Configuration: configuration.md
+  - BLE protocol: ble-protocol.md
+  - Health monitoring: health.md
