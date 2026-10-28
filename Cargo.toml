@@ -1,6 +1,6 @@
 [package]
 name = "vrconnect"
-version = "1.0.0"
+version = "2.2.0"
 edition = "2021"
 authors = ["UTBM Team"]
 description = "Medical middleware for real-time vital data processing"
