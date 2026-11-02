@@ -3001,3 +3001,29 @@ fn test_hourly_catchup_flag() {
     assert!(ReliableBleOutput::hourly_catchup_enabled());
     std::env::remove_var("HOURLY_CATCHUP");
 }
+
+/// ID SRS: SRS-TEST-BLERELIABLE-067
+/// Title: ecareTag comes from OUTPUT_BLE_ECARE_TAG, else the hostname
+///
+/// Description: ecare_tag returns the trimmed env value when set, and falls back to
+///              COMPUTERNAME when unset or blank.
+///
+/// Version: V1.0
+#[test]
+#[serial]
+fn test_ecare_tag_env_then_hostname() {
+    let saved_host = std::env::var("COMPUTERNAME").ok();
+    std::env::set_var("COMPUTERNAME", "CHU-REA-PC042");
+
+    std::env::set_var("OUTPUT_BLE_ECARE_TAG", "  ROOM-12-BOX  ");
+    assert_eq!(ReliableBleOutput::ecare_tag(), "ROOM-12-BOX");
+    std::env::set_var("OUTPUT_BLE_ECARE_TAG", "   ");
+    assert_eq!(ReliableBleOutput::ecare_tag(), "CHU-REA-PC042");
+    std::env::remove_var("OUTPUT_BLE_ECARE_TAG");
+    assert_eq!(ReliableBleOutput::ecare_tag(), "CHU-REA-PC042");
+
+    match saved_host {
+        Some(h) => std::env::set_var("COMPUTERNAME", h),
+        None => std::env::remove_var("COMPUTERNAME"),
+    }
+}

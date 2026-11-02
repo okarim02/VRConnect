@@ -14,6 +14,7 @@
 // - Subscribe   (0x90af): Write  - SUBSCRIBE_REQ (IDT) from the Central
 // - Control     (0x90b0): Notify - (legacy / reserved)
 // - Unsubscribe (0x90b1): Write  - SUBSCRIBE_REQ with op=UNSUBSCRIBE, or legacy 2b fallback
+// - Identity    (0x90b2): Read   - ecareTag (UTF-8), lets a tablet pick the right MiniPC (I-25)
 
 use crate::domain::ble_protocol::{
     has_idt_magic, parse_idt_wrapped_tlv_subscribe_req, parse_tlv_subscribe_req, AckFrame, Catalog,
@@ -128,6 +129,7 @@ const DATA_OUT_UUID_SUFFIX: &str = "90ad";
 const SUBSCRIBE_UUID_SUFFIX: &str = "90af";
 const CONTROL_UUID_SUFFIX: &str = "90b0";
 const UNSUBSCRIBE_UUID_SUFFIX: &str = "90b1";
+const IDENTITY_UUID_SUFFIX: &str = "90b2";
 
 impl ReliableBleOutput {
     /// ID SRS: SRS-FN-BLERELIABLE-001
@@ -167,6 +169,7 @@ impl ReliableBleOutput {
         let subscribe_uuid = Self::build_char_uuid(&base_uuid, SUBSCRIBE_UUID_SUFFIX)?;
         let control_uuid = Self::build_char_uuid(&base_uuid, CONTROL_UUID_SUFFIX)?;
         let unsubscribe_uuid = Self::build_char_uuid(&base_uuid, UNSUBSCRIBE_UUID_SUFFIX)?;
+        let identity_uuid = Self::build_char_uuid(&base_uuid, IDENTITY_UUID_SUFFIX)?;
 
         log::info!("Reliable BLE Output Configuration:");
         log::info!("  Device Name: {}", device_name);
@@ -216,6 +219,9 @@ impl ReliableBleOutput {
             "  Characteristic: Unsubscribe (Write) -> {}",
             unsubscribe_uuid
         );
+
+        server.add_characteristic("Identity", identity_uuid, &[CharProperty::Read]);
+        log::info!("  Characteristic: Identity (Read)     -> {}", identity_uuid);
 
         let registry = Arc::new(registry.unwrap_or_else(SignalRegistry::with_defaults));
         let catalog = registry.build_catalog();
@@ -359,6 +365,9 @@ impl ReliableBleOutput {
         {
             let mut server = self.server.write().await;
             server.set_read_value("Catalog", catalog_bytes);
+            let tag = Self::ecare_tag();
+            log::info!("ecareTag served on Identity: {}", tag);
+            server.set_read_value("Identity", tag.into_bytes());
         }
 
         // write_handler_loop updates self.last_ack_time on every ACK received;
@@ -1951,6 +1960,26 @@ impl ReliableBleOutput {
         }
         // Same send path as the IDT backlog; RSP was already notified above.
         Self::send_replay_batches(state, server, &batches).await;
+    }
+
+    /// ecareTag served on the Identity characteristic: env `OUTPUT_BLE_ECARE_TAG` (frozen by
+    /// Install.ps1 at first install), else `COMPUTERNAME` with a warning (not frozen).
+    ///
+    /// ID SRS: SRS-FN-BLERELIABLE-025
+    /// Version: V1.0
+    fn ecare_tag() -> String {
+        match std::env::var("OUTPUT_BLE_ECARE_TAG") {
+            Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+            _ => {
+                let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "UNKNOWN".to_string());
+                log::warn!(
+                    "OUTPUT_BLE_ECARE_TAG not set — serving hostname '{}' as ecareTag \
+                     (not frozen: a PC rename changes it; run Install.ps1 to freeze)",
+                    host
+                );
+                host
+            }
+        }
     }
 
     /// Hourly catch-up kill switch: env `HOURLY_CATCHUP=true` (default false = dev behaviour).
