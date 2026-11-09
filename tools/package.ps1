@@ -16,6 +16,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Resolve ..\ segments: the Substring() relative-path math below compares against
+# Get-ChildItem's resolved FullName.
+$SourceDeploy = (Resolve-Path $SourceDeploy).Path
 $ProjectRoot = Split-Path $PSScriptRoot -Parent
 $ReleaseBin  = Join-Path $ProjectRoot "target\release\vrconnect.exe"
 
