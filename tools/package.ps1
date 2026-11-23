@@ -78,8 +78,7 @@ Write-Host "[3/4] Copying deployment files..." -ForegroundColor Cyan
 Copy-Item $ReleaseBin (Join-Path $stagingDir "vrconnect.exe")
 Write-Host "  + vrconnect.exe ($exeSizeMB MB)" -ForegroundColor DarkGray
 
-# Root scripts (AGENTS.md/CLAUDE.md are AI-agent memory files -- internal dev
-# tooling, never shipped to a deployment target)
+# Root scripts only (dev-only files are never shipped to a deployment target)
 foreach ($f in @("Install.ps1", "Setup.bat", "Stop.bat")) {
     $src = Join-Path $SourceDeploy $f
     if (Test-Path $src) {

@@ -142,11 +142,6 @@ rust-project.json
 
 # Backup de systemd (si copié localement)
 *.service.bak
-# AI agent config — personal overrides only (shared files are tracked)
-CLAUDE.local.md
-
-.agents
-.claude
 AGENTS.local.md
 scripts/deploy.ps1
 tools/ble_central_test.py
