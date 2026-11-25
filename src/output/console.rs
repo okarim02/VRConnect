@@ -99,15 +99,16 @@ impl ConsoleOutput {
     /// Title: send
     ///
     /// Description: VRConnect shall enqueue formatted console text without
-    /// blocking, dropping it when the queue is full and warning every 100 drops.
+    /// blocking, dropping it when the queue is full and warning on the first
+    /// drop then every 100 drops.
     ///
-    /// Version: V1.0
+    /// Version: V1.1
     fn send(&self, out: String) {
         // ponytail: drop-on-full (console is best-effort, BLE/file must never wait);
         // keep-latest ring buffer if operators ever need gap-free console.
         if self.tx.try_send(out).is_err() {
             let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-            if n.is_multiple_of(100) {
+            if n == 1 || n.is_multiple_of(100) {
                 log::warn!("console output blocked/full: {} messages dropped", n);
             }
         }
