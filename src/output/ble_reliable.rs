@@ -1179,7 +1179,7 @@ impl ReliableBleOutput {
             if bytes.len() <= 20 {
                 continue;
             }
-            let tmp_path = format!("{}.tmp", path);
+            let tmp_path = Self::checkpoint_tmp_path(&path, "ckpt");
             match std::fs::write(&tmp_path, &bytes) {
                 Ok(_) => match std::fs::rename(&tmp_path, &path) {
                     Ok(_) => {
@@ -1190,6 +1190,16 @@ impl ReliableBleOutput {
                 Err(e) => log::warn!("[CKPT] Failed to write checkpoint: {}", e),
             }
         }
+    }
+
+    /// Per-writer tmp path for the atomic checkpoint write (`{path}.{tag}.tmp`).
+    /// checkpoint_task and WAL compaction must not share one tmp file, else a
+    /// concurrent rename fails / swaps a half-written file [I-23].
+    ///
+    /// ID SRS: SRS-FN-BLERELIABLE-025
+    /// Version: V1.0
+    fn checkpoint_tmp_path(path: &str, tag: &str) -> String {
+        format!("{}.{}.tmp", path, tag)
     }
 
     /// Path of the delivery-reference file, next to the history checkpoint
@@ -1333,7 +1343,7 @@ impl ReliableBleOutput {
 
                     // 3. Write checkpoint (same atomic pattern as checkpoint_task).
                     if bytes.len() > 20 {
-                        let tmp_path = format!("{}.tmp", checkpoint_path);
+                        let tmp_path = Self::checkpoint_tmp_path(&checkpoint_path, "wal");
                         match std::fs::write(&tmp_path, &bytes) {
                             Ok(_) => match std::fs::rename(&tmp_path, &checkpoint_path) {
                                 Ok(_) => log::info!(

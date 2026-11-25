@@ -3001,3 +3001,22 @@ fn test_hourly_catchup_flag() {
     assert!(ReliableBleOutput::hourly_catchup_enabled());
     std::env::remove_var("HOURLY_CATCHUP");
 }
+
+/// I-23: checkpoint_task and WAL compaction interleaved write/rename must both succeed.
+///
+/// ID SRS: SRS-TEST-BLERELIABLE-067
+/// Version: V1.0
+#[test]
+fn test_checkpoint_tmp_paths_distinct_interleave() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("history_checkpoint.bin");
+    let path = path.to_str().unwrap();
+    let a = ReliableBleOutput::checkpoint_tmp_path(path, "ckpt");
+    let b = ReliableBleOutput::checkpoint_tmp_path(path, "wal");
+    assert_ne!(a, b);
+    std::fs::write(&a, b"A").unwrap();
+    std::fs::write(&b, b"B").unwrap();
+    std::fs::rename(&b, path).unwrap();
+    std::fs::rename(&a, path).expect("ckpt rename must not lose its tmp to wal");
+    assert_eq!(std::fs::read(path).unwrap(), b"A");
+}
