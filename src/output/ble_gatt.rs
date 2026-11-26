@@ -24,7 +24,7 @@ use windows::{
         BluetoothError,
         GenericAttributeProfile::{
             GattCharacteristicProperties, GattLocalCharacteristic,
-            GattLocalCharacteristicParameters, GattServiceProvider,
+            GattLocalCharacteristicParameters, GattLocalService, GattServiceProvider,
             GattServiceProviderAdvertisingParameters, GattWriteRequestedEventArgs,
         },
     },
@@ -284,8 +284,9 @@ impl GattServer {
     ///
     /// Description: VRConnect shall start the GATT server: create the Windows BLE
     ///              service, register characteristic handlers, and begin advertising.
+    ///              Blocking WinRT `.get()` waits run via `spawn_blocking` (I-27).
     ///
-    /// Version: V1.0
+    /// Version: V1.1
     pub async fn start(&mut self) -> Result<()> {
         let service_guid = uuid_to_guid(&self.service_uuid);
 
@@ -294,28 +295,38 @@ impl GattServer {
             "Creating GATT service provider (UUID: {})",
             self.service_uuid
         );
-        let provider_result = GattServiceProvider::CreateAsync(service_guid)
-            .map_err(|e| VitalError::Config(format!("CreateAsync call failed: {}", e)))?
-            .get()
-            .map_err(|e| VitalError::Config(format!("CreateAsync await failed: {}", e)))?;
+        // CreateAsync(...).get() blocks the calling thread until the Bluetooth
+        // service answers — run it on the blocking-thread-pool, not a tokio worker
+        // (I-27: a blocked worker can stall the whole runtime). String error for the
+        // same clippy::result_large_err reason as notify().
+        let (provider, service) = tokio::task::spawn_blocking(
+            move || -> std::result::Result<(GattServiceProvider, GattLocalService), String> {
+                let provider_result = GattServiceProvider::CreateAsync(service_guid)
+                    .map_err(|e| format!("CreateAsync call failed: {}", e))?
+                    .get()
+                    .map_err(|e| format!("CreateAsync await failed: {}", e))?;
 
-        let bt_error = provider_result
-            .Error()
-            .map_err(|e| VitalError::Config(format!("Error() failed: {}", e)))?;
-        if bt_error != BluetoothError::Success {
-            return Err(VitalError::Config(format!(
-                "Bluetooth error creating service: {:?}",
-                bt_error
-            )));
-        }
+                let bt_error = provider_result
+                    .Error()
+                    .map_err(|e| format!("Error() failed: {}", e))?;
+                if bt_error != BluetoothError::Success {
+                    return Err(format!("Bluetooth error creating service: {:?}", bt_error));
+                }
 
-        let provider = provider_result
-            .ServiceProvider()
-            .map_err(|e| VitalError::Config(format!("ServiceProvider() failed: {}", e)))?;
+                let provider = provider_result
+                    .ServiceProvider()
+                    .map_err(|e| format!("ServiceProvider() failed: {}", e))?;
 
-        let service = provider
-            .Service()
-            .map_err(|e| VitalError::Config(format!("Service() failed: {}", e)))?;
+                let service = provider
+                    .Service()
+                    .map_err(|e| format!("Service() failed: {}", e))?;
+                Ok((provider, service))
+            },
+        )
+        .await
+        .map_err(|e| format!("CreateAsync blocking task panicked: {}", e))
+        .and_then(|inner| inner)
+        .map_err(VitalError::Config)?;
 
         // 2. Create each characteristic
         for cfg in &self.chars {
@@ -355,15 +366,22 @@ impl GattServer {
             }
 
             // Create the characteristic on the service
-            let char_result = service
-                .CreateCharacteristicAsync(char_guid, &params)
-                .map_err(|e| VitalError::Config(format!("CreateCharAsync call failed: {}", e)))?
-                .get()
-                .map_err(|e| VitalError::Config(format!("CreateCharAsync await failed: {}", e)))?;
-
-            let local_char = char_result
-                .Characteristic()
-                .map_err(|e| VitalError::Config(format!("Characteristic() failed: {}", e)))?;
+            // Blocking .get() → blocking-thread-pool (I-27), same as CreateAsync above.
+            let svc = service.clone();
+            let local_char = tokio::task::spawn_blocking(
+                move || -> std::result::Result<GattLocalCharacteristic, String> {
+                    svc.CreateCharacteristicAsync(char_guid, &params)
+                        .map_err(|e| format!("CreateCharAsync call failed: {}", e))?
+                        .get()
+                        .map_err(|e| format!("CreateCharAsync await failed: {}", e))?
+                        .Characteristic()
+                        .map_err(|e| format!("Characteristic() failed: {}", e))
+                },
+            )
+            .await
+            .map_err(|e| format!("CreateCharAsync blocking task panicked: {}", e))
+            .and_then(|inner| inner)
+            .map_err(VitalError::Config)?;
 
             // Register write handler if this characteristic is writable
             let has_write = cfg
