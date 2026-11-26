@@ -1,0 +1,6 @@
+# I-27: a blocked console write inside a tokio task froze processing for 6 h.
+# Console output goes through ConsoleOutput's dedicated thread (src/output/console.rs).
+disallowed-macros = [
+    { path = "std::println", reason = "blocks the tokio worker if the console is blocked (I-27); use ConsoleOutput or log::" },
+    { path = "std::print", reason = "blocks the tokio worker if the console is blocked (I-27); use ConsoleOutput or log::" },
+]
