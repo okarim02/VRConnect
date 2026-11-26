@@ -231,6 +231,7 @@ impl SocketIOServer {
             transformer,
             debug_enabled,
             &debug_file,
+            health_state.as_ref(),
         )
         .await;
 
@@ -255,7 +256,7 @@ impl SocketIOServer {
     /// so the sio_connection_count decrement in the caller always runs on the
     /// way out, regardless of which `?` (if any) ends this function early.
     ///
-    /// Version: V1.0
+    /// Version: V1.1
     #[cfg(not(tarpaulin_include))] // Requires real WebSocket connection, integration test only
     #[allow(clippy::too_many_arguments)]
     async fn run_connection(
@@ -267,6 +268,7 @@ impl SocketIOServer {
         transformer: Arc<VitalDataTransformer>,
         debug_enabled: bool,
         debug_file: &Arc<RwLock<Option<File>>>,
+        health_state: Option<&Arc<RwLock<GateHealthState>>>,
     ) -> Result<()> {
         let (mut write, mut read) = ws_stream.split();
 
@@ -385,6 +387,10 @@ impl SocketIOServer {
                                     processed_data.all_tracks.len()
                                 );
 
+                                if let Some(hs) = health_state {
+                                    hs.write().await.last_received_data =
+                                        Some(std::time::Instant::now());
+                                }
                                 if let Err(e) = tx.send(processed_data) {
                                     log::error!("Failed to send processed data: {}", e);
                                 }
