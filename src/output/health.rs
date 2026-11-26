@@ -62,7 +62,7 @@ pub struct OsHealthSnapshot {
 ///
 /// Description: VRConnect shall maintain the internal GATE health indicators
 /// behind an Arc<RwLock<GateHealthState>> shared between the processing
-/// pipeline, the BLE write-handler, and the health task.
+/// pipeline, the BLE write-handler, the Socket.IO server, and the health task.
 ///
 /// `ble = 1` when at least one IDT stream is active (signal_to_stream non-empty).
 /// This reflects active data flow, NOT merely a BLE link presence. A Central
@@ -73,7 +73,7 @@ pub struct OsHealthSnapshot {
 /// the old one). Using a reference count prevents the old-connection close event
 /// from clearing `sio=1` while the new connections are already active.
 ///
-/// Version: V1.0
+/// Version: V1.1
 #[derive(Debug)]
 pub struct GateHealthState {
     /// True when at least one Socket.IO WebSocket connection is active (sio_connection_count > 0).
@@ -85,6 +85,8 @@ pub struct GateHealthState {
     pub ble_subscriber: bool,
     /// Instant of the last ProcessedData forwarded to outputs.
     pub last_processed_data: Option<Instant>,
+    /// Instant of the last data frame decoded by the Socket.IO server (I-27 stall detection).
+    pub last_received_data: Option<Instant>,
     /// flow = 0 if no ProcessedData received within this many seconds.
     pub flow_timeout_sec: u64,
     /// GATT advertising live (`AdvertisementStatus == Started`), re-read by the
@@ -101,6 +103,7 @@ impl Default for GateHealthState {
             sio_connection_count: 0,
             ble_subscriber: false,
             last_processed_data: None,
+            last_received_data: None,
             flow_timeout_sec: 60,
             adv_started: None,
         }
@@ -307,6 +310,27 @@ fn log_stale_snapshot(now_sec: u64, ts: u64, age: u64, stale_threshold_sec: u64)
     }
 }
 
+/// ID SRS: SRS-FN-HEALTH-006
+/// Title: processing_stall_secs
+///
+/// Description: VRConnect shall detect the I-27 signature: Socket.IO data received
+/// within `timeout_sec` while the last processed data is older than `timeout_sec`.
+/// Returns the processed-data age in seconds when stalled, `None` otherwise
+/// (including when nothing was ever processed — avoids a startup false alarm).
+///
+/// Version: V1.0
+pub fn processing_stall_secs(
+    received: Option<Instant>,
+    processed: Option<Instant>,
+    timeout_sec: u64,
+    now: Instant,
+) -> Option<u64> {
+    let age = |t: Instant| now.saturating_duration_since(t).as_secs();
+    let rx_age = age(received?);
+    let px_age = age(processed?);
+    (rx_age < timeout_sec && px_age > timeout_sec).then_some(px_age)
+}
+
 /// ID SRS: SRS-FN-HEALTH-003
 /// Title: build_payload
 ///
@@ -381,6 +405,7 @@ mod tests {
             sio_connection_count: 1,
             ble_subscriber: true,
             last_processed_data: Some(Instant::now() - Duration::from_secs(5)),
+            last_received_data: None,
             flow_timeout_sec: 60,
             adv_started: Some(true),
         }
@@ -803,5 +828,23 @@ mod tests {
             !ESCALATED.load(Ordering::Relaxed),
             "a fresh read must clear escalation state left over from a past incident"
         );
+    }
+
+    /// ID SRS: SRS-TEST-HEALTH-017
+    /// Title: processing_stall_secs decision table
+    ///
+    /// Description: Stall only when received fresh and processed stale (I-27).
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_processing_stall_secs() {
+        use std::time::Duration;
+        let now = Instant::now() + Duration::from_secs(1000);
+        let ago = |s| Some(now - Duration::from_secs(s));
+        assert_eq!(processing_stall_secs(ago(5), ago(120), 60, now), Some(120));
+        assert_eq!(processing_stall_secs(ago(5), ago(10), 60, now), None);
+        assert_eq!(processing_stall_secs(ago(90), ago(120), 60, now), None);
+        assert_eq!(processing_stall_secs(None, ago(120), 60, now), None);
+        assert_eq!(processing_stall_secs(ago(5), None, 60, now), None);
     }
 }

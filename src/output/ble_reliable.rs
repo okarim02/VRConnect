@@ -26,7 +26,9 @@ use crate::output::ble_gatt::{
     BleConnectionEvent, CharProperty, GattServer, WriteEvent, CCCD_SUBSCRIBERS_LOST_MSG,
 };
 use crate::output::ble_session::BleSessionState;
-use crate::output::health::{build_payload, read_os_snapshot, GateHealthState};
+use crate::output::health::{
+    build_payload, processing_stall_secs, read_os_snapshot, GateHealthState,
+};
 use crate::output::wal::{self, WalEntry};
 use crate::utils::chaos;
 use std::io::{BufWriter, Write as IoWrite};
@@ -40,6 +42,8 @@ type RetryEntry = (Vec<u8>, u16, u16, u32);
 
 /// Catch-up is skipped below this negotiated gate period (would flood the link).
 const CATCHUP_MIN_PERIOD_MS: u32 = 60_000;
+/// I-27 processing-stall ERROR repeat interval while the stall persists.
+const STALL_LOG_REPEAT: Duration = Duration::from_secs(300);
 
 /// Replay frames collected for one stream (IDT backlog or TLV catch-up).
 struct ReplayBatch {
@@ -2330,7 +2334,11 @@ impl ReliableBleOutput {
     ///
     ///              `notify_control()` is a no-op when no Central subscribes to Control CCCD.
     ///
-    /// Version: V1.0
+    ///              Also logs (detection only, no restart) the I-27 processing stall:
+    ///              Socket.IO data fresh but processed data stale — ERROR on entry,
+    ///              repeated at most every 5 min, INFO on recovery.
+    ///
+    /// Version: V1.1
     async fn health_task(
         health_state: Arc<RwLock<GateHealthState>>,
         server: Arc<RwLock<GattServer>>,
@@ -2347,6 +2355,8 @@ impl ReliableBleOutput {
             health_file,
             stale_threshold
         );
+
+        let mut stall_logged_at: Option<Instant> = None;
 
         loop {
             // Wait for a state-change trigger OR the heartbeat timer — whichever fires first.
@@ -2385,7 +2395,30 @@ impl ReliableBleOutput {
 
             let gate = health_state.read().await;
             let payload = build_payload(&os, &gate);
+            let stall = processing_stall_secs(
+                gate.last_received_data,
+                gate.last_processed_data,
+                gate.flow_timeout_sec,
+                Instant::now(),
+            );
             drop(gate);
+
+            match (stall, stall_logged_at) {
+                (Some(secs), last) if last.is_none_or(|t| t.elapsed() >= STALL_LOG_REPEAT) => {
+                    log::error!(
+                        "[HEALTH] processing stalled: data received but not processed for {}s (I-27)",
+                        secs
+                    );
+                    stall_logged_at = Some(Instant::now());
+                }
+                (None, Some(_)) => {
+                    log::info!(
+                        "[HEALTH] processing recovered: processed data flowing again (I-27)"
+                    );
+                    stall_logged_at = None;
+                }
+                _ => {}
+            }
 
             match serde_json::to_vec(&payload) {
                 Ok(bytes) => {
