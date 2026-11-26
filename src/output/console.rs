@@ -3,17 +3,28 @@
 // Purpose: Console output with compact and verbose modes
 
 use crate::domain::{ProcessedData, ProcessedTrack, TrackType};
+use std::fmt::{self, Write as _};
+use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
+
+/// Bounded queue depth between the processor and the console thread.
+const CONSOLE_QUEUE: usize = 64;
 
 /// ID SRS: SRS-MOD-CONSOLE-001
 /// Title: ConsoleOutput
 ///
 /// Description: VRConnect shall provide console output with compact and verbose
-/// modes, with optional colorization for improved readability.
+/// modes, with optional colorization for improved readability. Writes happen on
+/// a dedicated "console-out" thread so a blocked console never stalls the
+/// async pipeline (I-27).
 ///
 /// Version: V1.0
 pub struct ConsoleOutput {
     verbose: bool,
     _colorized: bool, // Keep for future use
+    tx: SyncSender<String>,
+    dropped: AtomicU64,
 }
 
 impl ConsoleOutput {
@@ -21,7 +32,7 @@ impl ConsoleOutput {
     /// Title: new
     ///
     /// Description: VRConnect shall construct a ConsoleOutput instance with
-    /// verbosity and colorization configuration.
+    /// verbosity and colorization configuration, writing to stdout.
     ///
     /// Version: V1.0
     ///
@@ -32,9 +43,35 @@ impl ConsoleOutput {
     /// # Returns
     /// New ConsoleOutput instance
     pub fn new(verbose: bool, colorized: bool) -> Self {
+        Self::with_writer(verbose, colorized, Box::new(std::io::stdout()))
+    }
+
+    /// ID SRS: SRS-FN-CONSOLE-007
+    /// Title: with_writer
+    ///
+    /// Description: VRConnect shall construct a ConsoleOutput writing to the
+    /// given sink from a dedicated "console-out" OS thread fed by a bounded
+    /// channel, so a blocked sink cannot park the async caller.
+    ///
+    /// Version: V1.0
+    pub fn with_writer(verbose: bool, colorized: bool, mut writer: Box<dyn Write + Send>) -> Self {
+        let (tx, rx) = sync_channel::<String>(CONSOLE_QUEUE);
+        let spawned = std::thread::Builder::new()
+            .name("console-out".into())
+            .spawn(move || {
+                for s in rx {
+                    let _ = writer.write_all(s.as_bytes());
+                    let _ = writer.flush();
+                }
+            });
+        if let Err(e) = spawned {
+            log::error!("console-out thread spawn failed: {}", e);
+        }
         Self {
             verbose,
             _colorized: colorized,
+            tx,
+            dropped: AtomicU64::new(0),
         }
     }
 
@@ -42,17 +79,38 @@ impl ConsoleOutput {
     /// Title: output
     ///
     /// Description: VRConnect shall output ProcessedData to console in either
-    /// compact or verbose format based on configuration.
+    /// compact or verbose format based on configuration, without blocking.
     ///
     /// Version: V1.0
     ///
     /// # Arguments
     /// * `data` - Processed vital data to display
     pub async fn output(&self, data: &ProcessedData) {
-        if self.verbose {
-            self.output_verbose(data);
+        let mut out = String::new();
+        let _ = if self.verbose {
+            self.output_verbose(&mut out, data)
         } else {
-            self.output_compact(data);
+            self.output_compact(&mut out, data)
+        };
+        self.send(out);
+    }
+
+    /// ID SRS: SRS-FN-CONSOLE-008
+    /// Title: send
+    ///
+    /// Description: VRConnect shall enqueue formatted console text without
+    /// blocking, dropping it when the queue is full and warning on the first
+    /// drop then every 100 drops.
+    ///
+    /// Version: V1.1
+    fn send(&self, out: String) {
+        // ponytail: drop-on-full (console is best-effort, BLE/file must never wait);
+        // keep-latest ring buffer if operators ever need gap-free console.
+        if self.tx.try_send(out).is_err() {
+            let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(100) {
+                log::warn!("console output blocked/full: {} messages dropped", n);
+            }
         }
     }
 
@@ -65,26 +123,27 @@ impl ConsoleOutput {
     /// Version: V1.0
     ///
     /// # Arguments
+    /// * `out` - Destination buffer
     /// * `data` - Processed vital data
-    fn output_compact(&self, data: &ProcessedData) {
-        let header = format!(
+    fn output_compact(&self, out: &mut String, data: &ProcessedData) -> fmt::Result {
+        writeln!(
+            out,
             "[{}] 🏥 Vital Update - {} tracks",
             data.timestamp.format("%Y-%m-%dT%H:%M:%S%.9f"),
             data.all_tracks.len()
-        );
-
-        println!("{}", header);
+        )?;
 
         // Display first 5 tracks
         for track in data.all_tracks.iter() {
-            self.print_track_compact(track);
+            self.print_track_compact(out, track)?;
         }
 
         // Show remaining count
         if data.all_tracks.len() > 5 {
             let remaining = data.all_tracks.len() - 5;
-            println!("  ... and {} more tracks", remaining);
+            writeln!(out, "  ... and {} more tracks", remaining)?;
         }
+        Ok(())
     }
 
     /// ID SRS: SRS-FN-CONSOLE-004
@@ -96,29 +155,35 @@ impl ConsoleOutput {
     /// Version: V1.0
     ///
     /// # Arguments
+    /// * `out` - Destination buffer
     /// * `data` - Processed vital data
-    fn output_verbose(&self, data: &ProcessedData) {
-        println!("\n{}", "═".repeat(60));
-        println!("🏥 VITAL DATA UPDATE");
-        println!("{}", "═".repeat(60));
+    fn output_verbose(&self, out: &mut String, data: &ProcessedData) -> fmt::Result {
+        writeln!(out, "\n{}", "═".repeat(60))?;
+        writeln!(out, "🏥 VITAL DATA UPDATE")?;
+        writeln!(out, "{}", "═".repeat(60))?;
 
-        println!("Device: {}", data.device_id);
-        println!(
+        writeln!(out, "Device: {}", data.device_id)?;
+        writeln!(
+            out,
             "Timestamp: {}",
             data.timestamp.format("%Y-%m-%d %H:%M:%S%.3f")
-        );
-        println!("Rooms: {}", data.rooms.len());
-        println!("Total Tracks: {}", data.all_tracks.len());
+        )?;
+        writeln!(out, "Rooms: {}", data.rooms.len())?;
+        writeln!(out, "Total Tracks: {}", data.all_tracks.len())?;
 
         for room in &data.rooms {
-            println!("\nRoom: {} (Index: {})", room.room_name, room.room_index);
+            writeln!(
+                out,
+                "\nRoom: {} (Index: {})",
+                room.room_name, room.room_index
+            )?;
 
             for track in &room.tracks {
-                self.print_track_verbose(track, "  ");
+                self.print_track_verbose(out, track, "  ")?;
             }
         }
 
-        println!("\n{}", "═".repeat(60));
+        writeln!(out, "\n{}", "═".repeat(60))
     }
 
     /// ID SRS: SRS-FN-CONSOLE-005
@@ -130,12 +195,14 @@ impl ConsoleOutput {
     /// Version: V1.0
     ///
     /// # Arguments
+    /// * `out` - Destination buffer
     /// * `track` - Track to display
-    fn print_track_compact(&self, track: &ProcessedTrack) {
-        println!(
+    fn print_track_compact(&self, out: &mut String, track: &ProcessedTrack) -> fmt::Result {
+        writeln!(
+            out,
             "  {}: {} {} ({})",
             track.name, track.display_value, track.unit, track.room_name
-        );
+        )
     }
 
     /// ID SRS: SRS-FN-CONSOLE-006
@@ -147,46 +214,55 @@ impl ConsoleOutput {
     /// Version: V1.0
     ///
     /// # Arguments
+    /// * `out` - Destination buffer
     /// * `track` - Track to display
     /// * `indent` - Indentation string
-    fn print_track_verbose(&self, track: &ProcessedTrack, indent: &str) {
-        println!("{}Track: {}", indent, track.name);
-        println!("{}  Type: {:?}", indent, track.track_type);
-        println!("{}  Value: {}", indent, track.display_value);
-        println!("{}  Unit: {}", indent, track.unit);
-        println!(
+    fn print_track_verbose(
+        &self,
+        out: &mut String,
+        track: &ProcessedTrack,
+        indent: &str,
+    ) -> fmt::Result {
+        writeln!(out, "{}Track: {}", indent, track.name)?;
+        writeln!(out, "{}  Type: {:?}", indent, track.track_type)?;
+        writeln!(out, "{}  Value: {}", indent, track.display_value)?;
+        writeln!(out, "{}  Unit: {}", indent, track.unit)?;
+        writeln!(
+            out,
             "{}  Timestamp: {}",
             indent,
             track.timestamp.format("%H:%M:%S%.3f")
-        );
+        )?;
 
         if let Some(stats) = &track.waveform_stats {
-            println!(
+            writeln!(
+                out,
                 "{}  Stats: min={:.3}, max={:.3}, avg={:.3}, count={}",
                 indent, stats.min, stats.max, stats.avg, stats.count
-            );
+            )?;
         }
 
         // Print ALL waveform points in verbose mode
         if track.track_type == TrackType::Waveform {
             if let Some(points) = &track.waveform_points {
-                println!("{}  Waveform Points ({} total):", indent, points.len());
-                print!("{}    ", indent);
+                writeln!(out, "{}  Waveform Points ({} total):", indent, points.len())?;
+                write!(out, "{}    ", indent)?;
 
                 for (i, point) in points.iter().enumerate() {
-                    print!("{:.3}", point);
+                    write!(out, "{:.3}", point)?;
 
                     // Format: 10 points per line
                     if (i + 1) % 10 == 0 && i + 1 < points.len() {
-                        println!();
-                        print!("{}    ", indent);
+                        writeln!(out)?;
+                        write!(out, "{}    ", indent)?;
                     } else if i + 1 < points.len() {
-                        print!(", ");
+                        write!(out, ", ")?;
                     }
                 }
-                println!(); // Final newline
+                writeln!(out)?; // Final newline
             }
         }
+        Ok(())
     }
 }
 
@@ -565,5 +641,48 @@ mod tests {
 
         // This will print 10 points, then newline+indent, then 1 more point
         tokio_test::block_on(console.output(&data));
+    }
+
+    /// Writer whose write() parks forever (simulates QuickEdit-frozen console).
+    struct BlockingWriter;
+    impl std::io::Write for BlockingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            loop {
+                std::thread::park();
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// ID SRS: SRS-TEST-CONSOLE-016
+    /// Title: Test blocked console does not stall output
+    ///
+    /// Description: VRConnect shall return from output() promptly even when the
+    /// console sink blocks forever (I-27 regression).
+    ///
+    /// Version: V1.0
+    #[test]
+    fn test_blocked_console_nonblocking() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let console = ConsoleOutput::with_writer(false, false, Box::new(BlockingWriter));
+        let data = ProcessedData::new("VR-BLOCK".to_string(), vec![]);
+        let res = rt.block_on(async {
+            // Spawned so a synchronous block parks only one worker; timer runs on the other.
+            let task = tokio::spawn(async move {
+                for _ in 0..500 {
+                    console.output(&data).await;
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), task).await
+        });
+        // Don't wait for a worker stuck in a blocked write.
+        rt.shutdown_background();
+        assert!(res.is_ok(), "output() blocked on stalled console");
     }
 }
