@@ -42,7 +42,10 @@ if ((git -C $SourceDeploy rev-parse --is-inside-work-tree 2>$null) -eq "true") {
 if (-not $SkipBuild) {
     Write-Host "[1/4] cargo build --release..." -ForegroundColor Cyan
     Push-Location $ProjectRoot
+    # cargo writes progress to stderr; under "Stop", PS 5.1 turns that into a terminating error.
+    $ErrorActionPreference = "Continue"
     cargo build --release
+    $ErrorActionPreference = "Stop"
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[FAIL] Build failed." -ForegroundColor Red; exit 1
     }

@@ -61,6 +61,8 @@ async fn main() {
 ///
 /// # Arguments
 /// * `config` - Application configuration
+// Runs once before the processor starts: a blocked console here cannot freeze data flow (I-27).
+#[allow(clippy::disallowed_macros)]
 fn print_banner(config: &Config) {
     println!("\n{}", "═".repeat(70));
     println!("  VRConnect - Medical Vital Data Middleware v1.0.0");
